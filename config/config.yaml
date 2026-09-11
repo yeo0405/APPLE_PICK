@@ -18,3 +18,7 @@ RACE_6D:
   CLASS_ID: null
   DEPTH_Z_MAX_MM: 2000.0
   INVALID_DEPTH_VALUE: 65535
+  
+  LABEL_NAMES:
+    0: iphone
+    1: box

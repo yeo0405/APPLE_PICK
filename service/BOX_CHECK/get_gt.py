@@ -19,8 +19,8 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = PROJECT_ROOT / "model"
 
-SAM2_CONFIG = str(MODEL_DIR / "sam2.1_hiera_s.yaml")
-SAM2_CHECKPOINT = str(MODEL_DIR / "sam2.1_hiera_small.pt")
+SAM2_CONFIG = MODEL_DIR / "sam2.1_hiera_s.yaml"
+SAM2_CHECKPOINT = MODEL_DIR / "sam2.1_hiera_small.pt"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 GT_DIR = SCRIPT_DIR / "GT"
@@ -37,21 +37,25 @@ bbox_start = None
 bbox_end = None
 
 
+def relative_to_project(path):
+    """Return path relative to PROJECT_ROOT for JSON output."""
+    path = Path(path).resolve()
+    try:
+        return path.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return os.path.relpath(path, PROJECT_ROOT).replace(os.sep, "/")
+
+
 def find_gt_image():
     extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    images = sorted(
-        p for p in GT_DIR.iterdir()
-        if p.is_file() and p.suffix.lower() in extensions
-    )
+    images = sorted(p for p in GT_DIR.iterdir() if p.is_file() and p.suffix.lower() in extensions)
 
     if len(images) == 0:
         raise FileNotFoundError(f"No image found in GT folder: {GT_DIR}")
 
     if len(images) > 1:
         names = "\n".join(f"  {p.name}" for p in images)
-        raise RuntimeError(
-            f"Expected exactly one image in {GT_DIR}, found {len(images)}:\n{names}"
-        )
+        raise RuntimeError(f"Expected exactly one image in {GT_DIR}, found {len(images)}:\n{names}")
 
     return images[0]
 
@@ -119,15 +123,11 @@ def generate_sam_masks(predictor, device):
                 if device == "cuda":
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         masks, scores, _ = predictor.predict(
-                            box=box,
-                            multimask_output=True,
-                            return_logits=False,
+                            box=box, multimask_output=True, return_logits=False
                         )
                 else:
                     masks, scores, _ = predictor.predict(
-                        box=box,
-                        multimask_output=True,
-                        return_logits=False,
+                        box=box, multimask_output=True, return_logits=False
                     )
         except Exception as e:
             print(f"SAM2 prediction failed for bbox {index}: {e}")
@@ -159,27 +159,27 @@ def generate_sam_masks(predictor, device):
 
 
 def save_sam_masks(results, output_path):
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    os.makedirs(output_dir, exist_ok=True)
+    output_path = Path(output_path)
+    output_dir = output_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    base_name = os.path.splitext(os.path.basename(output_path))[0]
-    mask_dir = os.path.join(output_dir, f"{base_name}_masks")
-    os.makedirs(mask_dir, exist_ok=True)
+    mask_dir = output_dir / f"{output_path.stem}_masks"
+    mask_dir.mkdir(parents=True, exist_ok=True)
 
     mask_infos = []
 
     for result in results:
         index = result["index"]
         mask = result["mask"]
-        mask_path = os.path.join(mask_dir, f"ripcord_{index}.png")
+        mask_path = mask_dir / f"ripcord_{index}.png"
 
-        if not cv2.imwrite(mask_path, mask.astype(np.uint8) * 255):
+        if not cv2.imwrite(str(mask_path), mask.astype(np.uint8) * 255):
             raise RuntimeError(f"Failed to save SAM2 mask: {mask_path}")
 
         mask_infos.append({
             "index": index,
             "side": result["side"],
-            "file": os.path.abspath(mask_path),
+            "file": relative_to_project(mask_path),
             "score": result["score"],
             "area": result["area"],
         })
@@ -193,54 +193,25 @@ def draw_sam_result(results):
     result_image = image.copy()
 
     for result in results:
-        index = result["index"]
         side = result["side"]
         mask = result["mask"]
         score = result["score"]
         x1, y1, x2, y2 = result["bbox"]
 
         mask_uint8 = mask.astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        contours, _ = cv2.findContours(
-            mask_uint8,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
-        )
-
-        cv2.drawContours(
-            result_image,
-            contours,
-            -1,
-            (0, 255, 0),
-            3,
-        )
-
-        cv2.rectangle(
-            result_image,
-            (x1, y1),
-            (x2, y2),
-            (255, 0, 0),
-            2,
-        )
+        cv2.drawContours(result_image, contours, -1, (0, 255, 0), 3)
+        cv2.rectangle(result_image, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
         cv2.putText(
-            result_image,
-            f"{side} S={score:.2f}",
-            (x1, max(30, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 255, 255),
-            2,
+            result_image, f"{side} S={score:.2f}", (x1, max(30, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2
         )
-
         cv2.putText(
-            result_image,
-            f"Area={result['area']}",
+            result_image, f"Area={result['area']}",
             (x1, min(result_image.shape[0] - 10, y2 + 30)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
         )
 
     return result_image
@@ -295,26 +266,14 @@ def redraw():
 
         cv2.rectangle(display, (x1, y1), (x2, y2), (255, 0, 0), 3)
         cv2.putText(
-            display,
-            label,
-            (x1, max(30, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (255, 0, 0),
-            2,
+            display, label, (x1, max(30, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 2
         )
 
     if drawing_bbox and bbox_start and bbox_end:
         x1, x2 = sorted([bbox_start[0], bbox_end[0]])
         y1, y2 = sorted([bbox_start[1], bbox_end[1]])
-
-        cv2.rectangle(
-            display,
-            (x1, y1),
-            (x2, y2),
-            (0, 255, 255),
-            2,
-        )
+        cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
     if len(bboxes) == 0:
         text = "Drag mouse to select LEFT bbox"
@@ -324,24 +283,14 @@ def redraw():
         text = "2 bboxes selected - press S to run SAM2"
 
     cv2.putText(
-        display,
-        text,
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.9,
-        (0, 255, 0),
-        2,
+        display, text, (20, 40),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2
     )
 
     if status_message:
         cv2.putText(
-            display,
-            status_message,
-            (20, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 255, 0),
-            2,
+            display, status_message, (20, 80),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2
         )
 
 
@@ -391,13 +340,13 @@ def save_gt(output_path):
     ]
 
     data = {
-        "image": os.path.abspath(INPUT_IMAGE),
+        "image": relative_to_project(INPUT_IMAGE),
         "image_size": [int(image.shape[1]), int(image.shape[0])],
         "object_count": MAX_BBOXES,
         "objects": objects,
         "sam2": {
-            "config": os.path.abspath(SAM2_CONFIG),
-            "checkpoint": os.path.abspath(SAM2_CHECKPOINT),
+            "config": relative_to_project(SAM2_CONFIG),
+            "checkpoint": relative_to_project(SAM2_CHECKPOINT),
             "prompt_type": "box",
         },
     }
@@ -418,7 +367,7 @@ def save_gt(output_path):
 
     print(f"Image: {INPUT_IMAGE}")
     print(f"JSON: {output_path}")
-    print(f"Masks: {os.path.splitext(output_path)[0]}_masks")
+    print(f"Masks: {Path(output_path).with_suffix('')}_masks")
 
     return True
 
@@ -454,7 +403,6 @@ def main():
 
         if key in (ord("s"), ord("S")):
             save_gt(str(output_path))
-
         elif key in (ord("r"), ord("R")):
             bboxes = []
             drawing_bbox = False
@@ -462,7 +410,6 @@ def main():
             bbox_end = None
             status_message = ""
             redraw()
-
         elif key == 27:
             break
 

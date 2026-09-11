@@ -1,5 +1,5 @@
 {
-    "image": "/home/yeo/Downloads/Implementation/APPLE_PICK/service/BOX_CHECK/GT/GT.jpg",
+    "image": "service/BOX_CHECK/GT/GT.jpg",
     "image_size": [
         1920,
         1080
@@ -10,40 +10,40 @@
             "index": 0,
             "side": "left",
             "bbox": [
-                713,
-                380,
-                768,
-                491
+                704,
+                372,
+                770,
+                498
             ],
             "mask": {
                 "index": 0,
                 "side": "left",
-                "file": "/home/yeo/Downloads/Implementation/APPLE_PICK/service/BOX_CHECK/GT/gt_masks/ripcord_0.png",
-                "score": 0.95703125,
-                "area": 3220
+                "file": "service/BOX_CHECK/GT/gt_masks/ripcord_0.png",
+                "score": 0.953125,
+                "area": 3309
             }
         },
         {
             "index": 1,
             "side": "right",
             "bbox": [
-                1192,
-                382,
-                1259,
-                498
+                1191,
+                370,
+                1261,
+                503
             ],
             "mask": {
                 "index": 1,
                 "side": "right",
-                "file": "/home/yeo/Downloads/Implementation/APPLE_PICK/service/BOX_CHECK/GT/gt_masks/ripcord_1.png",
-                "score": 0.953125,
-                "area": 3740
+                "file": "service/BOX_CHECK/GT/gt_masks/ripcord_1.png",
+                "score": 0.94140625,
+                "area": 3799
             }
         }
     ],
     "sam2": {
-        "config": "/home/yeo/Downloads/Implementation/APPLE_PICK/model/sam2.1_hiera_s.yaml",
-        "checkpoint": "/home/yeo/Downloads/Implementation/APPLE_PICK/model/sam2.1_hiera_small.pt",
+        "config": "model/sam2.1_hiera_s.yaml",
+        "checkpoint": "model/sam2.1_hiera_small.pt",
         "prompt_type": "box"
     }
 }
