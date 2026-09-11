@@ -1,0 +1,49 @@
+{
+    "image": "/home/yeo/Downloads/Implementation/APPLE_PICK/service/BOX_CHECK/GT/GT.jpg",
+    "image_size": [
+        1920,
+        1080
+    ],
+    "object_count": 2,
+    "objects": [
+        {
+            "index": 0,
+            "side": "left",
+            "bbox": [
+                713,
+                380,
+                768,
+                491
+            ],
+            "mask": {
+                "index": 0,
+                "side": "left",
+                "file": "/home/yeo/Downloads/Implementation/APPLE_PICK/service/BOX_CHECK/GT/gt_masks/ripcord_0.png",
+                "score": 0.95703125,
+                "area": 3220
+            }
+        },
+        {
+            "index": 1,
+            "side": "right",
+            "bbox": [
+                1192,
+                382,
+                1259,
+                498
+            ],
+            "mask": {
+                "index": 1,
+                "side": "right",
+                "file": "/home/yeo/Downloads/Implementation/APPLE_PICK/service/BOX_CHECK/GT/gt_masks/ripcord_1.png",
+                "score": 0.953125,
+                "area": 3740
+            }
+        }
+    ],
+    "sam2": {
+        "config": "/home/yeo/Downloads/Implementation/APPLE_PICK/model/sam2.1_hiera_s.yaml",
+        "checkpoint": "/home/yeo/Downloads/Implementation/APPLE_PICK/model/sam2.1_hiera_small.pt",
+        "prompt_type": "box"
+    }
+}

@@ -1,0 +1,20 @@
+# ==========================================================
+# CAMERA
+# ==========================================================
+CAMERA:
+  # IP: "192.168.86.34"
+  IP: "0.0.0.0"
+  PORT: 9876
+# ==========================================================
+# RACE-6D
+# MODEL_CONFIG is relative to the APPLE_PICK project root.
+# ==========================================================
+RACE_6D:
+  MODEL_PATH: "model/last.pth"
+  MODEL_CONFIG: "service/RACE_6D/config/race6d_r50vd_pose_rgbd.yml"
+  SCORE_THRESHOLD: 0.25
+  MAX_PER_CLASS: 1
+  MAX_DETECTIONS: null
+  CLASS_ID: null
+  DEPTH_Z_MAX_MM: 2000.0
+  INVALID_DEPTH_VALUE: 65535

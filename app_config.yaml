@@ -1,0 +1,6 @@
+models:
+  - name: 'APPLE_PICKING'
+    version: ''
+    app: 'app'
+    ros: 'ros_app'
+    config: 'config'
