@@ -1,606 +1,316 @@
 #!/usr/bin/env python3
-"""SAM2 Left/Right Object Presence Estimator."""
+
+from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 
 import cv2
 import numpy as np
 import torch
-from hydra import compose, initialize_config_dir
-from hydra.core.global_hydra import GlobalHydra
-from hydra.utils import instantiate
-from omegaconf import OmegaConf
+import torch.nn.functional as F
 
-from sam2.build_sam import _load_checkpoint
-from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-# ============================================================
-# CONFIGURATION & THRESHOLDS
-# ============================================================
-
-SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-GT_PATH = SCRIPT_DIR / "GT" / "gt.json"
-MODEL_DIR = PROJECT_ROOT / "model"
-
-SAM2_CONFIG = MODEL_DIR / "sam2.1_hiera_s.yaml"
-SAM2_CHECKPOINT = MODEL_DIR / "sam2.1_hiera_small.pt"
-
-OBJECTS = ["left", "right"]
-
-MIN_IOU = 0.30
-MIN_AREA_RATIO = 0.30
-MAX_AREA_RATIO = 2.00
-MAX_CENTER_DISTANCE = 50.0
-MIN_SAM_SCORE = 0.30
-MAX_CONTOUR_DISTANCE = 3
-
-SHOW_INPUT_MASK = True
-SHOW_BBOX = True
-SHOW_TEXT = True
-
-MASK_CONTOUR_THICKNESS = 3
-BBOX_THICKNESS = 3
-FONT_SCALE_STATUS = 0.8
-FONT_SCALE_DETAIL = 0.55
-FONT_THICKNESS = 2
-
-USE_BFLOAT16 = True
-DYNAMIC_MULTIMASK_VIA_STABILITY = True
-DYNAMIC_MULTIMASK_STABILITY_DELTA = 0.05
-DYNAMIC_MULTIMASK_STABILITY_THRESH = 0.98
-
-
-# ============================================================
-# PATH HELPERS
-# ============================================================
-
-def resolve_project_path(path: str | Path) -> Path:
-    """Resolve JSON path. Relative paths are relative to PROJECT_ROOT."""
-    path = Path(path)
-    return (PROJECT_ROOT / path).resolve() if not path.is_absolute() else path.resolve()
-
-
-# ============================================================
-# GROUND TRUTH LOADERS
-# ============================================================
-
-def load_gt(gt_path: str | Path) -> Dict[str, Any]:
-    path = Path(gt_path).resolve()
-    if not path.is_file():
-        raise FileNotFoundError(f"GT JSON not found: {path}")
-
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if "image" not in data or "objects" not in data:
-        raise RuntimeError("GT JSON missing 'image' or 'objects' key.")
-    if len(data["objects"]) != 2:
-        raise RuntimeError("GT JSON must contain exactly 2 objects.")
-
-    objects = sorted(data["objects"], key=lambda x: x["index"])
-
-    for index, obj in enumerate(objects):
-        expected_side = OBJECTS[index]
-        if obj.get("side") != expected_side:
-            raise RuntimeError(
-                f"Expected object {index} to be '{expected_side}', got '{obj.get('side')}'."
-            )
-        if "bbox" not in obj:
-            raise RuntimeError(f"Object {index} is missing 'bbox'.")
-        if "mask" not in obj or "file" not in obj["mask"]:
-            raise RuntimeError(f"Object {index} is missing 'mask.file'.")
-
-    return data
-
-
-def load_gt_masks(gt_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    objects = sorted(gt_data["objects"], key=lambda x: x["index"])
-    results = []
-
-    for obj in objects:
-        index = int(obj["index"])
-        side = obj["side"]
-        bbox = [int(v) for v in obj["bbox"]]
-
-        # JSON 中的相对路径统一以 PROJECT_ROOT 为基准
-        mask_path = resolve_project_path(obj["mask"]["file"])
-
-        if not mask_path.is_file():
-            raise FileNotFoundError(f"GT mask not found: {mask_path}")
-
-        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-        if mask is None:
-            raise RuntimeError(f"Cannot load GT mask: {mask_path}")
-
-        mask = mask > 127
-        area = int(np.count_nonzero(mask))
-
-        if area == 0:
-            raise RuntimeError(f"GT mask {index} is empty: {mask_path}")
-
-        results.append({
-            "index": index,
-            "side": side,
-            "bbox": bbox,
-            "mask": mask,
-            "score": float(obj["mask"].get("score", 0.0)),
-            "area": area,
-            "file": str(mask_path),
-        })
-
-    return results
-
-
-# ============================================================
-# MODEL & MASK METRICS
-# ============================================================
-
-def build_sam2_from_file(
-    config_path: str | Path,
-    checkpoint_path: str | Path,
-    device: str = "cuda",
-) -> torch.nn.Module:
-    cfg_path = Path(config_path).resolve()
-    ckpt_path = Path(checkpoint_path).resolve()
-
-    if not cfg_path.is_file():
-        raise FileNotFoundError(f"SAM2 config not found: {cfg_path}")
-    if not ckpt_path.is_file():
-        raise FileNotFoundError(f"SAM2 checkpoint not found: {ckpt_path}")
-
-    if GlobalHydra.instance().is_initialized():
-        GlobalHydra.instance().clear()
-
-    overrides = []
-    if DYNAMIC_MULTIMASK_VIA_STABILITY:
-        overrides.extend([
-            "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=true",
-            f"++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_delta={DYNAMIC_MULTIMASK_STABILITY_DELTA}",
-            f"++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_thresh={DYNAMIC_MULTIMASK_STABILITY_THRESH}",
-        ])
-
-    with initialize_config_dir(version_base=None, config_dir=str(cfg_path.parent)):
-        cfg = compose(config_name=cfg_path.stem, overrides=overrides)
-        OmegaConf.resolve(cfg)
-        model = instantiate(cfg.model, _recursive_=True)
-
-    _load_checkpoint(model, str(ckpt_path))
-    model = model.to(device)
-    model.eval()
-
-    print("[SAM2] Model loaded successfully")
-    return model
-
-
-def calculate_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
-    mask_a = np.asarray(mask_a, dtype=bool)
-    mask_b = np.asarray(mask_b, dtype=bool)
-    intersection = np.logical_and(mask_a, mask_b).sum()
-    union = np.logical_or(mask_a, mask_b).sum()
-    return float(intersection / union) if union > 0 else 0.0
-
-
-def mask_center(mask: np.ndarray) -> Optional[Tuple[float, float]]:
-    ys, xs = np.where(mask)
-    if len(xs) == 0:
-        return None
-    return float(np.mean(xs)), float(np.mean(ys))
-
-
-def get_largest_contour(mask: np.ndarray) -> Optional[np.ndarray]:
-    binary = np.asarray(mask, dtype=np.uint8) * 255
-    contours, _ = cv2.findContours(
-        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    return max(contours, key=cv2.contourArea) if contours else None
-
-
-def calculate_contour_distance(
-    gt_mask: np.ndarray,
-    input_mask: np.ndarray,
-) -> float:
-    gt_contour = get_largest_contour(gt_mask)
-    input_contour = get_largest_contour(input_mask)
-
-    if gt_contour is None or input_contour is None:
-        return float("inf")
-
-    if cv2.contourArea(gt_contour) <= 0 or cv2.contourArea(input_contour) <= 0:
-        return float("inf")
-
-    return float(
-        cv2.matchShapes(
-            gt_contour,
-            input_contour,
-            cv2.CONTOURS_MATCH_I1,
-            0.0,
-        )
-    )
-
-
-def compare_object(
-    gt_mask: np.ndarray,
-    input_mask: Optional[np.ndarray],
-    input_score: float,
-) -> Dict[str, Any]:
-    gt_area = int(np.count_nonzero(gt_mask))
-
-    if input_mask is None:
-        return {
-            "exists": False,
-            "iou": 0.0,
-            "gt_area": gt_area,
-            "input_area": 0,
-            "area_ratio": 0.0,
-            "center_distance": float("inf"),
-            "contour_distance": float("inf"),
-            "input_score": 0.0,
-            "passed_iou": False,
-            "passed_area": False,
-            "passed_center": False,
-            "passed_contour": False,
-            "passed_score": False,
-        }
-
-    if gt_mask.shape != input_mask.shape:
-        input_mask = cv2.resize(
-            input_mask.astype(np.uint8),
-            (gt_mask.shape[1], gt_mask.shape[0]),
-            interpolation=cv2.INTER_NEAREST,
-        ).astype(bool)
-
-    input_area = int(np.count_nonzero(input_mask))
-    iou = calculate_iou(gt_mask, input_mask)
-    area_ratio = float(input_area) / float(gt_area) if gt_area > 0 else 0.0
-
-    gt_center = mask_center(gt_mask)
-    input_center = mask_center(input_mask)
-
-    if gt_center is None or input_center is None:
-        center_distance = float("inf")
-    else:
-        dx = gt_center[0] - input_center[0]
-        dy = gt_center[1] - input_center[1]
-        center_distance = float(np.sqrt(dx * dx + dy * dy))
-
-    contour_distance = calculate_contour_distance(gt_mask, input_mask)
-
-    passed_iou = iou >= MIN_IOU
-    passed_area = MIN_AREA_RATIO <= area_ratio <= MAX_AREA_RATIO
-    passed_center = center_distance <= MAX_CENTER_DISTANCE
-    passed_contour = contour_distance <= MAX_CONTOUR_DISTANCE
-    passed_score = input_score >= MIN_SAM_SCORE
-
-    exists = (
-        passed_iou
-        and passed_area
-        and passed_center
-        and passed_contour
-        and passed_score
-    )
-
-    return {
-        "exists": exists,
-        "iou": iou,
-        "gt_area": gt_area,
-        "input_area": input_area,
-        "area_ratio": area_ratio,
-        "center_distance": center_distance,
-        "contour_distance": contour_distance,
-        "input_score": input_score,
-        "passed_iou": passed_iou,
-        "passed_area": passed_area,
-        "passed_center": passed_center,
-        "passed_contour": passed_contour,
-        "passed_score": passed_score,
-    }
-
-
-# ============================================================
-# DEBUG ANNOTATION
-# ============================================================
-
-def draw_debug(
-    input_image: np.ndarray,
-    gt_results: List[Dict[str, Any]],
-    input_results: List[Dict[str, Any]],
-    comparisons: List[Dict[str, Any]],
-) -> np.ndarray:
-    debug = input_image.copy()
-    image_height, image_width = input_image.shape[:2]
-
-    for i, gt in enumerate(gt_results):
-        side = gt["side"]
-        x1, y1, x2, y2 = gt["bbox"]
-        comparison = comparisons[i]
-        input_mask = input_results[i]["mask"]
-        exists = comparison["exists"]
-
-        color = (0, 255, 0) if exists else (0, 0, 255)
-
-        if SHOW_BBOX:
-            cv2.rectangle(
-                debug,
-                (x1, y1),
-                (x2, y2),
-                color,
-                BBOX_THICKNESS,
-            )
-
-        if SHOW_INPUT_MASK and exists and input_mask is not None:
-            if input_mask.shape == (image_height, image_width):
-                full_mask = input_mask.astype(np.uint8) * 255
-            else:
-                full_mask = cv2.resize(
-                    input_mask.astype(np.uint8),
-                    (image_width, image_height),
-                    interpolation=cv2.INTER_NEAREST,
-                ) * 255
-
-            contours, _ = cv2.findContours(
-                full_mask,
-                cv2.RETR_EXTERNAL,
-                cv2.CHAIN_APPROX_SIMPLE,
-            )
-            cv2.drawContours(
-                debug,
-                contours,
-                -1,
-                (0, 255, 0),
-                MASK_CONTOUR_THICKNESS,
-            )
-
-        if not SHOW_TEXT:
-            continue
-
-        status = "PRESENT" if exists else "ABSENT"
-        text1 = f"{side.upper()}: {status}"
-        text2 = (
-            f"IoU={comparison['iou']:.2f} "
-            f"Area={comparison['area_ratio']:.2f} "
-            f"D={comparison['center_distance']:.1f}"
-        )
-
-        contour_distance = comparison["contour_distance"]
-        contour_text = (
-            f"C={contour_distance:.3f}"
-            if np.isfinite(contour_distance)
-            else "C=INF"
-        )
-        text3 = f"S={comparison['input_score']:.2f} {contour_text}"
-
-        cv2.putText(
-            debug,
-            text1,
-            (x1, max(30, y1 - 15)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            FONT_SCALE_STATUS,
-            color,
-            FONT_THICKNESS,
-        )
-        cv2.putText(
-            debug,
-            text2,
-            (x1, max(55, y1 + 20)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            FONT_SCALE_DETAIL,
-            (255, 255, 0),
-            FONT_THICKNESS,
-        )
-        cv2.putText(
-            debug,
-            text3,
-            (x1, max(80, y1 + 45)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            FONT_SCALE_DETAIL,
-            (255, 255, 0),
-            FONT_THICKNESS,
-        )
-
-    return debug
-
-
-# ============================================================
-# SAM2 ESTIMATOR
-# ============================================================
-
-class SAM2Estimator:
-    def __init__(self, annotate: bool = True):
-        self.annotate = annotate
-
-        print("===================================")
-        print("[SAM2Estimator] Initializing...")
-        print("[SAM2Estimator] Loading GT...")
-
-        self.gt_data = load_gt(GT_PATH)
-        self.gt_results = load_gt_masks(self.gt_data)
-
-        if len(self.gt_results) != 2:
-            raise RuntimeError("Failed to load LEFT and RIGHT GT masks.")
-
+DINOV3_ROOT = PROJECT_ROOT / "service" / "dinov3"
+WEIGHTS = PROJECT_ROOT / "model" / "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
+GT_PATH = PROJECT_ROOT / "service" / "BOX_CHECK" / "GT" / "gt.json"
+
+IMAGE_SIZE = 224
+PATCH_GRID = 14
+MASK_THRESHOLD = 0.25
+
+SIM_THRESHOLD = 0.75
+COVERAGE_THRESHOLD = 0.4
+
+PRESENT_LABEL = "PRESENT"
+ABSENT_LABEL = "ABSENT"
+
+PRESENT_COLOR = (0, 0, 255)
+ABSENT_COLOR = (0, 255, 0)
+PATCH_COLOR = (255, 255, 0)
+
+
+class DINOv3Estimator:
+    def __init__(
+        self,
+        sim_threshold: float = SIM_THRESHOLD,
+        coverage_threshold: float = COVERAGE_THRESHOLD,
+        present_label: str = PRESENT_LABEL,
+        absent_label: str = ABSENT_LABEL,
+    ):
+        self.sim_threshold = float(sim_threshold)
+        self.coverage_threshold = float(coverage_threshold)
+        self.present_label = present_label
+        self.absent_label = absent_label
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[SAM2Estimator] Device: {self.device}")
 
-        model = build_sam2_from_file(
-            SAM2_CONFIG,
-            SAM2_CHECKPOINT,
-            self.device,
-        )
-        self.predictor = SAM2ImagePredictor(model)
+        self.model = torch.hub.load(
+            str(DINOV3_ROOT),
+            "dinov3_vits16",
+            source="local",
+            weights=str(WEIGHTS),
+        ).to(self.device).eval()
 
-        print("[SAM2Estimator] Ready")
-        print("===================================")
+        self.gt_data = json.loads(GT_PATH.read_text())
+        gt_image_path = PROJECT_ROOT / self.gt_data["image"]
+        gt_image = cv2.imread(str(gt_image_path))
 
-    def _sam_predict(
-        self,
-        bbox: List[int],
-    ) -> Tuple[Optional[np.ndarray], float]:
-        box = np.asarray(bbox, dtype=np.float32)
+        if gt_image is None:
+            raise FileNotFoundError(f"Cannot read GT image: {gt_image_path}")
 
-        try:
-            with torch.inference_mode():
-                if self.device.startswith("cuda") and USE_BFLOAT16:
-                    with torch.autocast(
-                        device_type="cuda",
-                        dtype=torch.bfloat16,
-                    ):
-                        masks, scores, _ = self.predictor.predict(
-                            box=box,
-                            multimask_output=True,
-                            return_logits=False,
-                        )
-                else:
-                    masks, scores, _ = self.predictor.predict(
-                        box=box,
-                        multimask_output=True,
-                        return_logits=False,
-                    )
-        except Exception as e:
-            print(f"[ERROR] SAM2 prediction failed: {e}")
-            return None, 0.0
+        self.reference: Dict[str, Dict[str, Any]] = {}
 
-        masks, scores = np.asarray(masks), np.asarray(scores)
-
-        if masks.ndim == 4:
-            masks = masks[0]
-        if scores.ndim > 1:
-            scores = scores[0]
-        if len(masks) == 0:
-            return None, 0.0
-
-        best_idx = int(np.argmax(scores))
-        return np.asarray(masks[best_idx], dtype=bool), float(scores[best_idx])
-
-    def _generate_input_masks(
-        self,
-        rgb: np.ndarray,
-    ) -> List[Dict[str, Any]]:
-        input_rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-
-        with torch.inference_mode():
-            if self.device.startswith("cuda") and USE_BFLOAT16:
-                with torch.autocast(
-                    device_type="cuda",
-                    dtype=torch.bfloat16,
-                ):
-                    self.predictor.set_image(input_rgb)
-            else:
-                self.predictor.set_image(input_rgb)
-
-        height, width = rgb.shape[:2]
-        results = []
-
-        for obj in self.gt_results:
-            index = obj["index"]
+        for obj in self.gt_data["objects"]:
             side = obj["side"]
             bbox = obj["bbox"]
-            x1, y1, x2, y2 = bbox
+            gt_roi = self._crop_bbox(gt_image, bbox)
 
-            if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
-                print(f"[WARNING] Invalid bbox for {side}")
-                results.append({
-                    "index": index,
-                    "side": side,
-                    "bbox": bbox,
-                    "mask": None,
-                    "score": 0.0,
-                })
-                continue
+            mask_path = PROJECT_ROOT / obj["mask"]["file"]
+            full_mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
 
-            mask, score = self._sam_predict(bbox)
-            results.append({
-                "index": index,
-                "side": side,
+            if full_mask is None:
+                raise FileNotFoundError(f"Cannot read GT mask: {mask_path}")
+
+            mask_roi = self._crop_bbox(full_mask, bbox)
+            ear_mask = self._get_patch_mask(mask_roi)
+            gt_feat = self._extract_features(gt_roi)
+
+            self.reference[side] = {
                 "bbox": bbox,
-                "mask": mask,
-                "score": score,
-            })
+                "feature": gt_feat,
+                "mask": ear_mask,
+            }
 
-        return results
+    def _crop_bbox(self, image: np.ndarray, bbox):
+        h, w = image.shape[:2]
+        x1, y1, x2, y2 = map(int, bbox)
+        x1, x2 = max(0, x1), min(w, x2)
+        y1, y2 = max(0, y1), min(h, y2)
 
-    def predict(self, rgb: np.ndarray) -> Dict[str, Any]:
-        if rgb is None:
-            raise ValueError("SAM2Estimator.predict(): rgb is None")
-        if not isinstance(rgb, np.ndarray):
-            raise TypeError("SAM2Estimator.predict(): rgb must be numpy.ndarray")
-        if rgb.ndim != 3 or rgb.shape[2] != 3:
-            raise ValueError(
-                "SAM2Estimator.predict(): rgb must have shape (H, W, 3)"
-            )
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError(f"Invalid bbox: {bbox}")
 
-        image_size = self.gt_data.get("image_size")
-        if image_size is not None:
-            expected_w, expected_h = int(image_size[0]), int(image_size[1])
-            actual_h, actual_w = rgb.shape[:2]
+        return image[y1:y2, x1:x2]
 
-            if actual_w != expected_w or actual_h != expected_h:
-                raise ValueError(
-                    f"Input image resolution ({actual_w}x{actual_h}) "
-                    f"does not match GT ({expected_w}x{expected_h})"
-                )
-
-        input_results = self._generate_input_masks(rgb)
-
-        comparisons = [
-            compare_object(
-                gt_mask=self.gt_results[i]["mask"],
-                input_mask=input_results[i]["mask"],
-                input_score=input_results[i]["score"],
-            )
-            for i in range(2)
-        ]
-
-        debug_image = (
-            draw_debug(
-                rgb,
-                self.gt_results,
-                input_results,
-                comparisons,
-            )
-            if self.annotate
-            else None
+    def _extract_features(self, image: np.ndarray) -> torch.Tensor:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        image = cv2.resize(
+            image,
+            (IMAGE_SIZE, IMAGE_SIZE),
+            interpolation=cv2.INTER_AREA,
         )
 
+        x = torch.from_numpy(image).permute(2, 0, 1).float().div(255.0)
+        x = x.unsqueeze(0).to(self.device)
+
+        with torch.inference_mode():
+            feat = self.model.forward_features(x)["x_norm_patchtokens"][0]
+
+        return F.normalize(feat, dim=-1)
+
+    def _get_patch_mask(self, mask: np.ndarray) -> np.ndarray:
+        small = cv2.resize(
+            mask.astype(np.uint8),
+            (PATCH_GRID, PATCH_GRID),
+            interpolation=cv2.INTER_AREA,
+        )
+        return small >= MASK_THRESHOLD
+
+    def _evaluate(
+        self,
+        gt_feat: torch.Tensor,
+        input_feat: torch.Tensor,
+        ear_mask: np.ndarray,
+    ):
+        gt_feat = gt_feat.reshape(PATCH_GRID, PATCH_GRID, -1)
+        input_feat = input_feat.reshape(PATCH_GRID, PATCH_GRID, -1)
+
+        similarity = (gt_feat * input_feat).sum(dim=-1)
+        ear_mask_t = torch.from_numpy(ear_mask).to(self.device)
+        scores = similarity[ear_mask_t]
+        scores_np = scores.detach().cpu().numpy()
+
+        pass_mask = (similarity >= self.sim_threshold) & ear_mask_t
+        coverage = float(pass_mask[ear_mask_t].float().mean())
+        mean_similarity = float(scores.mean())
+        median_similarity = float(scores.median())
+        p10_similarity = float(np.percentile(scores_np, 10))
+
+        is_present = coverage >= self.coverage_threshold
+        label = self.present_label if is_present else self.absent_label
+
         return {
-            "left": bool(comparisons[0]["exists"]),
-            "right": bool(comparisons[1]["exists"]),
-            "debug_image": debug_image,
-            "left_result": comparisons[0],
-            "right_result": comparisons[1],
+            "label": label,
+            "present": is_present,
+            "coverage": coverage,
+            "coverage_percent": coverage * 100.0,
+            "mean_similarity": mean_similarity,
+            "median_similarity": median_similarity,
+            "p10_similarity": p10_similarity,
+            "similarity_threshold": self.sim_threshold,
+            "coverage_threshold": self.coverage_threshold,
+            "patch_count": int(len(scores_np)),
+            "pass_patch_count": int(pass_mask.sum().item()),
+            "pass_mask": pass_mask.detach().cpu().numpy(),
+            "similarity_map": similarity.detach().cpu().numpy(),
         }
 
+    def _draw_debug(
+        self,
+        image: np.ndarray,
+        side: str,
+        bbox,
+        evaluation: Dict[str, Any],
+    ):
+        x1, y1, x2, y2 = map(int, bbox)
+        color = PRESENT_COLOR if evaluation["present"] else ABSENT_COLOR
 
-# ============================================================
-# MAIN
-# ============================================================
+        debug = image.copy()
+        overlay = debug.copy()
+
+        roi_w = max(1, x2 - x1)
+        roi_h = max(1, y2 - y1)
+
+        pass_mask = evaluation["pass_mask"]
+
+        for row, col in zip(*np.where(pass_mask)):
+            px1 = x1 + int(col * roi_w / PATCH_GRID)
+            py1 = y1 + int(row * roi_h / PATCH_GRID)
+            px2 = x1 + int((col + 1) * roi_w / PATCH_GRID)
+            py2 = y1 + int((row + 1) * roi_h / PATCH_GRID)
+
+            cv2.rectangle(
+                overlay,
+                (px1, py1),
+                (px2, py2),
+                PATCH_COLOR,
+                -1,
+            )
+
+        debug = cv2.addWeighted(overlay, 0.28, debug, 0.72, 0)
+
+        cv2.rectangle(
+            debug,
+            (x1, y1),
+            (x2, y2),
+            color,
+            3,
+        )
+
+        label = evaluation["label"]
+        coverage = evaluation["coverage_percent"]
+        text = f"{side.upper()}: {label}  cov={coverage:.1f}%"
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.75
+        thickness = 2
+
+        (tw, th), baseline = cv2.getTextSize(
+            text,
+            font,
+            scale,
+            thickness,
+        )
+
+        text_y = max(th + baseline + 4, y1)
+        bg_y1 = max(0, text_y - th - baseline - 6)
+        bg_y2 = min(debug.shape[0], text_y + 3)
+        bg_x2 = min(debug.shape[1], x1 + tw + 10)
+
+        cv2.rectangle(
+            debug,
+            (x1, bg_y1),
+            (bg_x2, bg_y2),
+            color,
+            -1,
+        )
+
+        text_color = (255, 255, 255)
+
+        cv2.putText(
+            debug,
+            text,
+            (x1 + 5, text_y - 2),
+            font,
+            scale,
+            text_color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+        return debug
+
+    def predict(self, rgb: np.ndarray) -> Dict[str, Any]:
+        if rgb is None or not isinstance(rgb, np.ndarray):
+            raise ValueError("rgb must be a numpy.ndarray")
+
+        debug_image = rgb.copy()
+
+        result = {
+            "left": None,
+            "right": None,
+            "debug_image": debug_image,
+        }
+
+        for side, ref in self.reference.items():
+            input_roi = self._crop_bbox(rgb, ref["bbox"])
+            input_feat = self._extract_features(input_roi)
+
+            evaluation = self._evaluate(
+                ref["feature"],
+                input_feat,
+                ref["mask"],
+            )
+
+            pass_mask = evaluation.pop("pass_mask")
+            similarity_map = evaluation.pop("similarity_map")
+
+            evaluation["pass_mask"] = pass_mask
+            evaluation["similarity_map"] = similarity_map
+
+            result[side] = evaluation
+
+            debug_image = self._draw_debug(
+                debug_image,
+                side,
+                ref["bbox"],
+                evaluation,
+            )
+
+        result["debug_image"] = debug_image
+        return result
 
 if __name__ == "__main__":
-    import argparse
+    import sys
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="Input RGB image")
-    parser.add_argument(
-        "--output",
-        default="debug_image.jpg",
-        help="Debug image output path",
+    image_path = (
+        Path(sys.argv[1])
+        if len(sys.argv) > 1
+        else PROJECT_ROOT / "dino_test" / "hard.png"
     )
-    args = parser.parse_args()
 
-    image = cv2.imread(args.input)
+    image = cv2.imread(str(image_path))
+
     if image is None:
-        raise RuntimeError(f"Cannot load image: {args.input}")
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
 
-    estimator = SAM2Estimator()
+    estimator = DINOv3Estimator()
     result = estimator.predict(image)
 
-    print(f"LEFT  : {'PRESENT' if result['left'] else 'ABSENT'}")
-    print(f"RIGHT : {'PRESENT' if result['right'] else 'ABSENT'}")
-    print(f"LEFT IoU: {result['left_result']['iou']:.4f}")
-    print(f"RIGHT IoU: {result['right_result']['iou']:.4f}")
+    print(f"Device: {estimator.device}")
+    print(f"SIM_THRESHOLD: {estimator.sim_threshold}")
+    print(f"COVERAGE_THRESHOLD: {estimator.coverage_threshold}")
 
-    if result["debug_image"] is not None:
-        cv2.imwrite(args.output, result["debug_image"])
-        print(f"Debug image saved to: {args.output}")
+    for side in ("left", "right"):
+        item = result[side]
+        print(
+            f"{side}: {item['label']} | "
+            f"coverage={item['coverage_percent']:.1f}% | "
+            f"mean={item['mean_similarity']:.4f}"
+        )
+
+    debug_path = PROJECT_ROOT / "dino_test" / "debug_result.png"
+    cv2.imwrite(str(debug_path), result["debug_image"])
+    print(f"Debug image: {debug_path}")

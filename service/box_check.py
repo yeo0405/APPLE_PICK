@@ -16,7 +16,7 @@ APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
-from BOX_CHECK.ear_esitimator import SAM2Estimator as EarEstimator
+from BOX_CHECK.ear_esitimator import DINOv3Estimator as EarEstimator
 
 # ============================================================
 # CONFIG

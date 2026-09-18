@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""ROS 2 endpoint for RACE-6D RGB-D pose prediction."""
+"""ROS 2 endpoint for RACE-6D RGB-D pose prediction and SAM2 box check."""
 
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -11,15 +11,17 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose, TransformStamped
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
 
 from RACE_6D.core import PoseEstimator
+from BOX_CHECK.ear_esitimator import DINOv3Estimator
 from tomo_camera_tcp import CameraTCPClient
 
 
 class PoseNode(Node):
-    """Keep one RACE-6D model and camera alive."""
+    """Keep RACE-6D, DINOv3 and camera alive."""
 
     def __init__(self, cfg: Dict[str, Any], args: Any) -> None:
         super().__init__("pose6dof_ros_node")
@@ -37,7 +39,7 @@ class PoseNode(Node):
         race_cfg = cfg["RACE_6D"]
 
         # ------------------------------------------------------------
-        # Label → object name mapping
+        # RACE-6D label mapping
         # ------------------------------------------------------------
 
         label_names = race_cfg.get("LABEL_NAMES")
@@ -85,7 +87,7 @@ class PoseNode(Node):
             model_path = project_root / model_path
 
         self.get_logger().info("==============================")
-        self.get_logger().info("RACE-6D ROS Node")
+        self.get_logger().info("RACE-6D + BOX CHECK ROS Node")
         self.get_logger().info(f"Model config : {model_config}")
         self.get_logger().info(f"Model path   : {model_path}")
         self.get_logger().info(f"Device       : {args.device}")
@@ -119,6 +121,35 @@ class PoseNode(Node):
         )
 
         # ------------------------------------------------------------
+        # SAM2 Box Check
+        # ------------------------------------------------------------
+
+        box_cfg = cfg.get("BOX_CHECK", {})
+
+        self.box_check_enabled = bool(
+            box_cfg.get("ENABLED", True)
+        )
+
+        self.box_check_estimator: Optional[DINOv3Estimator] = None
+
+        if self.box_check_enabled:
+            self.get_logger().info(
+                "Initializing DINOv3 Box Check..."
+            )
+
+            self.box_check_estimator = DINOv3Estimator(
+                annotate=True
+            )
+
+            self.get_logger().info(
+                "DINOv3 Box Check initialized."
+            )
+        else:
+            self.get_logger().info(
+                "SAM2 Box Check disabled."
+            )
+
+        # ------------------------------------------------------------
         # Camera
         # ------------------------------------------------------------
 
@@ -140,16 +171,28 @@ class PoseNode(Node):
         self.get_logger().info(
             "Camera intrinsic matrix loaded successfully:"
         )
-        self.get_logger().info(f"\n{self.camera_matrix}")
+        self.get_logger().info(
+            f"\n{self.camera_matrix}"
+        )
 
         # ------------------------------------------------------------
-        # ROS service
+        # RACE-6D service
         # ------------------------------------------------------------
 
         self.predict_srv = self.create_service(
             Trigger,
             "/pose6dof/predict",
             self.trigger_callback,
+        )
+
+        # ------------------------------------------------------------
+        # Box Check service
+        # ------------------------------------------------------------
+
+        self.box_check_srv = self.create_service(
+            Trigger,
+            "/box_check/predict",
+            self.box_check_callback,
         )
 
         # ------------------------------------------------------------
@@ -160,18 +203,40 @@ class PoseNode(Node):
 
         for label, name in self.label_names.items():
             topic = f"/pose6dof/{name}"
+
             self.pose_publishers[label] = self.create_publisher(
                 Pose,
                 topic,
                 10,
             )
+
             self.get_logger().info(
                 f"Pose topic: label={label} -> {topic}"
             )
 
+        # ------------------------------------------------------------
+        # RACE-6D debug image
+        # ------------------------------------------------------------
+
         self.debug_pub = self.create_publisher(
             Image,
             "/pose6dof/debug_image",
+            10,
+        )
+
+        # ------------------------------------------------------------
+        # Box Check result
+        # ------------------------------------------------------------
+
+        self.box_check_result_pub = self.create_publisher(
+            String,
+            "/box_check/result",
+            10,
+        )
+
+        self.box_check_debug_pub = self.create_publisher(
+            Image,
+            "/box_check/debug_image",
             10,
         )
 
@@ -184,8 +249,21 @@ class PoseNode(Node):
 
         self.get_logger().info("==============================")
         self.get_logger().info("RACE-6D ROS node started.")
-        self.get_logger().info("Service : /pose6dof/predict")
-        self.get_logger().info("Debug   : /pose6dof/debug_image")
+        self.get_logger().info(
+            "Service : /pose6dof/predict"
+        )
+        self.get_logger().info(
+            "Debug   : /pose6dof/debug_image"
+        )
+        self.get_logger().info(
+            "Service : /box_check/predict"
+        )
+        self.get_logger().info(
+            "Result  : /box_check/result"
+        )
+        self.get_logger().info(
+            "Debug   : /box_check/debug_image"
+        )
 
         for label, name in self.label_names.items():
             self.get_logger().info(
@@ -200,7 +278,6 @@ class PoseNode(Node):
         max_retries: int = 10,
         retry_delay: float = 0.5,
     ) -> np.ndarray:
-        """Wait for and load camera color intrinsic matrix."""
 
         self.get_logger().info(
             "Waiting for camera color intrinsic matrix..."
@@ -214,7 +291,10 @@ class PoseNode(Node):
                 last_value = matrix
 
                 if matrix is not None:
-                    matrix = np.asarray(matrix, dtype=np.float32)
+                    matrix = np.asarray(
+                        matrix,
+                        dtype=np.float32,
+                    )
 
                     self.get_logger().info(
                         f"Camera intrinsic attempt "
@@ -252,8 +332,6 @@ class PoseNode(Node):
 
     @staticmethod
     def _failed_pose() -> Pose:
-        """Create invalid pose message."""
-
         pose = Pose()
 
         pose.position.x = float("nan")
@@ -268,7 +346,25 @@ class PoseNode(Node):
         return pose
 
     def _debug(self, image: Optional[np.ndarray]) -> None:
-        """Publish debug image."""
+        if image is None:
+            return
+
+        msg = self.bridge.cv2_to_imgmsg(
+            image,
+            encoding="bgr8",
+        )
+
+        msg.header.stamp = (
+            self.get_clock().now().to_msg()
+        )
+        msg.header.frame_id = "camera"
+
+        self.debug_pub.publish(msg)
+
+    def _publish_box_debug(
+        self,
+        image: Optional[np.ndarray],
+    ) -> None:
 
         if image is None:
             return
@@ -277,16 +373,18 @@ class PoseNode(Node):
             image,
             encoding="bgr8",
         )
-        msg.header.stamp = self.get_clock().now().to_msg()
+
+        msg.header.stamp = (
+            self.get_clock().now().to_msg()
+        )
         msg.header.frame_id = "camera"
 
-        self.debug_pub.publish(msg)
+        self.box_check_debug_pub.publish(msg)
 
     def _publish_detection(
         self,
         detection: Dict[str, Any],
     ) -> None:
-        """Publish one detection according to its configured label."""
 
         label = detection.get("label")
 
@@ -301,8 +399,7 @@ class PoseNode(Node):
         if label not in self.label_names:
             self.get_logger().warning(
                 f"Detected label={label}, "
-                "but it is not configured in LABEL_NAMES. "
-                f"Known labels={list(self.label_names.keys())}"
+                "but it is not configured in LABEL_NAMES."
             )
             return
 
@@ -325,9 +422,6 @@ class PoseNode(Node):
         pose.position.y = float(t[1])
         pose.position.z = float(t[2])
 
-        # RACE-6D: [qw, qx, qy, qz]
-        # ROS:     [qx, qy, qz, qw]
-
         pose.orientation.x = float(q[1])
         pose.orientation.y = float(q[2])
         pose.orientation.z = float(q[3])
@@ -335,13 +429,11 @@ class PoseNode(Node):
 
         publisher.publish(pose)
 
-        # ------------------------------------------------------------
-        # TF
-        # ------------------------------------------------------------
-
         tf = TransformStamped()
 
-        tf.header.stamp = self.get_clock().now().to_msg()
+        tf.header.stamp = (
+            self.get_clock().now().to_msg()
+        )
         tf.header.frame_id = self.parent_frame
         tf.child_frame_id = name
 
@@ -370,8 +462,6 @@ class PoseNode(Node):
             )
 
     def _get_camera_frame(self):
-        """Get one RGB-D frame from camera."""
-
         frame = self.camera.get_frame()
 
         if frame.is_empty:
@@ -399,6 +489,154 @@ class PoseNode(Node):
             return None, None
 
         return rgb, depth
+
+    def _get_camera_rgb(self):
+        frame = self.camera.get_frame()
+
+        if frame.is_empty:
+            self.get_logger().warning(
+                "Camera returned empty frame."
+            )
+            return None
+
+        rgb_frame = self.camera.get_color_frame()
+
+        if rgb_frame is None or rgb_frame.data is None:
+            self.get_logger().error(
+                "Camera returned empty RGB frame."
+            )
+            return None
+
+        rgb = rgb_frame.data
+
+        if not isinstance(rgb, np.ndarray):
+            rgb = np.asarray(rgb)
+
+        return rgb
+
+    # ============================================================
+    # BOX CHECK
+    # ============================================================
+
+    def box_check_callback(
+        self,
+        request: Trigger.Request,
+        response: Trigger.Response,
+    ) -> Trigger.Response:
+
+        del request
+
+        if not self.box_check_enabled:
+            response.success = False
+            response.message = "Box Check disabled."
+            return response
+
+        if self.processing:
+            response.success = False
+            response.message = "busy"
+            return response
+
+        if self.box_check_estimator is None:
+            response.success = False
+            response.message = "SAM2 estimator unavailable."
+            return response
+
+        self.processing = True
+
+        try:
+            self.get_logger().info(
+                "========================================"
+            )
+            self.get_logger().info(
+                "Box Check prediction triggered."
+            )
+
+            rgb = self._get_camera_rgb()
+
+            if rgb is None:
+                response.success = False
+                response.message = "camera failed"
+                return response
+
+            if rgb.ndim != 3 or rgb.shape[2] != 3:
+                raise RuntimeError(
+                    f"Invalid RGB shape: {rgb.shape}"
+                )
+
+            self.get_logger().info(
+                f"RGB: shape={rgb.shape}, dtype={rgb.dtype}"
+            )
+
+            self.get_logger().info(
+                "Running SAM2 Box Check..."
+            )
+
+            result = self.box_check_estimator.predict(rgb)
+
+            left = bool(result.get("left", False))
+            right = bool(result.get("right", False))
+
+            message = (
+                f"left:{str(left).lower()} "
+                f"right:{str(right).lower()}"
+            )
+
+            # --------------------------------------------------------
+            # Publish result topic
+            # --------------------------------------------------------
+
+            result_msg = String()
+            result_msg.data = message
+
+            self.box_check_result_pub.publish(
+                result_msg
+            )
+
+            # --------------------------------------------------------
+            # Publish debug image
+            # --------------------------------------------------------
+
+            debug_image = result.get("debug_image")
+
+            if debug_image is None:
+                debug_image = rgb
+
+            self._publish_box_debug(debug_image)
+
+            # --------------------------------------------------------
+            # Service response
+            # --------------------------------------------------------
+
+            response.success = True
+            response.message = message
+
+            self.get_logger().info(
+                f"Box Check result: {message}"
+            )
+
+            self.get_logger().info(
+                "========================================"
+            )
+
+        except Exception as error:
+            self.get_logger().error(
+                f"Box Check exception: "
+                f"{type(error).__name__}: {error}"
+            )
+
+            response.success = False
+            response.message = (
+                f"left:false right:false error:{error}"
+            )
+
+        finally:
+            self.processing = False
+
+        return response
+
+    # ============================================================
+    # RACE-6D
+    # ============================================================
 
     def trigger_callback(
         self,
@@ -437,6 +675,7 @@ class PoseNode(Node):
             self.get_logger().info(
                 f"RGB   : shape={rgb.shape}, dtype={rgb.dtype}"
             )
+
             self.get_logger().info(
                 f"Depth : shape={depth.shape}, dtype={depth.dtype}"
             )
@@ -474,10 +713,6 @@ class PoseNode(Node):
                     f"{camera_matrix.shape}"
                 )
 
-            # --------------------------------------------------------
-            # RACE-6D prediction
-            # --------------------------------------------------------
-
             self.get_logger().info(
                 "Running RACE-6D prediction..."
             )
@@ -499,15 +734,15 @@ class PoseNode(Node):
                 self._publish_failed_all()
 
                 response.success = False
-                response.message = "Invalid RACE-6D result."
+                response.message = (
+                    "Invalid RACE-6D result."
+                )
+
                 return response
 
-            # --------------------------------------------------------
-            # Debug all detections
-            # --------------------------------------------------------
-
             self.get_logger().info(
-                f"RACE-6D returned {len(detections)} detections."
+                f"RACE-6D returned "
+                f"{len(detections)} detections."
             )
 
             detected_labels = []
@@ -554,10 +789,6 @@ class PoseNode(Node):
                 f"Detected labels: {detected_labels}"
             )
 
-            # --------------------------------------------------------
-            # Publish every configured detection
-            # --------------------------------------------------------
-
             published_labels = set()
 
             for detection in detections:
@@ -576,11 +807,6 @@ class PoseNode(Node):
 
                 self._publish_detection(detection)
                 published_labels.add(label)
-
-            # --------------------------------------------------------
-            # Publish invalid pose for configured labels that
-            # were not detected.
-            # --------------------------------------------------------
 
             for label, name in self.label_names.items():
                 if label in published_labels:
@@ -601,12 +827,16 @@ class PoseNode(Node):
                 else rgb
             )
 
-            response.success = len(published_labels) > 0
+            response.success = (
+                len(published_labels) > 0
+            )
 
             if response.success:
                 published_names = [
                     self.label_names[label]
-                    for label in sorted(published_labels)
+                    for label in sorted(
+                        published_labels
+                    )
                 ]
 
                 response.message = (
@@ -615,7 +845,8 @@ class PoseNode(Node):
                 )
             else:
                 response.message = (
-                    "No configured RACE-6D object detected."
+                    "No configured RACE-6D "
+                    "object detected."
                 )
 
             self.get_logger().info(
@@ -641,8 +872,6 @@ class PoseNode(Node):
         return response
 
     def _publish_failed_all(self) -> None:
-        """Publish invalid poses for all configured objects."""
-
         failed = self._failed_pose()
 
         for label, publisher in self.pose_publishers.items():
@@ -650,12 +879,11 @@ class PoseNode(Node):
 
             self.get_logger().warning(
                 f"Published invalid pose for "
-                f"label={label} ({self.label_names[label]})."
+                f"label={label} "
+                f"({self.label_names[label]})."
             )
 
     def shutdown(self) -> None:
-        """Stop camera."""
-
         self.get_logger().info(
             "Shutting down PoseNode..."
         )
@@ -667,3 +895,66 @@ class PoseNode(Node):
             self.get_logger().warning(
                 f"Camera stop error: {error}"
             )
+
+
+def main():
+    import argparse
+    import yaml
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="Path to YAML configuration file.",
+    )
+
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="RACE-6D/SAM2 device.",
+    )
+
+    args = parser.parse_args()
+
+    config_path = Path(args.config).resolve()
+
+    if not config_path.is_file():
+        raise FileNotFoundError(
+            f"Config file not found: {config_path}"
+        )
+
+    with open(
+        config_path,
+        "r",
+        encoding="utf-8",
+    ) as f:
+        cfg = yaml.safe_load(f)
+
+    rclpy.init()
+
+    node = None
+
+    try:
+        node = PoseNode(cfg, args)
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    except Exception as error:
+        print(
+            f"[ERROR] ROS node failed: "
+            f"{type(error).__name__}: {error}"
+        )
+
+    finally:
+        if node is not None:
+            node.shutdown()
+            node.destroy_node()
+
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

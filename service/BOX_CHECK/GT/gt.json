@@ -10,40 +10,45 @@
             "index": 0,
             "side": "left",
             "bbox": [
-                704,
-                372,
-                770,
-                498
+                711,
+                381,
+                772,
+                491
             ],
             "mask": {
                 "index": 0,
                 "side": "left",
-                "file": "service/BOX_CHECK/GT/gt_masks/ripcord_0.png",
-                "score": 0.953125,
-                "area": 3309
+                "file": "service/BOX_CHECK/GT/gt_masks/ear_0.png",
+                "score": 0.9603234529495239,
+                "area": 3277
             }
         },
         {
             "index": 1,
             "side": "right",
             "bbox": [
-                1191,
-                370,
-                1261,
+                1196,
+                387,
+                1258,
                 503
             ],
             "mask": {
                 "index": 1,
                 "side": "right",
-                "file": "service/BOX_CHECK/GT/gt_masks/ripcord_1.png",
-                "score": 0.94140625,
-                "area": 3799
+                "file": "service/BOX_CHECK/GT/gt_masks/ear_1.png",
+                "score": 0.9538520574569702,
+                "area": 3693
             }
         }
     ],
     "sam2": {
-        "config": "model/sam2.1_hiera_s.yaml",
         "checkpoint": "model/sam2.1_hiera_small.pt",
-        "prompt_type": "box"
+        "config": "model/sam2.1_hiera_s.yaml",
+        "prompt_type": "box",
+        "selection": "highest_score",
+        "multimask_output": true,
+        "dynamic_multimask_via_stability": true,
+        "dynamic_multimask_stability_delta": 0.05,
+        "dynamic_multimask_stability_thresh": 0.98
     }
 }

@@ -1,0 +1,40 @@
+{
+    "image": "service/ALIGNMENT/GT/GT.jpg",
+    "image_size": [
+        1920,
+        1080
+    ],
+    "object_count": 1,
+    "objects": [
+        {
+            "index": 0,
+            "side": "object",
+            "bbox": [
+                1180,
+                464,
+                1201,
+                496
+            ],
+            "roi": [
+                704,
+                464,
+                1201,
+                624
+            ],
+            "class_id": 0,
+            "class_name": "ripcord",
+            "confidence": 0.10786925256252289,
+            "mask": {
+                "file": "service/ALIGNMENT/GT/gt_masks/object_0.png",
+                "area": 422
+            }
+        }
+    ],
+    "yolo": {
+        "checkpoint": "model/yolo_ripcord.pt",
+        "confidence_threshold": 0.01,
+        "iou_threshold": 0.7,
+        "roi_required": true,
+        "keep_largest_component": true
+    }
+}

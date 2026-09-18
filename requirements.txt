@@ -7,6 +7,8 @@ hydra-core>=1.3,<2.0
 omegaconf>=2.3,<3.0
 git+https://github.com/facebookresearch/sam2.git
 
+ultralytics
+
 torch>=2.0
 torchvision
 scipy
