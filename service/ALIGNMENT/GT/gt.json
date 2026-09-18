@@ -10,31 +10,58 @@
             "index": 0,
             "side": "object",
             "bbox": [
-                1180,
-                464,
-                1201,
-                496
+                772,
+                495,
+                1175,
+                610
             ],
             "roi": [
-                704,
-                464,
-                1201,
-                624
+                699,
+                437,
+                1232,
+                645
             ],
-            "class_id": 0,
-            "class_name": "ripcord",
-            "confidence": 0.10786925256252289,
+            "positive_points": [
+                [
+                    970,
+                    548
+                ],
+                [
+                    1145,
+                    587
+                ],
+                [
+                    821,
+                    513
+                ]
+            ],
+            "negative_points": [
+                [
+                    1189,
+                    568
+                ],
+                [
+                    757,
+                    573
+                ],
+                [
+                    761,
+                    546
+                ],
+                [
+                    1148,
+                    569
+                ]
+            ],
             "mask": {
                 "file": "service/ALIGNMENT/GT/gt_masks/object_0.png",
-                "area": 422
+                "area": 32246,
+                "sam_score": 0.9276654720306396
             }
         }
     ],
-    "yolo": {
-        "checkpoint": "model/yolo_ripcord.pt",
-        "confidence_threshold": 0.01,
-        "iou_threshold": 0.7,
-        "roi_required": true,
-        "keep_largest_component": true
+    "sam2": {
+        "config": "model/sam2.1_hiera_s.yaml",
+        "checkpoint": "model/sam2.1_hiera_small.pt"
     }
 }

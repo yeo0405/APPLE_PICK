@@ -7,37 +7,44 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import torch
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+from hydra.utils import instantiate
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = PROJECT_ROOT / "model"
-YOLO_CHECKPOINT = MODEL_DIR / "yolo_ripcord.pt"
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 GT_DIR = SCRIPT_DIR / "GT"
-INPUT_IMAGE = ""
 
-WINDOW_NAME = "YOLO Ripcord GT"
+SAM2_CONFIG = MODEL_DIR / "sam2.1_hiera_s.yaml"
+SAM2_CHECKPOINT = MODEL_DIR / "sam2.1_hiera_small.pt"
+
+WINDOW_NAME = "SAM2 Object GT"
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
 
-CONFIDENCE_THRESHOLD = 0.01
-IOU_THRESHOLD = 0.7
-KEEP_LARGEST_COMPONENT = True
 MIN_MASK_AREA = 100
-
-SELECTED_CONTOUR_THICKNESS = 4
 MASK_ALPHA = 0.35
+POINT_RADIUS = 8
+POINT_THICKNESS = 2
 FONT_SCALE = 0.65
 FONT_THICKNESS = 2
 
 image = None
 display = None
-model = None
-detection = None
+predictor = None
+INPUT_IMAGE = ""
+
 roi_start = None
 roi_end = None
 drawing_roi = False
+
+positive_points = []
+negative_points = []
+
+detection_mask = None
+detection_score = 0.0
 status_message = ""
 
 
@@ -51,171 +58,258 @@ def relative_to_project(path: str | Path) -> str:
 
 def find_gt_image() -> Path:
     extensions = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    images = sorted(p for p in GT_DIR.iterdir() if p.is_file() and p.suffix.lower() in extensions)
+    images = sorted(
+        p for p in GT_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() in extensions
+    )
     if not images:
         raise FileNotFoundError(f"No image found in GT folder: {GT_DIR}")
     if len(images) > 1:
         names = "\n".join(f"  {p.name}" for p in images)
-        raise RuntimeError(f"Expected exactly one image in {GT_DIR}, found {len(images)}:\n{names}")
+        raise RuntimeError(
+            f"Expected exactly one image in {GT_DIR}, found {len(images)}:\n{names}"
+        )
     return images[0]
-
-
-def keep_largest_component(mask: np.ndarray) -> np.ndarray:
-    mask_u8 = mask.astype(np.uint8)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
-    if n <= 1:
-        return mask.astype(bool)
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    idx = 1 + int(np.argmax(areas))
-    if int(stats[idx, cv2.CC_STAT_AREA]) < MIN_MASK_AREA:
-        return np.zeros_like(mask, dtype=bool)
-    return labels == idx
-
-
-def get_largest_contour(mask: np.ndarray):
-    mask_u8 = mask.astype(np.uint8) * 255
-    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return max(contours, key=cv2.contourArea) if contours else None
-
-
-def load_yolo():
-    global model
-    if not YOLO_CHECKPOINT.is_file():
-        raise FileNotFoundError(f"YOLO checkpoint not found: {YOLO_CHECKPOINT}")
-    print(f"[YOLO] Loading model: {YOLO_CHECKPOINT}")
-    model = YOLO(str(YOLO_CHECKPOINT))
-    print("[YOLO] Model loaded")
 
 
 def get_roi():
     if roi_start is None or roi_end is None:
         return None
+
     x1, x2 = sorted((roi_start[0], roi_end[0]))
     y1, y2 = sorted((roi_start[1], roi_end[1]))
+
     x1 = max(0, min(x1, image.shape[1] - 1))
     x2 = max(0, min(x2, image.shape[1] - 1))
     y1 = max(0, min(y1, image.shape[0] - 1))
     y2 = max(0, min(y2, image.shape[0] - 1))
+
     if x2 - x1 < 5 or y2 - y1 < 5:
         return None
+
     return x1, y1, x2, y2
 
 
-def run_yolo():
-    global detection, status_message
+def load_sam2():
+    global predictor
+
+    if not SAM2_CONFIG.is_file():
+        raise FileNotFoundError(f"SAM2 config not found: {SAM2_CONFIG}")
+
+    if not SAM2_CHECKPOINT.is_file():
+        raise FileNotFoundError(
+            f"SAM2 checkpoint not found: {SAM2_CHECKPOINT}"
+        )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"[SAM2] Device     : {device}")
+    print(f"[SAM2] Config     : {SAM2_CONFIG}")
+    print(f"[SAM2] Checkpoint : {SAM2_CHECKPOINT}")
+
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
+
+    if GlobalHydra.instance().is_initialized():
+        GlobalHydra.instance().clear()
+
+    with initialize_config_dir(
+        config_dir=str(SAM2_CONFIG.parent),
+        version_base=None,
+    ):
+        cfg = compose(config_name=SAM2_CONFIG.stem)
+
+    model = instantiate(cfg.model, _recursive_=True)
+
+    checkpoint = torch.load(
+        SAM2_CHECKPOINT,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    if "model" in checkpoint:
+        checkpoint = checkpoint["model"]
+
+    model.load_state_dict(checkpoint, strict=False)
+    model = model.to(device)
+    model.eval()
+
+    predictor = SAM2ImagePredictor(model)
+
+    print("[SAM2] Model loaded")
+
+
+def prepare_predictor():
     roi = get_roi()
-    if model is None or roi is None:
-        detection = None
-        status_message = "Draw a valid ROI first"
-        redraw()
-        return
+
+    if roi is None:
+        return None
 
     x1, y1, x2, y2 = roi
     crop = image[y1:y2, x1:x2]
 
-    print(f"[YOLO] ROI: [{x1}, {y1}, {x2}, {y2}]")
-    print("[YOLO] Running inference...")
+    predictor.set_image(
+        cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    )
 
-    try:
-        results = model.predict(
-            source=crop,
-            conf=CONFIDENCE_THRESHOLD,
-            iou=IOU_THRESHOLD,
-            verbose=False,
-        )
-    except Exception as error:
-        print(f"[ERROR] YOLO prediction failed: {error}")
-        detection = None
-        status_message = "YOLO prediction failed"
+    return roi
+
+
+def run_sam2():
+    global detection_mask
+    global detection_score
+    global status_message
+
+    roi = prepare_predictor()
+
+    if roi is None:
+        detection_mask = None
+        status_message = "Draw a valid ROI first"
         redraw()
         return
 
-    if not results or results[0].masks is None or results[0].boxes is None:
-        detection = None
-        status_message = "No YOLO mask found inside ROI"
-        print("[YOLO] No masks detected")
+    if not positive_points:
+        detection_mask = None
+        status_message = "Add at least one positive point (+)"
         redraw()
         return
 
-    result = results[0]
-    masks = result.masks.data.cpu().numpy()
-    boxes = result.boxes.xyxy.cpu().numpy()
-    confidences = result.boxes.conf.cpu().numpy()
-    classes = result.boxes.cls.cpu().numpy()
-    names = result.names
+    x1, y1, _, _ = roi
 
-    candidates = []
+    points = positive_points + negative_points
 
-    for i, mask_data in enumerate(masks):
-        mask = cv2.resize(
-            mask_data.astype(np.uint8),
-            (crop.shape[1], crop.shape[0]),
-            interpolation=cv2.INTER_NEAREST,
-        ).astype(bool)
+    labels = (
+        [1] * len(positive_points)
+        + [0] * len(negative_points)
+    )
 
-        if KEEP_LARGEST_COMPONENT:
-            mask = keep_largest_component(mask)
+    local_points = np.array(
+        [
+            [x - x1, y - roi[1]]
+            for x, y in points
+        ],
+        dtype=np.float32,
+    )
 
-        area = int(np.count_nonzero(mask))
-        if area < MIN_MASK_AREA:
-            continue
-
-        rx1, ry1, rx2, ry2 = boxes[i]
-        full_mask = np.zeros(image.shape[:2], dtype=bool)
-        full_mask[y1:y2, x1:x2] = mask
-
-        candidates.append({
-            "mask": full_mask,
-            "bbox": [float(rx1 + x1), float(ry1 + y1), float(rx2 + x1), float(ry2 + y1)],
-            "confidence": float(confidences[i]),
-            "class_id": int(classes[i]),
-            "class_name": names.get(int(classes[i]), str(int(classes[i]))),
-            "area": area,
-        })
-
-    if not candidates:
-        detection = None
-        status_message = "No valid YOLO mask inside ROI"
-        redraw()
-        return
-
-    detection = max(candidates, key=lambda d: d["confidence"])
+    point_labels = np.array(
+        labels,
+        dtype=np.int32,
+    )
 
     print(
-        f"[YOLO] Candidates={len(candidates)} | "
-        f"Selected class={detection['class_name']} "
-        f"conf={detection['confidence']:.4f} "
-        f"area={detection['area']}"
+        f"[SAM2] Positive={len(positive_points)} "
+        f"Negative={len(negative_points)}"
+    )
+
+    try:
+        masks, scores, _ = predictor.predict(
+            point_coords=local_points,
+            point_labels=point_labels,
+            multimask_output=True,
+        )
+    except Exception as error:
+        print(f"[ERROR] SAM2 prediction failed: {error}")
+        detection_mask = None
+        status_message = "SAM2 prediction failed"
+        redraw()
+        return
+
+    valid = [
+        i
+        for i, mask in enumerate(masks)
+        if int(np.count_nonzero(mask)) >= MIN_MASK_AREA
+    ]
+
+    if not valid:
+        detection_mask = None
+        status_message = "No valid SAM2 mask"
+        redraw()
+        return
+
+    best = max(
+        valid,
+        key=lambda i: float(scores[i]),
+    )
+
+    detection_mask = masks[best].astype(bool)
+    detection_score = float(scores[best])
+
+    area = int(np.count_nonzero(detection_mask))
+
+    print(
+        f"[SAM2] Selected mask={best} "
+        f"score={detection_score:.4f} "
+        f"area={area}"
     )
 
     status_message = (
-        f"Ripcord | Conf={detection['confidence']:.3f} | "
-        f"Area={detection['area']}"
+        f"SAM2 | Score={detection_score:.3f} | "
+        f"Area={area} | "
+        f"+{len(positive_points)} -{len(negative_points)}"
     )
+
     redraw()
 
 
-def overlay_mask(output: np.ndarray, mask: np.ndarray, color, alpha: float):
-    mask_bool = mask.astype(bool)
-    if not np.any(mask_bool):
+def overlay_mask(
+    output: np.ndarray,
+    mask: np.ndarray,
+    color,
+    alpha: float,
+):
+    if mask is None or not np.any(mask):
         return
-    output[mask_bool] = cv2.addWeighted(
-        output[mask_bool], 1.0 - alpha,
-        np.full_like(output[mask_bool], color), alpha, 0
+
+    output[mask] = cv2.addWeighted(
+        output[mask],
+        1.0 - alpha,
+        np.full_like(output[mask], color),
+        alpha,
+        0,
     )
+
+
+def get_full_mask() -> np.ndarray | None:
+    roi = get_roi()
+
+    if roi is None or detection_mask is None:
+        return None
+
+    x1, y1, x2, y2 = roi
+
+    full_mask = np.zeros(
+        image.shape[:2],
+        dtype=bool,
+    )
+
+    full_mask[
+        y1:y2,
+        x1:x2
+    ] = detection_mask
+
+    return full_mask
 
 
 def redraw():
     global display
+
     if image is None:
         return
 
     display = image.copy()
 
     roi = get_roi()
+
     if roi is not None:
         x1, y1, x2, y2 = roi
-        cv2.rectangle(display, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+        cv2.rectangle(
+            display,
+            (x1, y1),
+            (x2, y2),
+            (255, 0, 0),
+            2,
+        )
+
         cv2.putText(
             display,
             "ROI",
@@ -224,57 +318,98 @@ def redraw():
             FONT_SCALE,
             (255, 0, 0),
             FONT_THICKNESS,
+            cv2.LINE_AA,
         )
 
-    if detection is not None:
-        mask = detection["mask"]
-        overlay_mask(display, mask, (0, 255, 0), MASK_ALPHA)
+    full_mask = get_full_mask()
 
-        contour = get_largest_contour(mask)
-        if contour is not None:
+    if full_mask is not None:
+        overlay_mask(
+            display,
+            full_mask,
+            (0, 255, 0),
+            MASK_ALPHA,
+        )
+
+        mask_u8 = (
+            full_mask.astype(np.uint8) * 255
+        )
+
+        contours, _ = cv2.findContours(
+            mask_u8,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+
+        if contours:
             cv2.drawContours(
                 display,
-                [contour],
+                contours,
                 -1,
                 (0, 255, 0),
-                SELECTED_CONTOUR_THICKNESS,
+                3,
             )
 
-        x1, y1, x2, y2 = map(int, detection["bbox"])
-        cv2.rectangle(
+    for x, y in positive_points:
+        cv2.circle(
             display,
-            (x1, y1),
-            (x2, y2),
+            (x, y),
+            POINT_RADIUS,
             (0, 255, 0),
-            2,
+            -1,
         )
 
-        label = (
-            f"Ripcord {detection['confidence']:.3f} "
-            f"Area={detection['area']}"
-        )
         cv2.putText(
             display,
-            label,
-            (x1, max(25, y1 - 8)),
+            "+",
+            (x + 10, y - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
-            FONT_SCALE,
+            0.8,
             (0, 255, 0),
-            FONT_THICKNESS,
+            2,
+            cv2.LINE_AA,
+        )
+
+    for x, y in negative_points:
+        cv2.circle(
+            display,
+            (x, y),
+            POINT_RADIUS,
+            (0, 0, 255),
+            -1,
+        )
+
+        cv2.line(
+            display,
+            (x - 7, y - 7),
+            (x + 7, y + 7),
+            (255, 255, 255),
+            POINT_THICKNESS,
+        )
+
+        cv2.line(
+            display,
+            (x + 7, y - 7),
+            (x - 7, y + 7),
+            (255, 255, 255),
+            POINT_THICKNESS,
         )
 
     cv2.putText(
         display,
-        "Drag: ROI | R: Detect | S: Save | C: Clear | ESC: Exit",
+        "Left Drag: ROI | Left Click: + | Middle Click: - | "
+        "R: Refine | S: Save | C: Clear | ESC: Exit",
         (20, 35),
         cv2.FONT_HERSHEY_SIMPLEX,
         FONT_SCALE,
         (255, 255, 255),
         FONT_THICKNESS,
+        cv2.LINE_AA,
     )
 
     if roi is not None:
         x1, y1, x2, y2 = roi
+
         cv2.putText(
             display,
             f"ROI: [{x1}, {y1}, {x2}, {y2}]",
@@ -283,200 +418,337 @@ def redraw():
             0.6,
             (255, 255, 255),
             2,
+            cv2.LINE_AA,
         )
 
-    if detection is not None:
+    cv2.putText(
+        display,
+        f"Points: +{len(positive_points)} -{len(negative_points)}",
+        (20, 100),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    if detection_mask is not None:
         cv2.putText(
             display,
-            f"Detected: Conf={detection['confidence']:.3f}",
-            (20, 100),
+            f"SAM2: Score={detection_score:.3f} "
+            f"Area={int(np.count_nonzero(detection_mask))}",
+            (20, 132),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (0, 255, 0),
             2,
+            cv2.LINE_AA,
         )
 
     if status_message:
         cv2.putText(
             display,
             status_message,
-            (20, 132),
+            (20, 164),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
             (0, 255, 255),
             2,
+            cv2.LINE_AA,
         )
 
 
 def mouse_callback(event, x, y, flags, param):
-    global roi_start, roi_end, drawing_roi, detection, status_message
+    global roi_start, roi_end
+    global drawing_roi
+    global positive_points, negative_points
+    global detection_mask
+    global status_message
 
     if event == cv2.EVENT_LBUTTONDOWN:
-        roi_start = (x, y)
-        roi_end = (x, y)
-        drawing_roi = True
-        detection = None
-        status_message = "Release mouse to run YOLO"
-        redraw()
+        if get_roi() is None:
+            roi_start = (x, y)
+            roi_end = (x, y)
+            drawing_roi = True
+            detection_mask = None
+            positive_points.clear()
+            negative_points.clear()
+            status_message = "Drawing ROI..."
+            redraw()
+            return
+
+        roi = get_roi()
+
+        if roi is None:
+            return
+
+        x1, y1, x2, y2 = roi
+
+        if x1 <= x < x2 and y1 <= y < y2:
+            positive_points.append((x, y))
+            status_message = (
+                "Positive point added - press R"
+            )
+            redraw()
 
     elif event == cv2.EVENT_MOUSEMOVE and drawing_roi:
         roi_end = (x, y)
         redraw()
 
     elif event == cv2.EVENT_LBUTTONUP:
+        if not drawing_roi:
+            return
+
         roi_end = (x, y)
         drawing_roi = False
-        if get_roi() is None:
+
+        roi = get_roi()
+
+        if roi is None:
+            roi_start = None
+            roi_end = None
             status_message = "Invalid ROI"
+        else:
+            positive_points.clear()
+            negative_points.clear()
+            detection_mask = None
+            status_message = (
+                "ROI selected - add positive/negative points"
+            )
+
+        redraw()
+
+    elif event == cv2.EVENT_MBUTTONDOWN:
+        roi = get_roi()
+
+        if roi is None:
+            status_message = "Draw ROI first"
             redraw()
             return
-        run_yolo()
+
+        x1, y1, x2, y2 = roi
+
+        if x1 <= x < x2 and y1 <= y < y2:
+            negative_points.append((x, y))
+            status_message = (
+                "Negative point added - press R"
+            )
+            redraw()
 
 
 def save_gt() -> bool:
     global status_message
 
-    if detection is None:
-        print("[ERROR] No YOLO detection to save")
-        status_message = "No detection to save"
+    full_mask = get_full_mask()
+
+    if full_mask is None:
+        print("[ERROR] No valid SAM2 mask to save")
+        status_message = "No mask to save"
+        redraw()
+        return False
+
+    area = int(np.count_nonzero(full_mask))
+
+    if area < MIN_MASK_AREA:
+        print("[ERROR] Mask too small")
+        status_message = "Mask too small"
         redraw()
         return False
 
     roi = get_roi()
+
     if roi is None:
         print("[ERROR] No valid ROI")
         status_message = "No valid ROI"
         redraw()
         return False
 
-    mask = detection["mask"]
-    mask_area = int(np.count_nonzero(mask))
-
-    if mask_area < MIN_MASK_AREA:
-        print("[ERROR] Selected mask is too small")
-        status_message = "Mask too small"
-        redraw()
-        return False
-
-    output_path = GT_DIR / "gt.json"
     mask_dir = GT_DIR / "gt_masks"
-    mask_dir.mkdir(parents=True, exist_ok=True)
-    mask_path = mask_dir / "object_0.png"
+    mask_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    if not cv2.imwrite(str(mask_path), mask.astype(np.uint8) * 255):
-        print(f"[ERROR] Failed to save mask: {mask_path}")
+    mask_path = mask_dir / "object_0.png"
+    json_path = GT_DIR / "gt.json"
+
+    if not cv2.imwrite(
+        str(mask_path),
+        full_mask.astype(np.uint8) * 255,
+    ):
+        print(
+            f"[ERROR] Failed to save mask: {mask_path}"
+        )
         return False
 
-    x1, y1, x2, y2 = detection["bbox"]
-    rx1, ry1, rx2, ry2 = roi
+    x1, y1, x2, y2 = roi
+
+    ys, xs = np.where(full_mask)
+
+    bbox = [
+        int(xs.min()),
+        int(ys.min()),
+        int(xs.max() + 1),
+        int(ys.max() + 1),
+    ]
 
     data = {
         "image": relative_to_project(INPUT_IMAGE),
-        "image_size": [int(image.shape[1]), int(image.shape[0])],
+        "image_size": [
+            int(image.shape[1]),
+            int(image.shape[0]),
+        ],
         "object_count": 1,
         "objects": [{
             "index": 0,
             "side": "object",
-            "bbox": [
-                int(round(x1)),
-                int(round(y1)),
-                int(round(x2)),
-                int(round(y2)),
-            ],
+            "bbox": bbox,
             "roi": [
-                int(rx1),
-                int(ry1),
-                int(rx2),
-                int(ry2),
+                int(x1),
+                int(y1),
+                int(x2),
+                int(y2),
             ],
-            "class_id": int(detection["class_id"]),
-            "class_name": detection["class_name"],
-            "confidence": float(detection["confidence"]),
+            "positive_points": [
+                [int(x), int(y)]
+                for x, y in positive_points
+            ],
+            "negative_points": [
+                [int(x), int(y)]
+                for x, y in negative_points
+            ],
             "mask": {
                 "file": relative_to_project(mask_path),
-                "area": mask_area,
+                "area": area,
+                "sam_score": detection_score,
             },
         }],
-        "yolo": {
-            "checkpoint": relative_to_project(YOLO_CHECKPOINT),
-            "confidence_threshold": CONFIDENCE_THRESHOLD,
-            "iou_threshold": IOU_THRESHOLD,
-            "roi_required": True,
-            "keep_largest_component": KEEP_LARGEST_COMPONENT,
+        "sam2": {
+            "config": relative_to_project(
+                SAM2_CONFIG
+            ),
+            "checkpoint": relative_to_project(
+                SAM2_CHECKPOINT
+            ),
         },
     }
 
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    with open(
+        json_path,
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(
+            data,
+            f,
+            indent=4,
+            ensure_ascii=False,
+        )
 
     print("=" * 60)
     print("GT SAVED")
     print("=" * 60)
-    print(f"Image      : {INPUT_IMAGE}")
-    print(f"JSON       : {output_path}")
-    print(f"Mask       : {mask_path}")
-    print(f"ROI        : [{rx1}, {ry1}, {rx2}, {ry2}]")
-    print(f"BBox       : [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]")
-    print(f"Class      : {detection['class_name']} ({detection['class_id']})")
-    print(f"Confidence : {detection['confidence']:.4f}")
-    print(f"Mask area  : {mask_area}")
+    print(f"Image     : {INPUT_IMAGE}")
+    print(f"JSON      : {json_path}")
+    print(f"Mask      : {mask_path}")
+    print(f"ROI       : [{x1}, {y1}, {x2}, {y2}]")
+    print(f"BBox      : {bbox}")
+    print(f"Positive  : {len(positive_points)}")
+    print(f"Negative  : {len(negative_points)}")
+    print(f"SAM score : {detection_score:.4f}")
+    print(f"Mask area : {area}")
     print("=" * 60)
 
     status_message = "GT saved successfully"
     redraw()
+
     return True
 
 
 def main():
     global image, display, INPUT_IMAGE
+    global roi_start, roi_end
+    global positive_points, negative_points
+    global detection_mask
 
     if not GT_DIR.is_dir():
-        raise FileNotFoundError(f"GT folder not found: {GT_DIR}")
+        raise FileNotFoundError(
+            f"GT folder not found: {GT_DIR}"
+        )
 
     input_path = find_gt_image()
     INPUT_IMAGE = str(input_path)
+
     image = cv2.imread(INPUT_IMAGE)
 
     if image is None:
-        raise RuntimeError(f"Cannot load image: {INPUT_IMAGE}")
+        raise RuntimeError(
+            f"Cannot load image: {INPUT_IMAGE}"
+        )
 
     print("=" * 60)
-    print("YOLO RIPCORD GT ANNOTATION")
+    print("SAM2 OBJECT GT ANNOTATION")
     print("=" * 60)
     print(f"Image : {INPUT_IMAGE}")
-    print(f"Model : {YOLO_CHECKPOINT}")
+    print(f"Config: {SAM2_CONFIG}")
+    print(f"Model : {SAM2_CHECKPOINT}")
     print("=" * 60)
-    print("Drag = Select ROI")
-    print("R    = Re-run YOLO")
-    print("S    = Save GT")
-    print("C    = Clear ROI")
-    print("ESC  = Exit")
+    print("Left Drag    = Draw ROI")
+    print("Left Click   = Positive point (+)")
+    print("Middle Click = Negative point (-)")
+    print("R            = Refine SAM2")
+    print("S            = Save GT")
+    print("C            = Clear")
+    print("ESC          = Exit")
     print("=" * 60)
 
-    load_yolo()
+    load_sam2()
 
-    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WINDOW_NAME, WINDOW_WIDTH, WINDOW_HEIGHT)
-    cv2.setMouseCallback(WINDOW_NAME, mouse_callback)
+    cv2.namedWindow(
+        WINDOW_NAME,
+        cv2.WINDOW_NORMAL,
+    )
+
+    cv2.resizeWindow(
+        WINDOW_NAME,
+        WINDOW_WIDTH,
+        WINDOW_HEIGHT,
+    )
+
+    cv2.setMouseCallback(
+        WINDOW_NAME,
+        mouse_callback,
+    )
 
     redraw()
 
     while True:
-        cv2.imshow(WINDOW_NAME, display)
+        cv2.imshow(
+            WINDOW_NAME,
+            display,
+        )
+
         key = cv2.waitKey(20)
+
         if key != -1:
             key &= 0xFF
 
-        if key in (ord("s"), ord("S")):
+        if key in (ord("r"), ord("R")):
+            run_sam2()
+
+        elif key in (ord("s"), ord("S")):
             save_gt()
-        elif key in (ord("r"), ord("R")):
-            run_yolo()
+
         elif key in (ord("c"), ord("C")):
             roi_start = None
             roi_end = None
-            detection = None
-            status_message = "ROI cleared"
+            drawing_roi = False
+            positive_points.clear()
+            negative_points.clear()
+            detection_mask = None
+            status_message = "Cleared - draw ROI"
             redraw()
+
         elif key == 27:
             break
 
