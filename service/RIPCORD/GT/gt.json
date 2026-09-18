@@ -1,0 +1,78 @@
+{
+    "image": "service/RIPCORD/GT/gt.png",
+    "image_size": [
+        1920,
+        1080
+    ],
+    "roi": [
+        903,
+        228,
+        1428,
+        715
+    ],
+    "ripcord_count": 4,
+    "ripcords": [
+        {
+            "index": 0,
+            "center": [
+                1127,
+                343
+            ],
+            "mask": {
+                "index": 0,
+                "file": "service/RIPCORD/GT/gt_masks/ripcord_0.png",
+                "score": 0.97265625,
+                "area": 17783
+            }
+        },
+        {
+            "index": 1,
+            "center": [
+                1169,
+                412
+            ],
+            "mask": {
+                "index": 1,
+                "file": "service/RIPCORD/GT/gt_masks/ripcord_1.png",
+                "score": 0.96875,
+                "area": 19130
+            }
+        },
+        {
+            "index": 2,
+            "center": [
+                1216,
+                484
+            ],
+            "mask": {
+                "index": 2,
+                "file": "service/RIPCORD/GT/gt_masks/ripcord_2.png",
+                "score": 0.96484375,
+                "area": 20234
+            }
+        },
+        {
+            "index": 3,
+            "center": [
+                1264,
+                554
+            ],
+            "mask": {
+                "index": 3,
+                "file": "service/RIPCORD/GT/gt_masks/ripcord_3.png",
+                "score": 0.96484375,
+                "area": 21293
+            }
+        }
+    ],
+    "sam2": {
+        "checkpoint": "model/sam2.1_hiera_small.pt",
+        "config": "model/sam2.1_hiera_s.yaml",
+        "prompt_type": "point",
+        "multimask_output": true,
+        "selection": "highest_score",
+        "dynamic_multimask_via_stability": true,
+        "dynamic_multimask_stability_delta": 0.05,
+        "dynamic_multimask_stability_thresh": 0.98
+    }
+}
