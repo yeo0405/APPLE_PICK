@@ -5,6 +5,7 @@ CAMERA:
   IP: "192.168.0.238"
   # IP: "0.0.0.0"
   PORT: 9876
+
 # ==========================================================
 # RACE-6D
 # MODEL_CONFIG is relative to the APPLE_PICK project root.
@@ -18,9 +19,17 @@ RACE_6D:
   CLASS_ID: null
   DEPTH_Z_MAX_MM: 2000.0
   INVALID_DEPTH_VALUE: 65535
-  
+
   LABEL_NAMES:
     0: iphone14_plus
     1: brown_box
     2: flap
     3: iphone14_pro_max
+
+# ==========================================================
+# BOX CHECK
+# ==========================================================
+BOX_CHECK:
+  ENABLED: true
+  SIM_THRESHOLD: 0.9
+  COVERAGE_THRESHOLD: 0.1

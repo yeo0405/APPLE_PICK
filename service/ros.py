@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""ROS 2 endpoint for RACE-6D RGB-D pose prediction and SAM2 box check."""
+"""ROS 2 endpoint for RACE-6D RGB-D pose prediction and DINOv3 box check."""
 
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -38,10 +38,6 @@ class PoseNode(Node):
         camera_cfg = cfg["CAMERA"]
         race_cfg = cfg["RACE_6D"]
 
-        # ------------------------------------------------------------
-        # RACE-6D label mapping
-        # ------------------------------------------------------------
-
         label_names = race_cfg.get("LABEL_NAMES")
 
         if not isinstance(label_names, dict) or not label_names:
@@ -71,10 +67,6 @@ class PoseNode(Node):
             f"Configured labels: {self.label_names}"
         )
 
-        # ------------------------------------------------------------
-        # Resolve RACE-6D paths
-        # ------------------------------------------------------------
-
         project_root = Path(__file__).resolve().parents[1]
 
         model_config = Path(race_cfg["MODEL_CONFIG"])
@@ -87,16 +79,12 @@ class PoseNode(Node):
             model_path = project_root / model_path
 
         self.get_logger().info("==============================")
-        self.get_logger().info("RACE-6D + BOX CHECK ROS Node")
+        self.get_logger().info("RACE-6D + DINOv3 BOX CHECK ROS Node")
         self.get_logger().info(f"Model config : {model_config}")
         self.get_logger().info(f"Model path   : {model_path}")
         self.get_logger().info(f"Device       : {args.device}")
         self.get_logger().info(f"Labels       : {self.label_names}")
         self.get_logger().info("==============================")
-
-        # ------------------------------------------------------------
-        # RACE-6D
-        # ------------------------------------------------------------
 
         self.pose_estimator = PoseEstimator(
             model_path=str(model_path),
@@ -121,7 +109,7 @@ class PoseNode(Node):
         )
 
         # ------------------------------------------------------------
-        # SAM2 Box Check
+        # DINOv3 Box Check
         # ------------------------------------------------------------
 
         box_cfg = cfg.get("BOX_CHECK", {})
@@ -138,7 +126,12 @@ class PoseNode(Node):
             )
 
             self.box_check_estimator = DINOv3Estimator(
-                annotate=True
+                sim_threshold=float(
+                    box_cfg.get("SIM_THRESHOLD", 0.8)
+                ),
+                coverage_threshold=float(
+                    box_cfg.get("COVERAGE_THRESHOLD", 0.2)
+                ),
             )
 
             self.get_logger().info(
@@ -146,7 +139,7 @@ class PoseNode(Node):
             )
         else:
             self.get_logger().info(
-                "SAM2 Box Check disabled."
+                "DINOv3 Box Check disabled."
             )
 
         # ------------------------------------------------------------
@@ -176,7 +169,7 @@ class PoseNode(Node):
         )
 
         # ------------------------------------------------------------
-        # RACE-6D service
+        # Services
         # ------------------------------------------------------------
 
         self.predict_srv = self.create_service(
@@ -184,10 +177,6 @@ class PoseNode(Node):
             "/pose6dof/predict",
             self.trigger_callback,
         )
-
-        # ------------------------------------------------------------
-        # Box Check service
-        # ------------------------------------------------------------
 
         self.box_check_srv = self.create_service(
             Trigger,
@@ -215,7 +204,7 @@ class PoseNode(Node):
             )
 
         # ------------------------------------------------------------
-        # RACE-6D debug image
+        # Debug publishers
         # ------------------------------------------------------------
 
         self.debug_pub = self.create_publisher(
@@ -223,10 +212,6 @@ class PoseNode(Node):
             "/pose6dof/debug_image",
             10,
         )
-
-        # ------------------------------------------------------------
-        # Box Check result
-        # ------------------------------------------------------------
 
         self.box_check_result_pub = self.create_publisher(
             String,
@@ -249,21 +234,11 @@ class PoseNode(Node):
 
         self.get_logger().info("==============================")
         self.get_logger().info("RACE-6D ROS node started.")
-        self.get_logger().info(
-            "Service : /pose6dof/predict"
-        )
-        self.get_logger().info(
-            "Debug   : /pose6dof/debug_image"
-        )
-        self.get_logger().info(
-            "Service : /box_check/predict"
-        )
-        self.get_logger().info(
-            "Result  : /box_check/result"
-        )
-        self.get_logger().info(
-            "Debug   : /box_check/debug_image"
-        )
+        self.get_logger().info("Service : /pose6dof/predict")
+        self.get_logger().info("Debug   : /pose6dof/debug_image")
+        self.get_logger().info("Service : /box_check/predict")
+        self.get_logger().info("Result  : /box_check/result")
+        self.get_logger().info("Debug   : /box_check/debug_image")
 
         for label, name in self.label_names.items():
             self.get_logger().info(
@@ -515,7 +490,7 @@ class PoseNode(Node):
         return rgb
 
     # ============================================================
-    # BOX CHECK
+    # DINOv3 BOX CHECK
     # ============================================================
 
     def box_check_callback(
@@ -538,7 +513,7 @@ class PoseNode(Node):
 
         if self.box_check_estimator is None:
             response.success = False
-            response.message = "SAM2 estimator unavailable."
+            response.message = "DINOv3 estimator unavailable."
             return response
 
         self.processing = True
@@ -568,7 +543,7 @@ class PoseNode(Node):
             )
 
             self.get_logger().info(
-                "Running SAM2 Box Check..."
+                "Running DINOv3 Box Check..."
             )
 
             result = self.box_check_estimator.predict(rgb)
@@ -581,10 +556,6 @@ class PoseNode(Node):
                 f"right:{str(right).lower()}"
             )
 
-            # --------------------------------------------------------
-            # Publish result topic
-            # --------------------------------------------------------
-
             result_msg = String()
             result_msg.data = message
 
@@ -592,20 +563,14 @@ class PoseNode(Node):
                 result_msg
             )
 
-            # --------------------------------------------------------
-            # Publish debug image
-            # --------------------------------------------------------
-
             debug_image = result.get("debug_image")
 
             if debug_image is None:
                 debug_image = rgb
 
-            self._publish_box_debug(debug_image)
-
-            # --------------------------------------------------------
-            # Service response
-            # --------------------------------------------------------
+            self._publish_box_debug(
+                debug_image
+            )
 
             response.success = True
             response.message = message
@@ -900,6 +865,7 @@ class PoseNode(Node):
 def main():
     import argparse
     import yaml
+    import rclpy
 
     parser = argparse.ArgumentParser()
 
@@ -912,7 +878,7 @@ def main():
     parser.add_argument(
         "--device",
         default="cuda",
-        help="RACE-6D/SAM2 device.",
+        help="RACE-6D/DINOv3 device.",
     )
 
     args = parser.parse_args()

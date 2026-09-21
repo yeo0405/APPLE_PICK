@@ -1,5 +1,5 @@
 {
-    "image": "service/BOX_CHECK/GT/GT.jpg",
+    "image": "service/BOX_CHECK/GT/GT.png",
     "image_size": [
         1920,
         1080
@@ -9,42 +9,78 @@
         {
             "index": 0,
             "side": "left",
+            "polygon": [
+                [
+                    727,
+                    604
+                ],
+                [
+                    709,
+                    738
+                ],
+                [
+                    669,
+                    748
+                ],
+                [
+                    688,
+                    613
+                ]
+            ],
             "bbox": [
-                711,
-                381,
-                772,
-                491
+                669,
+                604,
+                727,
+                748
             ],
             "mask": {
                 "index": 0,
                 "side": "left",
                 "file": "service/BOX_CHECK/GT/gt_masks/ear_0.png",
-                "score": 0.9603234529495239,
-                "area": 3277
+                "score": 0.9419207572937012,
+                "area": 4264
             }
         },
         {
             "index": 1,
             "side": "right",
+            "polygon": [
+                [
+                    1185,
+                    600
+                ],
+                [
+                    1203,
+                    736
+                ],
+                [
+                    1243,
+                    738
+                ],
+                [
+                    1226,
+                    622
+                ]
+            ],
             "bbox": [
-                1196,
-                387,
-                1258,
-                503
+                1185,
+                600,
+                1243,
+                738
             ],
             "mask": {
                 "index": 1,
                 "side": "right",
                 "file": "service/BOX_CHECK/GT/gt_masks/ear_1.png",
-                "score": 0.9538520574569702,
-                "area": 3693
+                "score": 0.9474796652793884,
+                "area": 4027
             }
         }
     ],
     "sam2": {
         "checkpoint": "model/sam2.1_hiera_small.pt",
         "config": "model/sam2.1_hiera_s.yaml",
-        "prompt_type": "box",
+        "prompt_type": "polygon_to_bbox",
         "selection": "highest_score",
         "multimask_output": true,
         "dynamic_multimask_via_stability": true,
