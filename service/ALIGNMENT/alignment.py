@@ -11,7 +11,6 @@ import torch
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 from hydra.utils import instantiate
-
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 from .geometry import calculate_pose
@@ -19,43 +18,31 @@ from .geometry import calculate_pose
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = PROJECT_ROOT / "model"
-
 SAM2_CONFIG = MODEL_DIR / "sam2.1_hiera_s.yaml"
 SAM2_CHECKPOINT = MODEL_DIR / "sam2.1_hiera_small.pt"
-
 MIN_MASK_AREA = 100
+AXIS_LENGTH = 0.05
 
 
 def normalize_quaternion(q: np.ndarray) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64).reshape(4)
     norm = np.linalg.norm(q)
-
     if norm < 1e-12:
         raise ValueError("Invalid zero quaternion")
-
     q /= norm
-
     if q[3] < 0:
         q = -q
-
     return q
 
 
 def quaternion_inverse(q: np.ndarray) -> np.ndarray:
     q = normalize_quaternion(q)
-    return np.array(
-        [-q[0], -q[1], -q[2], q[3]],
-        dtype=np.float64,
-    )
+    return np.array([-q[0], -q[1], -q[2], q[3]], dtype=np.float64)
 
 
-def quaternion_multiply(
-    q1: np.ndarray,
-    q2: np.ndarray,
-) -> np.ndarray:
+def quaternion_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     x1, y1, z1, w1 = q1
     x2, y2, z2, w2 = q2
-
     return np.array([
         w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
         w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
@@ -73,18 +60,17 @@ def quaternion_to_euler(q: np.ndarray) -> np.ndarray:
     roll = np.arctan2(sinr, cosr)
 
     sinp = 2.0 * (w * y - z * x)
-    if abs(sinp) >= 1.0:
-        pitch = np.copysign(np.pi / 2.0, sinp)
-    else:
-        pitch = np.arcsin(sinp)
+    pitch = (
+        np.copysign(np.pi / 2.0, sinp)
+        if abs(sinp) >= 1.0
+        else np.arcsin(sinp)
+    )
 
     siny = 2.0 * (w * z + x * y)
     cosy = 1.0 - 2.0 * (y * y + z * z)
     yaw = np.arctan2(siny, cosy)
 
-    return np.degrees(
-        np.array([roll, pitch, yaw])
-    )
+    return np.degrees(np.array([roll, pitch, yaw]))
 
 
 class AlignmentEstimator:
@@ -95,7 +81,6 @@ class AlignmentEstimator:
     ):
         self.gt_json = Path(gt_json)
         self.gt_data = self._load_json(self.gt_json)
-
         self.gt_image_path = self._resolve_gt_image()
         self.gt_mask = self._load_gt_mask()
         self.gt_depth = self._load_gt_depth()
@@ -114,13 +99,10 @@ class AlignmentEstimator:
         self.gt_obb = self._load_gt_obb()
 
         self.device = device or (
-            "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
+            "cuda" if torch.cuda.is_available() else "cpu"
         )
 
         self.predictor = self._load_sam2()
-
         self.gt_height, self.gt_width = self.gt_image.shape[:2]
 
     @staticmethod
@@ -132,15 +114,8 @@ class AlignmentEstimator:
             return json.load(f)
 
     def _resolve_gt_image(self) -> Path:
-        for ext in (
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".bmp",
-            ".webp",
-        ):
+        for ext in (".jpg", ".jpeg", ".png", ".bmp", ".webp"):
             path = self.gt_json.parent / f"GT{ext}"
-
             if path.is_file():
                 return path
 
@@ -152,9 +127,7 @@ class AlignmentEstimator:
         objects = self.gt_data.get("objects", [])
 
         if not objects:
-            raise RuntimeError(
-                "gt.json contains no objects"
-            )
+            raise RuntimeError("gt.json contains no objects")
 
         mask_file = objects[0]["mask"]["file"]
         mask_path = self.gt_json.parent / mask_file
@@ -195,14 +168,10 @@ class AlignmentEstimator:
         obj = self.gt_data["objects"][0]
 
         if "xyz" not in obj:
-            raise RuntimeError(
-                "GT object contains no xyz"
-            )
+            raise RuntimeError("GT object contains no xyz")
 
         if "quaternion" not in obj:
-            raise RuntimeError(
-                "GT object contains no quaternion"
-            )
+            raise RuntimeError("GT object contains no quaternion")
 
         return {
             "location": np.asarray(
@@ -219,11 +188,7 @@ class AlignmentEstimator:
 
     def _load_gt_obb(self) -> Optional[Dict[str, Any]]:
         obj = self.gt_data["objects"][0]
-
-        if "obb" not in obj:
-            return None
-
-        return obj["obb"]
+        return obj.get("obb")
 
     def _load_sam2(self):
         if not SAM2_CONFIG.is_file():
@@ -243,9 +208,7 @@ class AlignmentEstimator:
             version_base=None,
             config_dir=str(SAM2_CONFIG.parent),
         ):
-            cfg = compose(
-                config_name=SAM2_CONFIG.stem,
-            )
+            cfg = compose(config_name=SAM2_CONFIG.stem)
 
         model = instantiate(cfg.model)
 
@@ -263,14 +226,10 @@ class AlignmentEstimator:
         )
 
         if missing:
-            print(
-                f"SAM2 missing keys: {len(missing)}"
-            )
+            print(f"SAM2 missing keys: {len(missing)}")
 
         if unexpected:
-            print(
-                f"SAM2 unexpected keys: {len(unexpected)}"
-            )
+            print(f"SAM2 unexpected keys: {len(unexpected)}")
 
         model.to(self.device)
         model.eval()
@@ -290,10 +249,7 @@ class AlignmentEstimator:
         if len(xs) < 3:
             return None
 
-        points = np.column_stack(
-            (xs, ys)
-        ).astype(np.float32)
-
+        points = np.column_stack((xs, ys)).astype(np.float32)
         rect = cv2.minAreaRect(points)
         (cx, cy), (width, height), angle = rect
 
@@ -308,40 +264,31 @@ class AlignmentEstimator:
             angle += 180.0
 
         return {
-            "center": (
-                float(cx),
-                float(cy),
-            ),
+            "center": (float(cx), float(cy)),
             "width": float(width),
             "height": float(height),
             "angle_deg": float(angle),
         }
 
     def _get_gt_bbox(self) -> np.ndarray:
-        obb = self.gt_obb
+        if self.gt_obb is not None:
+            cx, cy = self.gt_obb["center"]
+            width = float(self.gt_obb["width"])
+            height = float(self.gt_obb["height"])
+            angle = float(self.gt_obb["angle_deg"])
 
-        if obb is not None:
-            cx, cy = obb["center"]
-            width = float(obb["width"])
-            height = float(obb["height"])
-            angle = float(obb["angle_deg"])
-
-            box = cv2.boxPoints(
-                (
-                    (float(cx), float(cy)),
-                    (width, height),
-                    angle,
-                )
-            )
+            box = cv2.boxPoints((
+                (float(cx), float(cy)),
+                (width, height),
+                angle,
+            ))
 
             return box.astype(np.float32)
 
         ys, xs = np.where(self.gt_mask > 0)
 
         if len(xs) == 0:
-            raise RuntimeError(
-                "GT mask contains no pixels"
-            )
+            raise RuntimeError("GT mask contains no pixels")
 
         return np.array([
             [xs.min(), ys.min()],
@@ -354,11 +301,7 @@ class AlignmentEstimator:
         self,
         image: np.ndarray,
     ) -> Tuple[np.ndarray, float, np.ndarray]:
-        rgb = cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2RGB,
-        )
-
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         self.predictor.set_image(rgb)
 
         bbox = self._get_gt_bbox()
@@ -376,9 +319,7 @@ class AlignmentEstimator:
         )
 
         if masks is None or len(masks) == 0:
-            raise RuntimeError(
-                "SAM2 returned no masks"
-            )
+            raise RuntimeError("SAM2 returned no masks")
 
         scores = np.asarray(
             scores,
@@ -388,23 +329,17 @@ class AlignmentEstimator:
         candidates = []
 
         for i, candidate in enumerate(masks):
-            area = int(
-                np.count_nonzero(candidate)
-            )
+            area = int(np.count_nonzero(candidate))
 
             if area >= MIN_MASK_AREA:
-                candidates.append(
-                    (
-                        float(scores[i]),
-                        area,
-                        candidate,
-                    )
-                )
+                candidates.append((
+                    float(scores[i]),
+                    area,
+                    candidate,
+                ))
 
         if not candidates:
-            raise RuntimeError(
-                "SAM2 returned no valid mask"
-            )
+            raise RuntimeError("SAM2 returned no valid mask")
 
         candidates.sort(
             key=lambda x: x[0],
@@ -425,21 +360,14 @@ class AlignmentEstimator:
         depth: np.ndarray,
         K: np.ndarray,
     ) -> Optional[Dict[str, Any]]:
-        K = np.asarray(
-            K,
-            dtype=np.float64,
-        )
+        K = np.asarray(K, dtype=np.float64)
 
         if K.shape != (3, 3):
             raise ValueError(
                 f"K must have shape (3, 3), got {K.shape}"
             )
 
-        pose = calculate_pose(
-            mask,
-            depth,
-            K,
-        )
+        pose = calculate_pose(mask, depth, K)
 
         if pose is None:
             return None
@@ -452,10 +380,7 @@ class AlignmentEstimator:
                 "plane_mask": plane.get("plane_mask"),
             }
 
-        pose["geometry_debug"] = pose.get(
-            "orientation_debug"
-        )
-
+        pose["geometry_debug"] = pose.get("orientation_debug")
         return pose
 
     def _calculate_delta(
@@ -480,22 +405,15 @@ class AlignmentEstimator:
             input_pose["rotation"]
         )
 
-        delta_location = (
-            gt_location - input_location
-        )
+        delta_location = gt_location - input_location
 
         delta_rotation = quaternion_multiply(
             gt_rotation,
             quaternion_inverse(input_rotation),
         )
 
-        delta_rotation = normalize_quaternion(
-            delta_rotation
-        )
-
-        delta_euler = quaternion_to_euler(
-            delta_rotation
-        )
+        delta_rotation = normalize_quaternion(delta_rotation)
+        delta_euler = quaternion_to_euler(delta_rotation)
 
         delta_angle = 2.0 * np.arccos(
             np.clip(
@@ -515,6 +433,85 @@ class AlignmentEstimator:
         }
 
     @staticmethod
+    def _project_point(
+        point: np.ndarray,
+        K: np.ndarray,
+    ) -> Optional[Tuple[int, int]]:
+        point = np.asarray(
+            point,
+            dtype=np.float64,
+        ).reshape(3)
+
+        if point[2] <= 1e-8:
+            return None
+
+        x = (
+            K[0, 0] * point[0] / point[2]
+            + K[0, 2]
+        )
+        y = (
+            K[1, 1] * point[1] / point[2]
+            + K[1, 2]
+        )
+
+        if not np.isfinite([x, y]).all():
+            return None
+
+        return int(round(x)), int(round(y))
+
+    @classmethod
+    def _draw_axis(
+        cls,
+        image: np.ndarray,
+        origin_3d: np.ndarray,
+        axis_3d: np.ndarray,
+        K: np.ndarray,
+        color: Tuple[int, int, int],
+        label: str,
+    ) -> None:
+        origin = cls._project_point(
+            origin_3d,
+            K,
+        )
+
+        endpoint_3d = (
+            origin_3d
+            + axis_3d * AXIS_LENGTH
+        )
+
+        endpoint = cls._project_point(
+            endpoint_3d,
+            K,
+        )
+
+        if origin is None or endpoint is None:
+            return
+
+        cv2.arrowedLine(
+            image,
+            origin,
+            endpoint,
+            color,
+            3,
+            cv2.LINE_AA,
+            tipLength=0.15,
+        )
+
+        cv2.putText(
+            image,
+            label,
+            (
+                endpoint[0] + 8,
+                endpoint[1] - 8,
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    @staticmethod
     def _draw_text(
         image: np.ndarray,
         result: Dict[str, Any],
@@ -522,9 +519,7 @@ class AlignmentEstimator:
         input_pose = result.get("input_pose")
         delta = result.get("delta")
 
-        lines = [
-            f"",
-        ]
+        lines = [""]
 
         if input_pose is not None:
             location = np.asarray(
@@ -546,59 +541,6 @@ class AlignmentEstimator:
                 f"{rotation[2]:.4f}, "
                 f"{rotation[3]:.4f}",
             ])
-
-            plane = input_pose.get("plane")
-
-            # if plane is not None:
-            #     normal = np.asarray(
-            #         plane["normal"]
-            #     ).reshape(3)
-
-            #     lines.extend([
-            #         "Plane N: "
-            #         f"{normal[0]:.3f}, "
-            #         f"{normal[1]:.3f}, "
-            #         f"{normal[2]:.3f}",
-            #         f"Plane pts: "
-            #         f"{plane.get('point_count', 0)}",
-            #         f"Plane RMSE: "
-            #         f"{plane.get('rmse', 0.0):.5f}",
-            #         "Inset H/V: "
-            #         f"{plane.get('horizontal_inset', 0.0):.2f}/"
-            #         f"{plane.get('vertical_inset', 0.0):.2f}",
-            #     ])
-
-            geometry_debug = input_pose.get(
-                "orientation_debug"
-            )
-
-            # if geometry_debug is not None:
-            #     x_axis = np.asarray(
-            #         geometry_debug["x_axis"]
-            #     ).reshape(3)
-
-            #     y_axis = np.asarray(
-            #         geometry_debug["y_axis"]
-            #     ).reshape(3)
-
-            #     z_axis = np.asarray(
-            #         geometry_debug["z_axis"]
-            #     ).reshape(3)
-
-            #     lines.extend([
-            #         "X axis: "
-            #         f"{x_axis[0]:.3f}, "
-            #         f"{x_axis[1]:.3f}, "
-            #         f"{x_axis[2]:.3f}",
-            #         "Y axis: "
-            #         f"{y_axis[0]:.3f}, "
-            #         f"{y_axis[1]:.3f}, "
-            #         f"{y_axis[2]:.3f}",
-            #         "Z axis: "
-            #         f"{z_axis[0]:.3f}, "
-            #         f"{z_axis[1]:.3f}, "
-            #         f"{z_axis[2]:.3f}",
-            #     ])
 
         if delta is not None:
             location = np.asarray(
@@ -623,16 +565,15 @@ class AlignmentEstimator:
                 f"{rotation[1]:.4f}, "
                 f"{rotation[2]:.4f}, "
                 f"{rotation[3]:.4f}",
-                # "Delta Angle: "
-                # f"{delta['rotation_angle_deg']:.2f} deg",
                 "Delta RPY: "
                 f"{euler[0]:.2f}, "
                 f"{euler[1]:.2f}, "
                 f"{euler[2]:.2f}",
+                "Delta Angle: "
+                f"{delta['rotation_angle_deg']:.2f} deg",
             ])
 
-        x = 20
-        y = 30
+        x, y = 20, 30
 
         for line in lines:
             cv2.putText(
@@ -650,72 +591,108 @@ class AlignmentEstimator:
     def _draw_debug(
         self,
         image: np.ndarray,
-        mask: np.ndarray,
-        input_obb: Optional[Dict[str, Any]],
         result: Dict[str, Any],
+        K: np.ndarray,
     ) -> np.ndarray:
         debug = image.copy()
-        overlay = debug.copy()
 
-        overlay[mask > 0] = (
-            0.5 * overlay[mask > 0]
-            + 0.5 * np.array(
-                [0, 255, 0],
+        input_pose = result.get("input_pose")
+        plane_mask = None
+
+        if input_pose is not None:
+            debug_masks = input_pose.get("debug_masks")
+
+            if debug_masks is not None:
+                plane_mask = debug_masks.get("plane_mask")
+
+        if plane_mask is not None:
+            plane_mask = np.asarray(plane_mask) > 0
+
+            if plane_mask.shape == debug.shape[:2]:
+                overlay = debug.copy()
+                overlay[plane_mask] = (
+                    0.5 * overlay[plane_mask]
+                    + 0.5 * np.array(
+                        [0, 255, 0],
+                        dtype=np.float64,
+                    )
+                ).astype(np.uint8)
+
+                debug = cv2.addWeighted(
+                    debug,
+                    0.7,
+                    overlay,
+                    0.3,
+                    0.0,
+                )
+
+        if input_pose is not None:
+            location = np.asarray(
+                input_pose["location"],
                 dtype=np.float64,
+            ).reshape(3)
+
+            orientation_debug = input_pose.get(
+                "orientation_debug"
             )
-        ).astype(np.uint8)
 
-        debug = cv2.addWeighted(
-            debug,
-            0.7,
-            overlay,
-            0.3,
-            0.0,
-        )
+            if orientation_debug is not None:
+                x_axis = np.asarray(
+                    orientation_debug["x_axis"],
+                    dtype=np.float64,
+                ).reshape(3)
 
-        if self.gt_obb is not None:
-            cx, cy = self.gt_obb["center"]
-            width = float(self.gt_obb["width"])
-            height = float(self.gt_obb["height"])
-            angle = float(self.gt_obb["angle_deg"])
+                y_axis = np.asarray(
+                    orientation_debug["y_axis"],
+                    dtype=np.float64,
+                ).reshape(3)
 
-            box = cv2.boxPoints(
-                (
-                    (float(cx), float(cy)),
-                    (width, height),
-                    angle,
+                z_axis = np.asarray(
+                    orientation_debug["z_axis"],
+                    dtype=np.float64,
+                ).reshape(3)
+
+                origin = self._project_point(
+                    location,
+                    K,
                 )
-            ).astype(np.int32)
 
-            cv2.polylines(
-                debug,
-                [box],
-                True,
-                (255, 0, 0),
-                2,
-            )
+                if origin is not None:
+                    cv2.circle(
+                        debug,
+                        origin,
+                        7,
+                        (255, 255, 255),
+                        -1,
+                        cv2.LINE_AA,
+                    )
 
-        if input_obb is not None:
-            cx, cy = input_obb["center"]
-            width = float(input_obb["width"])
-            height = float(input_obb["height"])
-            angle = float(input_obb["angle_deg"])
-
-            box = cv2.boxPoints(
-                (
-                    (float(cx), float(cy)),
-                    (width, height),
-                    angle,
+                self._draw_axis(
+                    debug,
+                    location,
+                    x_axis,
+                    K,
+                    (0, 0, 255),
+                    "X",
                 )
-            ).astype(np.int32)
 
-            cv2.polylines(
-                debug,
-                [box],
-                True,
-                (0, 0, 255),
-                2,
-            )
+                self._draw_axis(
+                    debug,
+                    location,
+                    y_axis,
+                    K,
+                    (0, 255, 0),
+                    "Y",
+                )
+
+                self._draw_axis(
+                    debug,
+                    location,
+                    z_axis,
+                    K,
+                    (255, 0, 0),
+                    "Z",
+                )
 
         self._draw_text(
             debug,
@@ -731,24 +708,17 @@ class AlignmentEstimator:
         K: np.ndarray,
     ) -> Dict[str, Any]:
         if image is None:
-            raise ValueError(
-                "Input image is None"
-            )
+            raise ValueError("Input image is None")
 
         if depth is None:
-            raise ValueError(
-                "Input depth is None"
-            )
+            raise ValueError("Input depth is None")
 
         if K is None:
             raise ValueError(
                 "Camera intrinsic matrix K is None"
             )
 
-        K = np.asarray(
-            K,
-            dtype=np.float64,
-        )
+        K = np.asarray(K, dtype=np.float64)
 
         if K.shape != (3, 3):
             raise ValueError(
@@ -761,10 +731,7 @@ class AlignmentEstimator:
                 f"{image.shape[:2]} vs {depth.shape[:2]}"
             )
 
-        mask, score, bbox = self._predict_mask(
-            image
-        )
-
+        mask, score, bbox = self._predict_mask(image)
         input_obb = self._fit_obb(mask)
 
         input_pose = self._calculate_pose(
@@ -779,9 +746,7 @@ class AlignmentEstimator:
             input_pose is not None
             and input_pose.get("rotation") is not None
         ):
-            delta = self._calculate_delta(
-                input_pose
-            )
+            delta = self._calculate_delta(input_pose)
 
         result = {
             "present": input_obb is not None,
@@ -797,10 +762,8 @@ class AlignmentEstimator:
 
         result["debug_image"] = self._draw_debug(
             image,
-            mask,
-            input_obb,
             result,
+            K,
         )
 
         return result
-
