@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""ROS 2 endpoint for RACE-6D RGB-D pose prediction and DINOv3 box check."""
+"""ROS 2 endpoint for RACE-6D RGB-D pose prediction, DINOv3 box check and Alignment."""
 
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -17,11 +17,12 @@ from tf2_ros import TransformBroadcaster
 
 from RACE_6D.core import PoseEstimator
 from BOX_CHECK.ear_esitimator import DINOv3Estimator
+from ALIGNMENT.alignment import AlignmentEstimator
 from tomo_camera_tcp import CameraTCPClient
 
 
 class PoseNode(Node):
-    """Keep RACE-6D, DINOv3 and camera alive."""
+    """Keep RACE-6D, DINOv3, Alignment and camera alive."""
 
     def __init__(self, cfg: Dict[str, Any], args: Any) -> None:
         super().__init__("pose6dof_ros_node")
@@ -67,6 +68,7 @@ class PoseNode(Node):
             f"Configured labels: {self.label_names}"
         )
 
+        # Keep original RACE-6D project root unchanged.
         project_root = Path(__file__).resolve().parents[1]
 
         model_config = Path(race_cfg["MODEL_CONFIG"])
@@ -143,6 +145,55 @@ class PoseNode(Node):
             )
 
         # ------------------------------------------------------------
+        # Alignment
+        # ------------------------------------------------------------
+
+        alignment_cfg = cfg.get("ALIGNMENT", {})
+        self.alignment_enabled = bool(
+            alignment_cfg.get("ENABLED", True)
+        )
+
+        self.alignment_estimator: Optional[AlignmentEstimator] = None
+
+        if self.alignment_enabled:
+            alignment_root = Path(__file__).resolve().parent
+
+            gt_json = Path(
+                alignment_cfg.get(
+                    "GT_JSON",
+                    "ALIGNMENT/GT/gt.json",
+                )
+            )
+
+            if not gt_json.is_absolute():
+                gt_json = alignment_root / gt_json
+
+            self.get_logger().info(
+                "Initializing Alignment..."
+            )
+            self.get_logger().info(
+                f"Alignment GT: {gt_json}"
+            )
+
+            if not gt_json.is_file():
+                raise FileNotFoundError(
+                    f"Alignment GT JSON not found: {gt_json}"
+                )
+
+            self.alignment_estimator = AlignmentEstimator(
+                gt_json=gt_json,
+                device=args.device,
+            )
+
+            self.get_logger().info(
+                "Alignment initialized."
+            )
+        else:
+            self.get_logger().info(
+                "Alignment disabled."
+            )
+
+        # ------------------------------------------------------------
         # Camera
         # ------------------------------------------------------------
 
@@ -182,6 +233,12 @@ class PoseNode(Node):
             Trigger,
             "/box_check/predict",
             self.box_check_callback,
+        )
+
+        self.alignment_srv = self.create_service(
+            Trigger,
+            "/alignment/predict",
+            self.alignment_callback,
         )
 
         # ------------------------------------------------------------
@@ -225,12 +282,25 @@ class PoseNode(Node):
             10,
         )
 
+        self.alignment_result_pub = self.create_publisher(
+            Pose,
+            "/alignment/result",
+            10,
+        )
+
+        self.alignment_debug_pub = self.create_publisher(
+            Image,
+            "/alignment/debug_image",
+            10,
+        )
+
         # ------------------------------------------------------------
         # TF
         # ------------------------------------------------------------
 
         self.tf_broadcaster = TransformBroadcaster(self)
         self.parent_frame = "Head_camera_link"
+        self.ripcord_frame = "ripcord"
 
         self.get_logger().info("==============================")
         self.get_logger().info("RACE-6D ROS node started.")
@@ -239,6 +309,12 @@ class PoseNode(Node):
         self.get_logger().info("Service : /box_check/predict")
         self.get_logger().info("Result  : /box_check/result")
         self.get_logger().info("Debug   : /box_check/debug_image")
+        self.get_logger().info("Service : /alignment/predict")
+        self.get_logger().info("Result  : /alignment/result")
+        self.get_logger().info("Debug   : /alignment/debug_image")
+        self.get_logger().info(
+            f"Alignment TF: {self.parent_frame} -> {self.ripcord_frame}"
+        )
 
         for label, name in self.label_names.items():
             self.get_logger().info(
@@ -355,6 +431,26 @@ class PoseNode(Node):
         msg.header.frame_id = "camera"
 
         self.box_check_debug_pub.publish(msg)
+
+    def _publish_alignment_debug(
+        self,
+        image: Optional[np.ndarray],
+    ) -> None:
+
+        if image is None:
+            return
+
+        msg = self.bridge.cv2_to_imgmsg(
+            image,
+            encoding="bgr8",
+        )
+
+        msg.header.stamp = (
+            self.get_clock().now().to_msg()
+        )
+        msg.header.frame_id = "camera"
+
+        self.alignment_debug_pub.publish(msg)
 
     def _publish_detection(
         self,
@@ -593,6 +689,247 @@ class PoseNode(Node):
             response.message = (
                 f"left:false right:false error:{error}"
             )
+
+        finally:
+            self.processing = False
+
+        return response
+
+    # ============================================================
+    # ALIGNMENT
+    # ============================================================
+
+    def alignment_callback(
+        self,
+        request: Trigger.Request,
+        response: Trigger.Response,
+    ) -> Trigger.Response:
+
+        del request
+
+        if not self.alignment_enabled:
+            response.success = False
+            response.message = "Alignment disabled."
+            return response
+
+        if self.processing:
+            response.success = False
+            response.message = "busy"
+            return response
+
+        if self.alignment_estimator is None:
+            response.success = False
+            response.message = "Alignment estimator unavailable."
+            return response
+
+        self.processing = True
+
+        try:
+            self.get_logger().info(
+                "========================================"
+            )
+            self.get_logger().info(
+                "Alignment prediction triggered."
+            )
+
+            rgb, depth = self._get_camera_frame()
+
+            if rgb is None or depth is None:
+                response.success = False
+                response.message = "camera failed"
+                return response
+
+            if rgb.ndim != 3 or rgb.shape[2] != 3:
+                raise RuntimeError(
+                    f"Invalid RGB shape: {rgb.shape}"
+                )
+
+            if depth.ndim != 2:
+                raise RuntimeError(
+                    f"Invalid depth shape: {depth.shape}"
+                )
+
+            if depth.shape != rgb.shape[:2]:
+                raise RuntimeError(
+                    "RGB/depth resolution mismatch: "
+                    f"RGB={rgb.shape[:2]}, "
+                    f"Depth={depth.shape}"
+                )
+
+            if self.camera_matrix is None:
+                raise RuntimeError(
+                    "Camera intrinsic matrix is None."
+                )
+
+            camera_matrix = np.asarray(
+                self.camera_matrix,
+                dtype=np.float64,
+            )
+
+            if camera_matrix.shape != (3, 3):
+                raise RuntimeError(
+                    "Invalid camera intrinsic matrix shape: "
+                    f"{camera_matrix.shape}"
+                )
+
+            self.get_logger().info(
+                f"RGB   : shape={rgb.shape}, dtype={rgb.dtype}"
+            )
+            self.get_logger().info(
+                f"Depth : shape={depth.shape}, dtype={depth.dtype}"
+            )
+
+            self.get_logger().info(
+                "Running Alignment..."
+            )
+
+            result = self.alignment_estimator.predict(
+                image=rgb,
+                depth=depth,
+                K=camera_matrix,
+            )
+
+            input_pose = result.get("input_pose")
+            delta = result.get("delta")
+
+            debug_image = result.get("debug_image")
+
+            if debug_image is None:
+                debug_image = rgb
+
+            self._publish_alignment_debug(debug_image)
+
+            if input_pose is None:
+                response.success = False
+                response.message = "Alignment failed: no input pose."
+                return response
+
+            if delta is None:
+                response.success = False
+                response.message = "Alignment failed: no delta."
+                return response
+
+            location = np.asarray(
+                input_pose.get("location"),
+                dtype=np.float64,
+            )
+
+            rotation = np.asarray(
+                input_pose.get("rotation"),
+                dtype=np.float64,
+            )
+
+            delta_location = np.asarray(
+                delta.get("location"),
+                dtype=np.float64,
+            )
+
+            delta_rotation = np.asarray(
+                delta.get("rotation"),
+                dtype=np.float64,
+            )
+
+            if (
+                location.shape != (3,)
+                or rotation.shape != (4,)
+                or delta_location.shape != (3,)
+                or delta_rotation.shape != (4,)
+            ):
+                raise RuntimeError(
+                    "Invalid Alignment pose/delta shape."
+                )
+
+            if not (
+                np.all(np.isfinite(location))
+                and np.all(np.isfinite(rotation))
+                and np.all(np.isfinite(delta_location))
+                and np.all(np.isfinite(delta_rotation))
+            ):
+                raise RuntimeError(
+                    "Alignment returned non-finite pose/delta."
+                )
+
+            pose_msg = Pose()
+
+            pose_msg.position.x = float(delta_location[0])
+            pose_msg.position.y = float(delta_location[1])
+            pose_msg.position.z = float(delta_location[2])
+
+            # Alignment quaternion format: [qx, qy, qz, qw].
+            pose_msg.orientation.x = float(delta_rotation[0])
+            pose_msg.orientation.y = float(delta_rotation[1])
+            pose_msg.orientation.z = float(delta_rotation[2])
+            pose_msg.orientation.w = float(delta_rotation[3])
+
+            self.alignment_result_pub.publish(
+                pose_msg
+            )
+
+            tf = TransformStamped()
+
+            tf.header.stamp = (
+                self.get_clock().now().to_msg()
+            )
+            tf.header.frame_id = self.parent_frame
+            tf.child_frame_id = self.ripcord_frame
+
+            tf.transform.translation.x = float(location[0])
+            tf.transform.translation.y = float(location[1])
+            tf.transform.translation.z = float(location[2])
+
+            # Input pose quaternion format: [qx, qy, qz, qw].
+            tf.transform.rotation.x = float(rotation[0])
+            tf.transform.rotation.y = float(rotation[1])
+            tf.transform.rotation.z = float(rotation[2])
+            tf.transform.rotation.w = float(rotation[3])
+
+            self.tf_broadcaster.sendTransform(tf)
+
+            angle_deg = delta.get("angle_deg")
+
+            self.get_logger().info(
+                "Alignment input pose: "
+                f"XYZ=({location[0]:.6f}, "
+                f"{location[1]:.6f}, "
+                f"{location[2]:.6f}) "
+                f"Q=({rotation[0]:.6f}, "
+                f"{rotation[1]:.6f}, "
+                f"{rotation[2]:.6f}, "
+                f"{rotation[3]:.6f})"
+            )
+
+            self.get_logger().info(
+                "Alignment delta: "
+                f"XYZ=({delta_location[0]:.6f}, "
+                f"{delta_location[1]:.6f}, "
+                f"{delta_location[2]:.6f}) "
+                f"Q=({delta_rotation[0]:.6f}, "
+                f"{delta_rotation[1]:.6f}, "
+                f"{delta_rotation[2]:.6f}, "
+                f"{delta_rotation[3]:.6f})"
+            )
+
+            if angle_deg is not None:
+                self.get_logger().info(
+                    f"Alignment delta angle: "
+                    f"{float(angle_deg):.6f} deg"
+                )
+
+            response.success = True
+            response.message = "Alignment prediction successful."
+
+            self.get_logger().info(
+                "========================================"
+            )
+
+        except Exception as error:
+            self.get_logger().error(
+                f"Alignment exception: "
+                f"{type(error).__name__}: {error}"
+            )
+
+            response.success = False
+            response.message = str(error)
 
         finally:
             self.processing = False
@@ -878,7 +1215,7 @@ def main():
     parser.add_argument(
         "--device",
         default="cuda",
-        help="RACE-6D/DINOv3 device.",
+        help="RACE-6D/DINOv3/Alignment device.",
     )
 
     args = parser.parse_args()
