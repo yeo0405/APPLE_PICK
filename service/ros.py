@@ -327,7 +327,7 @@ class PoseNode(Node):
     def _load_camera_matrix(
         self,
         max_retries: int = 10,
-        retry_delay: float = 0.5,
+        retry_delay: float = 2.0,
     ) -> np.ndarray:
 
         self.get_logger().info(
