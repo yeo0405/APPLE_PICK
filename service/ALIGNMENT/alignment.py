@@ -34,7 +34,7 @@ MIN_MASK_AREA = 100
 AXIS_LENGTH = 0.05
 
 DINO_IMAGE_SIZE = 224
-DINO_THRESHOLD = 0.70
+DINO_THRESHOLD = 0.6
 
 
 def normalize_quaternion(q: np.ndarray) -> np.ndarray:
