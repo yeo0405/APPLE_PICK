@@ -12,21 +12,24 @@ import torch
 
 RACE_ROOT = Path(__file__).resolve().parent
 
-# src is bundled in this RACE_6D directory.
-# Add its parent directory so import src.zoo works regardless
-# of the directory used to start ros_app.py.
 if str(RACE_ROOT) not in sys.path:
     sys.path.insert(0, str(RACE_ROOT))
 
-
-# RACE-6D repository dependencies
 import src.zoo  # noqa: F401,E402
 from src.core import YAMLConfig  # noqa: E402
 
 
-def _load_checkpoint(model: torch.nn.Module, path: str) -> None:
-    """Load RACE-6D checkpoint."""
+CROP_X = 240
+CROP_WIDTH = 1440
+CROP_HEIGHT = 1080
+MODEL_WIDTH = 640
+MODEL_HEIGHT = 480
 
+
+def _load_checkpoint(
+    model: torch.nn.Module,
+    path: str,
+) -> None:
     state = torch.load(
         path,
         map_location="cpu",
@@ -39,10 +42,8 @@ def _load_checkpoint(model: torch.nn.Module, path: str) -> None:
         and "module" in state["ema"]
     ):
         weights = state["ema"]["module"]
-
     elif "model" in state:
         weights = state["model"]
-
     else:
         weights = state
 
@@ -59,12 +60,9 @@ def _load_checkpoint(model: torch.nn.Module, path: str) -> None:
         )
 
 
-def _matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
-    """
-    Convert a proper rotation matrix to
-    [qw, qx, qy, qz].
-    """
-
+def _matrix_to_quat_wxyz(
+    matrix: np.ndarray,
+) -> np.ndarray:
     m = np.asarray(
         matrix,
         dtype=np.float64,
@@ -79,14 +77,12 @@ def _matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
 
     if trace > 0:
         s = 2 * np.sqrt(trace + 1.0)
-
         q = [
             0.25 * s,
             (m[2, 1] - m[1, 2]) / s,
             (m[0, 2] - m[2, 0]) / s,
             (m[1, 0] - m[0, 1]) / s,
         ]
-
     elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
         s = 2 * np.sqrt(
             1.0
@@ -94,14 +90,12 @@ def _matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
             - m[1, 1]
             - m[2, 2]
         )
-
         q = [
             (m[2, 1] - m[1, 2]) / s,
             0.25 * s,
             (m[0, 1] + m[1, 0]) / s,
             (m[0, 2] + m[2, 0]) / s,
         ]
-
     elif m[1, 1] > m[2, 2]:
         s = 2 * np.sqrt(
             1.0
@@ -109,14 +103,12 @@ def _matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
             - m[0, 0]
             - m[2, 2]
         )
-
         q = [
             (m[0, 2] - m[2, 0]) / s,
             (m[0, 1] + m[1, 0]) / s,
             0.25 * s,
             (m[1, 2] + m[2, 1]) / s,
         ]
-
     else:
         s = 2 * np.sqrt(
             1.0
@@ -124,7 +116,6 @@ def _matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
             - m[0, 0]
             - m[1, 1]
         )
-
         q = [
             (m[1, 0] - m[0, 1]) / s,
             (m[0, 2] + m[2, 0]) / s,
@@ -149,8 +140,23 @@ def _matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
 
 class PoseEstimator:
     """
-    RACE-6D model that takes BGR/depth camera arrays
-    and returns all selected pose detections.
+    RACE-6D pose estimator.
+
+    Input:
+        RGB   : 1920x1080 BGR
+        Depth : 1920x1080
+        K     : original 1920x1080 camera intrinsic
+
+    Internal preprocessing:
+        1920x1080
+            -> crop 240 px left/right
+        1440x1080
+            -> resize
+        640x480
+
+    The model uses the intrinsic matrix corresponding to
+    the final 640x480 image. Returned pose translation
+    remains in the original camera coordinate system.
     """
 
     def __init__(
@@ -165,7 +171,6 @@ class PoseEstimator:
         invalid_depth_value: int = 65535,
         class_id: Optional[int] = None,
     ) -> None:
-
         self.device = torch.device(
             device
             or (
@@ -178,23 +183,16 @@ class PoseEstimator:
         self.score_threshold = float(
             score_threshold
         )
-
         self.max_per_class = int(
             max_per_class
         )
-
-        self.max_detections = (
-            max_detections
-        )
-
+        self.max_detections = max_detections
         self.depth_z_max_mm = (
             depth_z_max_mm
         )
-
         self.invalid_depth_value = int(
             invalid_depth_value
         )
-
         self.class_id = class_id
 
         if not 0 <= self.score_threshold <= 1:
@@ -255,6 +253,82 @@ class PoseEstimator:
             model_path,
         )
 
+    @staticmethod
+    def _crop_and_resize(
+        image: np.ndarray,
+        interpolation: int,
+    ) -> np.ndarray:
+        height, width = image.shape[:2]
+
+        if (
+            width != 1920
+            or height != 1080
+        ):
+            raise ValueError(
+                "RACE input must be 1920x1080, "
+                f"got {width}x{height}"
+            )
+
+        cropped = image[
+            :CROP_HEIGHT,
+            CROP_X:CROP_X + CROP_WIDTH,
+        ]
+
+        if cropped.shape[:2] != (
+            CROP_HEIGHT,
+            CROP_WIDTH,
+        ):
+            raise RuntimeError(
+                "Unexpected crop size: "
+                f"{cropped.shape}"
+            )
+
+        return cv2.resize(
+            cropped,
+            (
+                MODEL_WIDTH,
+                MODEL_HEIGHT,
+            ),
+            interpolation=interpolation,
+        )
+
+    @staticmethod
+    def _update_intrinsic(
+        camera: np.ndarray,
+    ) -> np.ndarray:
+        camera = np.asarray(
+            camera,
+            dtype=np.float32,
+        )
+
+        if camera.shape != (3, 3):
+            raise ValueError(
+                "Expected 3x3 camera matrix, "
+                f"got {camera.shape}"
+            )
+
+        K = camera.copy()
+
+        # 1920x1080 -> 1440x1080 crop.
+        K[0, 2] -= CROP_X
+
+        # 1440x1080 -> 640x480 resize.
+        sx = (
+            MODEL_WIDTH
+            / CROP_WIDTH
+        )
+        sy = (
+            MODEL_HEIGHT
+            / CROP_HEIGHT
+        )
+
+        K[0, 0] *= sx
+        K[0, 2] *= sx
+        K[1, 1] *= sy
+        K[1, 2] *= sy
+
+        return K
+
     def _image(
         self,
         bgr: np.ndarray,
@@ -263,8 +337,8 @@ class PoseEstimator:
         torch.Tensor,
         int,
         int,
+        np.ndarray,
     ]:
-
         if (
             bgr is None
             or depth is None
@@ -283,31 +357,52 @@ class PoseEstimator:
 
         height, width = bgr.shape[:2]
 
+        if (
+            width != 1920
+            or height != 1080
+        ):
+            raise ValueError(
+                "RACE input must be 1920x1080, "
+                f"got {width}x{height}"
+            )
+
         rgb = cv2.cvtColor(
             bgr,
             cv2.COLOR_BGR2RGB,
         )
 
+        rgb = self._crop_and_resize(
+            rgb,
+            cv2.INTER_LINEAR,
+        )
+
         in_h, in_w = (
             self.cfg.yaml_cfg.get(
                 "eval_spatial_size",
-                [height, width],
+                [
+                    MODEL_HEIGHT,
+                    MODEL_WIDTH,
+                ],
             )
         )
 
-        model_rgb = cv2.resize(
-            rgb,
-            (
-                int(in_w),
-                int(in_h),
-            ),
-            interpolation=cv2.INTER_LINEAR,
-        )
+        in_h = int(in_h)
+        in_w = int(in_w)
+
+        if (
+            in_w != MODEL_WIDTH
+            or in_h != MODEL_HEIGHT
+        ):
+            rgb = cv2.resize(
+                rgb,
+                (in_w, in_h),
+                interpolation=cv2.INTER_LINEAR,
+            )
 
         rgb_tensor = (
             torch.from_numpy(
                 np.ascontiguousarray(
-                    model_rgb
+                    rgb
                 )
             )
             .permute(2, 0, 1)
@@ -324,15 +419,24 @@ class PoseEstimator:
         )
 
         if channels == 4:
-
-            d = cv2.resize(
+            depth = self._crop_and_resize(
                 depth,
-                (
-                    int(in_w),
-                    int(in_h),
-                ),
-                interpolation=cv2.INTER_NEAREST,
-            ).astype(np.float32)
+                cv2.INTER_NEAREST,
+            )
+
+            if (
+                in_w != MODEL_WIDTH
+                or in_h != MODEL_HEIGHT
+            ):
+                depth = cv2.resize(
+                    depth,
+                    (in_w, in_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
+            d = depth.astype(
+                np.float32
+            )
 
             d[
                 d == self.invalid_depth_value
@@ -342,7 +446,7 @@ class PoseEstimator:
                 self.depth_z_max_mm
                 or self.cfg.yaml_cfg.get(
                     "val_dataloader",
-                    {}
+                    {},
                 )
                 .get("dataset", {})
                 .get(
@@ -376,7 +480,6 @@ class PoseEstimator:
             )
 
         elif channels == 3:
-
             image = rgb_tensor
 
         else:
@@ -389,8 +492,9 @@ class PoseEstimator:
             image.unsqueeze(0).to(
                 self.device
             ),
-            height,
-            width,
+            in_h,
+            in_w,
+            rgb,
         )
 
     def predict(
@@ -401,46 +505,32 @@ class PoseEstimator:
             Sequence[float]
         ],
     ) -> Dict[str, Any]:
-        """
-        Run RACE-6D inference.
-
-        Returns ALL selected detections.
-
-        Selection rules:
-          1. confidence >= score_threshold
-          2. optional class_id filtering
-          3. maximum max_per_class detections
-             for each class
-          4. optional global max_detections
-
-        The detections are sorted by confidence
-        in descending order.
-        """
-
-        # --------------------------------------------------
-        # Camera intrinsic
-        # --------------------------------------------------
-
-        camera = np.asarray(
+        original_camera = np.asarray(
             intrinsic,
             dtype=np.float32,
         )
 
-        if camera.shape != (3, 3):
+        if original_camera.shape != (
+            3,
+            3,
+        ):
             raise ValueError(
                 "Expected 3x3 camera matrix, "
-                f"got {camera.shape}"
+                f"got {original_camera.shape}"
             )
 
-        # --------------------------------------------------
-        # Prepare image
-        # --------------------------------------------------
+        camera = self._update_intrinsic(
+            original_camera
+        )
 
-        image, height, width = (
-            self._image(
-                rgb,
-                depth,
-            )
+        (
+            image,
+            height,
+            width,
+            debug_image,
+        ) = self._image(
+            rgb,
+            depth,
         )
 
         size = torch.tensor(
@@ -449,12 +539,7 @@ class PoseEstimator:
             device=self.device,
         )
 
-        # --------------------------------------------------
-        # Model inference
-        # --------------------------------------------------
-
         with torch.inference_mode():
-
             result = self.postprocessor(
                 self.model(image),
                 size,
@@ -463,26 +548,17 @@ class PoseEstimator:
         scores = result["scores"]
         labels = result["labels"]
 
-        # --------------------------------------------------
-        # Confidence filtering
-        # --------------------------------------------------
-
         keep = torch.nonzero(
             scores >= self.score_threshold,
             as_tuple=False,
         ).squeeze(1)
 
         if len(keep) == 0:
-
             return {
                 "success": False,
                 "detections": [],
-                "debug_image": rgb.copy(),
+                "debug_image": debug_image,
             }
-
-        # --------------------------------------------------
-        # Sort by confidence
-        # --------------------------------------------------
 
         ordered = keep[
             torch.argsort(
@@ -491,33 +567,20 @@ class PoseEstimator:
             )
         ]
 
-        # --------------------------------------------------
-        # Select detections
-        #
-        # max_per_class:
-        #   limit number of objects per label.
-        #
-        # max_detections:
-        #   optional global limit.
-        # --------------------------------------------------
-
         selected = []
         counts = {}
 
         for index in ordered.tolist():
-
             label = int(
                 labels[index]
             )
 
-            # Optional class filter
             if (
                 self.class_id is not None
                 and label != self.class_id
             ):
                 continue
 
-            # Per-class limit
             if (
                 counts.get(label, 0)
                 >= self.max_per_class
@@ -527,10 +590,10 @@ class PoseEstimator:
             selected.append(index)
 
             counts[label] = (
-                counts.get(label, 0) + 1
+                counts.get(label, 0)
+                + 1
             )
 
-            # Global limit
             if (
                 self.max_detections
                 is not None
@@ -539,86 +602,49 @@ class PoseEstimator:
             ):
                 break
 
-        # --------------------------------------------------
-        # No selected detection
-        # --------------------------------------------------
-
         if not selected:
-
             return {
                 "success": False,
                 "detections": [],
-                "debug_image": rgb.copy(),
+                "debug_image": debug_image,
             }
-
-        # --------------------------------------------------
-        # Process ALL selected detections
-        # --------------------------------------------------
 
         detections = []
 
-        debug = rgb.copy()
-
         for index in selected:
-
-            # ----------------------------------------------
-            # Bounding box
-            # ----------------------------------------------
-
-            box = result["boxes"][
-                index
-            ]
+            box = result["boxes"][index]
 
             normalized = box.clone()
 
-            normalized[
-                0::2
-            ] /= width
-
-            normalized[
-                1::2
-            ] /= height
+            normalized[0::2] /= width
+            normalized[1::2] /= height
 
             normalized = torch.stack(
                 (
                     (
                         normalized[0]
                         + normalized[2]
-                    )
-                    / 2,
-
+                    ) / 2,
                     (
                         normalized[1]
                         + normalized[3]
-                    )
-                    / 2,
-
+                    ) / 2,
                     normalized[2]
                     - normalized[0],
-
                     normalized[3]
                     - normalized[1],
                 )
             ).unsqueeze(0)
 
-            # ----------------------------------------------
-            # Translation
-            # ----------------------------------------------
-
             translation_mm = (
                 self.criterion._c2t_pred(
-                    result[
-                        "translations"
-                    ][index].unsqueeze(0),
-
+                    result["translations"][
+                        index
+                    ].unsqueeze(0),
                     torch.from_numpy(
                         camera
-                    ).to(
-                        self.device
-                    ),
-
+                    ).to(self.device),
                     normalized,
-
                     width,
                     height,
                 )[0]
@@ -627,10 +653,6 @@ class PoseEstimator:
                 .numpy()
             )
 
-            # ----------------------------------------------
-            # Rotation
-            # ----------------------------------------------
-
             rotation = (
                 result["rotations"][index]
                 .detach()
@@ -638,15 +660,9 @@ class PoseEstimator:
                 .numpy()
             )
 
-            quat = (
-                _matrix_to_quat_wxyz(
-                    rotation
-                )
+            quat = _matrix_to_quat_wxyz(
+                rotation
             )
-
-            # ----------------------------------------------
-            # Confidence
-            # ----------------------------------------------
 
             score = float(
                 result["scores"][index]
@@ -665,10 +681,6 @@ class PoseEstimator:
                 .tolist()
             )
 
-            # ----------------------------------------------
-            # Debug bounding box
-            # ----------------------------------------------
-
             x0, y0, x1, y1 = (
                 np.rint(
                     np.asarray(
@@ -678,7 +690,7 @@ class PoseEstimator:
             )
 
             cv2.rectangle(
-                debug,
+                debug_image,
                 (x0, y0),
                 (x1, y1),
                 (0, 0, 255),
@@ -687,7 +699,7 @@ class PoseEstimator:
             )
 
             cv2.putText(
-                debug,
+                debug_image,
                 (
                     f"RACE "
                     f"label={label} "
@@ -707,62 +719,36 @@ class PoseEstimator:
                 cv2.LINE_AA,
             )
 
-            # ----------------------------------------------
-            # Store detection
-            # ----------------------------------------------
-
             detections.append(
                 {
                     "label": label,
                     "confidence": score,
-
-                    # metres
                     "translation": (
                         translation_mm / 1000.0
                     ).tolist(),
-
-                    # millimetres
                     "translation_mm": (
                         translation_mm
                     ).tolist(),
-
-                    # [qw, qx, qy, qz]
-                    "quat": (
-                        quat.tolist()
-                    ),
-
-                    # 3x3 rotation matrix
+                    "quat": quat.tolist(),
                     "rotation": (
                         rotation.tolist()
                     ),
-
-                    # [x0, y0, x1, y1]
                     "bbox_xyxy": bbox_xyxy,
                 }
             )
 
-        # --------------------------------------------------
-        # Return ALL detections
-        # --------------------------------------------------
-
         return {
-            "success": len(detections) > 0,
-
-            # Main result:
-            # list of every selected detection.
+            "success": (
+                len(detections) > 0
+            ),
             "detections": detections,
-
-            # Number of detections.
             "num_detections": len(
                 detections
             ),
-
-            # Useful for debugging.
             "class_counts": {
                 str(label): count
                 for label, count
                 in counts.items()
             },
-
-            "debug_image": debug,
+            "debug_image": debug_image,
         }

@@ -9,7 +9,7 @@ __include__: [
 output_dir: ./output/race6d_r50vd_pose_rgbd
 coco_path: ./
 category_file: ./pose_dataset2coco_category.yml
-num_classes: 4
+num_classes: 5
 eval_spatial_size:
 - 480
 - 640

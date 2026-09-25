@@ -11,7 +11,7 @@ CAMERA:
 # MODEL_CONFIG is relative to the APPLE_PICK project root.
 # ==========================================================
 RACE_6D:
-  MODEL_PATH: "model/race6d_0917.pth"
+  MODEL_PATH: "model/race6d_0925.pth"
   MODEL_CONFIG: "service/RACE_6D/config/race6d_r50vd_pose_rgbd.yml"
   SCORE_THRESHOLD: 0.8
   MAX_PER_CLASS: 1
@@ -21,10 +21,11 @@ RACE_6D:
   INVALID_DEPTH_VALUE: 65535
 
   LABEL_NAMES:
-    0: iphone14_plus
+    0: iphone14_plus_blue
     1: brown_box
     2: flap
     3: iphone14_pro_max
+    4: iphone14_plus_yellow
 
 # ==========================================================
 # BOX CHECK
