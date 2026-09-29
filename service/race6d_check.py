@@ -45,20 +45,28 @@ def parse_args():
 
 def load_config():
     if not CONFIG_PATH.is_file():
-        raise FileNotFoundError(f"Config not found: {CONFIG_PATH}")
+        raise FileNotFoundError(
+            f"Config not found: {CONFIG_PATH}"
+        )
 
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     if not isinstance(config, dict):
-        raise ValueError(f"Invalid config: {CONFIG_PATH}")
+        raise ValueError(
+            f"Invalid config: {CONFIG_PATH}"
+        )
 
     return config
 
 
 def resolve_project_path(value: str) -> Path:
     path = Path(value)
-    return path if path.is_absolute() else PROJECT_ROOT / path
+    return (
+        path
+        if path.is_absolute()
+        else PROJECT_ROOT / path
+    )
 
 
 def load_race6d_config():
@@ -66,62 +74,105 @@ def load_race6d_config():
     race_config = config.get("RACE_6D")
 
     if not isinstance(race_config, dict):
-        raise ValueError(f"RACE_6D section is missing in {CONFIG_PATH}")
+        raise ValueError(
+            f"RACE_6D section is missing in {CONFIG_PATH}"
+        )
 
-    label_names = race_config.get("LABEL_NAMES", {})
+    label_names = race_config.get(
+        "LABEL_NAMES",
+        {},
+    )
+
     if not isinstance(label_names, dict):
-        raise ValueError("RACE_6D.LABEL_NAMES must be a mapping.")
+        raise ValueError(
+            "RACE_6D.LABEL_NAMES must be a mapping."
+        )
 
     return {
-        "model_path": resolve_project_path(race_config["MODEL_PATH"]),
-        "model_config": resolve_project_path(race_config["MODEL_CONFIG"]),
-        "score_threshold": float(race_config.get("SCORE_THRESHOLD", 0.25)),
-        "max_per_class": int(race_config.get("MAX_PER_CLASS", 1)),
-        "max_detections": race_config.get("MAX_DETECTIONS"),
-        "class_id": race_config.get("CLASS_ID"),
-        "depth_z_max_mm": float(race_config.get("DEPTH_Z_MAX_MM", 2000.0)),
-        "invalid_depth_value": int(race_config.get("INVALID_DEPTH_VALUE", 65535)),
-        "label_names": {int(k): str(v) for k, v in label_names.items()},
+        "model_path": resolve_project_path(
+            race_config["MODEL_PATH"]
+        ),
+        "model_config": resolve_project_path(
+            race_config["MODEL_CONFIG"]
+        ),
+        "score_threshold": float(
+            race_config.get(
+                "SCORE_THRESHOLD",
+                0.25,
+            )
+        ),
+        "max_per_class": int(
+            race_config.get(
+                "MAX_PER_CLASS",
+                1,
+            )
+        ),
+        "max_detections": race_config.get(
+            "MAX_DETECTIONS"
+        ),
+        "class_id": race_config.get(
+            "CLASS_ID"
+        ),
+        "depth_z_max_mm": float(
+            race_config.get(
+                "DEPTH_Z_MAX_MM",
+                2000.0,
+            )
+        ),
+        "invalid_depth_value": int(
+            race_config.get(
+                "INVALID_DEPTH_VALUE",
+                65535,
+            )
+        ),
+        "label_names": {
+            int(k): str(v)
+            for k, v in label_names.items()
+        },
     }
 
 
-def get_model_intrinsic(K: np.ndarray) -> np.ndarray:
-    model_K = np.asarray(K, dtype=np.float32).copy()
+def preprocess_debug_image(
+    image: np.ndarray,
+) -> np.ndarray:
+    if image is None:
+        raise ValueError(
+            "Cannot preprocess empty image."
+        )
 
-    model_K[0, 2] -= CROP_X
+    cropped = image[
+        :INPUT_HEIGHT,
+        CROP_X:CROP_X + CROP_WIDTH,
+    ]
 
-    sx = MODEL_WIDTH / CROP_WIDTH
-    sy = MODEL_HEIGHT / INPUT_HEIGHT
-
-    model_K[0, 0] *= sx
-    model_K[0, 2] *= sx
-    model_K[1, 1] *= sy
-    model_K[1, 2] *= sy
-
-    return model_K
-
-
-def preprocess_debug_image(image: np.ndarray) -> np.ndarray:
-    cropped = image[:INPUT_HEIGHT, CROP_X:CROP_X + CROP_WIDTH]
-    resized = cv2.resize(
+    return cv2.resize(
         cropped,
         (MODEL_WIDTH, MODEL_HEIGHT),
         interpolation=cv2.INTER_LINEAR,
     )
-    return resized
 
 
-def quaternion_to_rotation_matrix(q) -> np.ndarray:
-    q = np.asarray(q, dtype=np.float64).reshape(-1)
+def quaternion_to_rotation_matrix(
+    q,
+) -> np.ndarray:
+    q = np.asarray(
+        q,
+        dtype=np.float64,
+    ).reshape(-1)
 
     if q.size != 4:
-        raise ValueError(f"Invalid quaternion: {q}")
+        raise ValueError(
+            f"Invalid quaternion: {q}"
+        )
 
     qw, qx, qy, qz = q
+
     norm = np.linalg.norm(q)
 
     if norm < 1e-12:
-        raise ValueError("Quaternion norm is zero.")
+        raise ValueError(
+            "Quaternion norm is zero."
+        )
 
     qw, qx, qy, qz = q / norm
 
@@ -147,19 +198,38 @@ def quaternion_to_rotation_matrix(q) -> np.ndarray:
     )
 
 
-def project_point(point: np.ndarray, K: np.ndarray):
+def project_point(
+    point: np.ndarray,
+    K: np.ndarray,
+):
     x, y, z = point
 
-    if not np.isfinite(z) or z <= 1e-6:
+    if (
+        not np.isfinite(z)
+        or z <= 1e-6
+    ):
         return None
 
-    u = K[0, 0] * x / z + K[0, 2]
-    v = K[1, 1] * y / z + K[1, 2]
+    u = (
+        K[0, 0] * x / z
+        + K[0, 2]
+    )
 
-    if not np.isfinite(u) or not np.isfinite(v):
+    v = (
+        K[1, 1] * y / z
+        + K[1, 2]
+    )
+
+    if (
+        not np.isfinite(u)
+        or not np.isfinite(v)
+    ):
         return None
 
-    return int(round(u)), int(round(v))
+    return (
+        int(round(u)),
+        int(round(v)),
+    )
 
 
 def draw_axis(
@@ -169,13 +239,21 @@ def draw_axis(
     K: np.ndarray,
     axis_length_mm: float,
 ) -> bool:
-    t = np.asarray(translation_mm, dtype=np.float64).reshape(-1)
+    t = np.asarray(
+        translation_mm,
+        dtype=np.float64,
+    ).reshape(-1)
 
-    if t.size != 3 or not np.all(np.isfinite(t)):
+    if (
+        t.size != 3
+        or not np.all(np.isfinite(t))
+    ):
         return False
 
     try:
-        R = quaternion_to_rotation_matrix(quaternion)
+        R = quaternion_to_rotation_matrix(
+            quaternion
+        )
     except Exception:
         return False
 
@@ -189,19 +267,28 @@ def draw_axis(
         dtype=np.float64,
     )
 
-    projected = [project_point(point, K) for point in points]
+    projected = [
+        project_point(point, K)
+        for point in points
+    ]
 
     if projected[0] is None:
         return False
 
     origin = projected[0]
+
     h, w = image.shape[:2]
 
     def valid(point):
         if point is None:
             return False
+
         x, y = point
-        return -w <= x <= 2 * w and -h <= y <= 2 * h
+
+        return (
+            -w <= x <= 2 * w
+            and -h <= y <= 2 * h
+        )
 
     cv2.circle(
         image,
@@ -233,7 +320,10 @@ def draw_axis(
         cv2.putText(
             image,
             name,
-            (endpoint[0] + 8, endpoint[1]),
+            (
+                endpoint[0] + 8,
+                endpoint[1],
+            ),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
             color,
@@ -251,14 +341,28 @@ def draw_detection(
     K: np.ndarray,
     axis_length_mm: float,
 ) -> bool:
-    translation_mm = detection.get("translation_mm")
-    quaternion = detection.get("quat")
+    translation_mm = detection.get(
+        "translation_mm"
+    )
 
-    if translation_mm is None or quaternion is None:
+    quaternion = detection.get(
+        "quat"
+    )
+
+    if (
+        translation_mm is None
+        or quaternion is None
+    ):
         return False
 
-    label = int(detection.get("label", -1))
-    name = label_names.get(label, f"class_{label}")
+    label = int(
+        detection.get("label", -1)
+    )
+
+    name = label_names.get(
+        label,
+        f"class_{label}",
+    )
 
     if not draw_axis(
         image,
@@ -269,19 +373,36 @@ def draw_detection(
     ):
         return False
 
-    t = np.asarray(translation_mm, dtype=np.float64).reshape(-1)
-    confidence = detection.get("confidence")
+    t = np.asarray(
+        translation_mm,
+        dtype=np.float64,
+    ).reshape(-1)
+
+    confidence = detection.get(
+        "confidence"
+    )
 
     if confidence is None:
-        text = f"{name} T=({t[0]:.0f}, {t[1]:.0f}, {t[2]:.0f})mm"
+        text = (
+            f"{name} "
+            f"T=({t[0]:.0f}, "
+            f"{t[1]:.0f}, "
+            f"{t[2]:.0f})mm"
+        )
     else:
         text = (
-            f"{name} {float(confidence):.2f} "
-            f"T=({t[0]:.0f}, {t[1]:.0f}, {t[2]:.0f})mm"
+            f"{name} "
+            f"{float(confidence):.2f} "
+            f"T=({t[0]:.0f}, "
+            f"{t[1]:.0f}, "
+            f"{t[2]:.0f})mm"
         )
 
     y = 35 + label * 30
-    y = min(y, image.shape[0] - 15)
+    y = min(
+        y,
+        image.shape[0] - 15,
+    )
 
     cv2.putText(
         image,
@@ -319,9 +440,16 @@ def open_depth_pipe(path: Path):
     )
 
 
-def read_depth_frame(process, width: int, height: int):
+def read_depth_frame(
+    process,
+    width: int,
+    height: int,
+):
     frame_bytes = width * height * 2
-    raw = process.stdout.read(frame_bytes)
+
+    raw = process.stdout.read(
+        frame_bytes
+    )
 
     if len(raw) != frame_bytes:
         return None
@@ -329,106 +457,246 @@ def read_depth_frame(process, width: int, height: int):
     return np.frombuffer(
         raw,
         dtype="<u2",
-    ).reshape(height, width)
+    ).reshape(
+        height,
+        width,
+    )
 
 
 def main():
     args = parse_args()
 
-    rgb_path = Path(args.rgb).resolve()
-    depth_path = Path(args.depth).resolve()
+    rgb_path = Path(
+        args.rgb
+    ).resolve()
+
+    depth_path = Path(
+        args.depth
+    ).resolve()
 
     if not rgb_path.is_file():
-        raise FileNotFoundError(rgb_path)
+        raise FileNotFoundError(
+            rgb_path
+        )
 
     if not depth_path.is_file():
-        raise FileNotFoundError(depth_path)
+        raise FileNotFoundError(
+            depth_path
+        )
 
     race_config = load_race6d_config()
-    model_path = race_config["model_path"]
-    model_config = race_config["model_config"]
-    label_names = race_config["label_names"]
+
+    model_path = race_config[
+        "model_path"
+    ]
+
+    model_config = race_config[
+        "model_config"
+    ]
+
+    label_names = race_config[
+        "label_names"
+    ]
 
     if not model_path.is_file():
-        raise FileNotFoundError(f"RACE-6D model not found: {model_path}")
+        raise FileNotFoundError(
+            f"RACE-6D model not found: "
+            f"{model_path}"
+        )
 
     if not model_config.is_file():
-        raise FileNotFoundError(f"RACE-6D config not found: {model_config}")
+        raise FileNotFoundError(
+            f"RACE-6D config not found: "
+            f"{model_config}"
+        )
 
-    output_path = Path.cwd() / f"{rgb_path.stem}_race6d.mp4"
+    output_path = (
+        Path.cwd()
+        / f"{rgb_path.stem}_race6d.mp4"
+    )
+
     camera_matrix = DEFAULT_K.copy()
-    model_intrinsic = get_model_intrinsic(camera_matrix)
 
-    cap = cv2.VideoCapture(str(rgb_path))
+    cap = cv2.VideoCapture(
+        str(rgb_path)
+    )
 
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open RGB video: {rgb_path}")
+        raise RuntimeError(
+            f"Cannot open RGB video: "
+            f"{rgb_path}"
+        )
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not np.isfinite(fps) or fps <= 0:
+    fps = cap.get(
+        cv2.CAP_PROP_FPS
+    )
+
+    if (
+        not np.isfinite(fps)
+        or fps <= 0
+    ):
         fps = 30.0
 
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_WIDTH
+        )
+    )
 
-    if width != INPUT_WIDTH or height != INPUT_HEIGHT:
+    height = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_HEIGHT
+        )
+    )
+
+    frame_count = int(
+        cap.get(
+            cv2.CAP_PROP_FRAME_COUNT
+        )
+    )
+
+    if (
+        width != INPUT_WIDTH
+        or height != INPUT_HEIGHT
+    ):
         cap.release()
+
         raise RuntimeError(
-            f"RGB video must be {INPUT_WIDTH}x{INPUT_HEIGHT}, "
+            f"RGB video must be "
+            f"{INPUT_WIDTH}x{INPUT_HEIGHT}, "
             f"got {width}x{height}"
         )
 
     print("=" * 70)
     print("RACE-6D RGB-D VIDEO INFERENCE")
     print("=" * 70)
-    print(f"Project   : {PROJECT_ROOT}")
-    print(f"Config    : {CONFIG_PATH}")
-    print(f"RGB       : {rgb_path}")
-    print(f"Depth     : {depth_path}")
-    print(f"Output    : {output_path}")
-    print(f"Model     : {model_path}")
-    print(f"Model cfg : {model_config}")
-    print(f"Input     : {width} x {height}")
-    print(f"Output    : {MODEL_WIDTH} x {MODEL_HEIGHT}")
-    print(f"FPS       : {fps:.3f}")
-    print(f"Frames    : {frame_count}")
-    print(f"Score     : {race_config['score_threshold']}")
-    print(f"Max/class : {race_config['max_per_class']}")
-    print(f"Axis      : {AXIS_LENGTH_MM:.1f} mm")
-    print(f"Original K:\n{camera_matrix}")
-    print(f"Model K:\n{model_intrinsic}")
+    print(
+        f"Project   : {PROJECT_ROOT}"
+    )
+    print(
+        f"Config    : {CONFIG_PATH}"
+    )
+    print(
+        f"RGB       : {rgb_path}"
+    )
+    print(
+        f"Depth     : {depth_path}"
+    )
+    print(
+        f"Output    : {output_path}"
+    )
+    print(
+        f"Model     : {model_path}"
+    )
+    print(
+        f"Model cfg : {model_config}"
+    )
+    print(
+        f"Input     : {width} x {height}"
+    )
+    print(
+        f"Output    : "
+        f"{MODEL_WIDTH} x {MODEL_HEIGHT}"
+    )
+    print(
+        f"FPS       : {fps:.3f}"
+    )
+    print(
+        f"Frames    : {frame_count}"
+    )
+    print(
+        f"Score     : "
+        f"{race_config['score_threshold']}"
+    )
+    print(
+        f"Max/class : "
+        f"{race_config['max_per_class']}"
+    )
+    print(
+        f"Axis      : "
+        f"{AXIS_LENGTH_MM:.1f} mm"
+    )
+    print(
+        f"Original K:\n{camera_matrix}"
+    )
     print("=" * 70)
 
-    print("[INFO] Initializing RACE-6D...")
-
-    estimator = PoseEstimator(
-        model_path=str(model_path),
-        config_path=str(model_config),
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        score_threshold=race_config["score_threshold"],
-        max_per_class=race_config["max_per_class"],
-        max_detections=race_config["max_detections"],
-        depth_z_max_mm=race_config["depth_z_max_mm"],
-        invalid_depth_value=race_config["invalid_depth_value"],
-        class_id=race_config["class_id"],
+    print(
+        "[INFO] Initializing RACE-6D..."
     )
 
-    print("[INFO] RACE-6D ready.")
+    estimator = PoseEstimator(
+        model_path=str(
+            model_path
+        ),
+        config_path=str(
+            model_config
+        ),
+        device=(
+            "cuda"
+            if torch.cuda.is_available()
+            else "cpu"
+        ),
+        score_threshold=(
+            race_config[
+                "score_threshold"
+            ]
+        ),
+        max_per_class=(
+            race_config[
+                "max_per_class"
+            ]
+        ),
+        max_detections=(
+            race_config[
+                "max_detections"
+            ]
+        ),
+        depth_z_max_mm=(
+            race_config[
+                "depth_z_max_mm"
+            ]
+        ),
+        invalid_depth_value=(
+            race_config[
+                "invalid_depth_value"
+            ]
+        ),
+        class_id=(
+            race_config[
+                "class_id"
+            ]
+        ),
+    )
 
-    depth_process = open_depth_pipe(depth_path)
+    print(
+        "[INFO] RACE-6D ready."
+    )
+
+    depth_process = open_depth_pipe(
+        depth_path
+    )
 
     writer = cv2.VideoWriter(
         str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
+        cv2.VideoWriter_fourcc(
+            *"mp4v"
+        ),
         fps,
-        (MODEL_WIDTH, MODEL_HEIGHT),
+        (
+            MODEL_WIDTH,
+            MODEL_HEIGHT,
+        ),
     )
 
     if not writer.isOpened():
         depth_process.kill()
         cap.release()
-        raise RuntimeError(f"Cannot create output video: {output_path}")
+
+        raise RuntimeError(
+            f"Cannot create output video: "
+            f"{output_path}"
+        )
 
     frame_index = 0
     success_frames = 0
@@ -448,13 +716,21 @@ def main():
             )
 
             if depth is None:
-                print(f"\n[INFO] Depth ended at frame {frame_index}.")
+                print(
+                    f"\n[INFO] Depth ended at "
+                    f"frame {frame_index}."
+                )
                 break
 
-            if depth.shape != (height, width):
+            if depth.shape != (
+                height,
+                width,
+            ):
                 raise RuntimeError(
-                    f"RGB/depth resolution mismatch: "
-                    f"RGB={rgb.shape[:2]}, Depth={depth.shape}"
+                    "RGB/depth resolution "
+                    "mismatch: "
+                    f"RGB={rgb.shape[:2]}, "
+                    f"Depth={depth.shape}"
                 )
 
             try:
@@ -464,34 +740,69 @@ def main():
                     intrinsic=camera_matrix,
                 )
 
-                detections = result.get("detections", [])
-                if not isinstance(detections, list):
+                detections = result.get(
+                    "detections",
+                    [],
+                )
+
+                if not isinstance(
+                    detections,
+                    list,
+                ):
                     detections = []
 
-                debug = result.get("debug_image")
+                model_intrinsic = np.asarray(
+                    result[
+                        "model_intrinsic"
+                    ],
+                    dtype=np.float32,
+                )
+
+                if model_intrinsic.shape != (
+                    3,
+                    3,
+                ):
+                    raise RuntimeError(
+                        "Invalid model_intrinsic "
+                        f"shape: "
+                        f"{model_intrinsic.shape}"
+                    )
+
+                debug = result.get(
+                    "debug_image"
+                )
 
                 if debug is None:
-                    debug = preprocess_debug_image(rgb)
+                    debug = (
+                        preprocess_debug_image(
+                            rgb
+                        )
+                    )
                 else:
                     debug = debug.copy()
 
-                if debug.shape[:2] != (MODEL_HEIGHT, MODEL_WIDTH):
+                if debug.shape[:2] != (
+                    MODEL_HEIGHT,
+                    MODEL_WIDTH,
+                ):
                     debug = cv2.resize(
                         debug,
-                        (MODEL_WIDTH, MODEL_HEIGHT),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-
-                if debug.ndim == 3 and debug.shape[2] == 3:
-                    debug = cv2.cvtColor(
-                        debug,
-                        cv2.COLOR_RGB2BGR,
+                        (
+                            MODEL_WIDTH,
+                            MODEL_HEIGHT,
+                        ),
+                        interpolation=(
+                            cv2.INTER_LINEAR
+                        ),
                     )
 
                 valid_detections = 0
 
                 for detection in detections:
-                    if not isinstance(detection, dict):
+                    if not isinstance(
+                        detection,
+                        dict,
+                    ):
                         continue
 
                     if draw_detection(
@@ -506,14 +817,21 @@ def main():
                 if valid_detections:
                     success_frames += 1
 
-                total_detections += valid_detections
+                total_detections += (
+                    valid_detections
+                )
 
-                debug_height, debug_width = debug.shape[:2]
+                debug_height, debug_width = (
+                    debug.shape[:2]
+                )
 
                 cv2.putText(
                     debug,
                     f"Frame: {frame_index}",
-                    (20, debug_height - 45),
+                    (
+                        20,
+                        debug_height - 45,
+                    ),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,
                     (255, 255, 255),
@@ -523,8 +841,12 @@ def main():
 
                 cv2.putText(
                     debug,
-                    f"Detections: {valid_detections}",
-                    (20, debug_height - 15),
+                    f"Detections: "
+                    f"{valid_detections}",
+                    (
+                        20,
+                        debug_height - 15,
+                    ),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,
                     (255, 255, 255),
@@ -534,11 +856,17 @@ def main():
 
             except Exception as error:
                 print(
-                    f"\n[ERROR] Frame {frame_index}: "
-                    f"{type(error).__name__}: {error}"
+                    f"\n[ERROR] Frame "
+                    f"{frame_index}: "
+                    f"{type(error).__name__}: "
+                    f"{error}"
                 )
 
-                debug = preprocess_debug_image(rgb)
+                debug = (
+                    preprocess_debug_image(
+                        rgb
+                    )
+                )
 
                 cv2.putText(
                     debug,
@@ -551,21 +879,33 @@ def main():
                     cv2.LINE_AA,
                 )
 
-            if debug.shape[1] != MODEL_WIDTH or debug.shape[0] != MODEL_HEIGHT:
+            if debug.shape[1] != (
+                MODEL_WIDTH
+            ) or debug.shape[0] != (
+                MODEL_HEIGHT
+            ):
                 debug = cv2.resize(
                     debug,
-                    (MODEL_WIDTH, MODEL_HEIGHT),
-                    interpolation=cv2.INTER_LINEAR,
+                    (
+                        MODEL_WIDTH,
+                        MODEL_HEIGHT,
+                    ),
+                    interpolation=(
+                        cv2.INTER_LINEAR
+                    ),
                 )
 
             writer.write(debug)
+
             frame_index += 1
 
             if frame_index % 10 == 0:
                 print(
                     f"\rFrame: {frame_index} | "
-                    f"Pose frames: {success_frames} | "
-                    f"Detections: {total_detections}",
+                    f"Pose frames: "
+                    f"{success_frames} | "
+                    f"Detections: "
+                    f"{total_detections}",
                     end="",
                     flush=True,
                 )
@@ -578,7 +918,9 @@ def main():
             depth_process.terminate()
 
         try:
-            depth_process.wait(timeout=2)
+            depth_process.wait(
+                timeout=2
+            )
         except subprocess.TimeoutExpired:
             depth_process.kill()
 
@@ -586,11 +928,22 @@ def main():
     print("=" * 70)
     print("DONE")
     print("=" * 70)
-    print(f"Frames      : {frame_index}")
-    print(f"Pose frames : {success_frames}")
-    print(f"Detections  : {total_detections}")
-    print(f"Output      : {output_path}")
-    print(f"Output size : {MODEL_WIDTH} x {MODEL_HEIGHT}")
+    print(
+        f"Frames      : {frame_index}"
+    )
+    print(
+        f"Pose frames : {success_frames}"
+    )
+    print(
+        f"Detections  : {total_detections}"
+    )
+    print(
+        f"Output      : {output_path}"
+    )
+    print(
+        f"Output size : "
+        f"{MODEL_WIDTH} x {MODEL_HEIGHT}"
+    )
     print("=" * 70)
 
 
