@@ -9,7 +9,7 @@ import time
 
 import numpy as np
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose, TransformStamped
+from geometry_msgs.msg import Pose, PoseArray, TransformStamped
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
@@ -65,6 +65,8 @@ class PoseNode(Node):
             raise ValueError(
                 "RACE_6D.LABEL_NAMES contains duplicate object names."
             )
+
+        self.pose_labels = sorted(self.label_names)
 
         self.get_logger().info(
             f"Configured labels: {self.label_names}"
@@ -252,20 +254,11 @@ class PoseNode(Node):
             self.ripcord_callback,
         )
 
-        self.pose_publishers = {}
-
-        for label, name in self.label_names.items():
-            topic = f"/pose6dof/{name}"
-
-            self.pose_publishers[label] = self.create_publisher(
-                Pose,
-                topic,
-                10,
-            )
-
-            self.get_logger().info(
-                f"Pose topic: label={label} -> {topic}"
-            )
+        self.pose_pub = self.create_publisher(
+            PoseArray,
+            "/pose6dof/result",
+            10,
+        )
 
         self.debug_pub = self.create_publisher(
             Image,
@@ -316,6 +309,7 @@ class PoseNode(Node):
         self.get_logger().info("==============================")
         self.get_logger().info("RACE-6D ROS node started.")
         self.get_logger().info("Service : /pose6dof/predict")
+        self.get_logger().info("Result  : /pose6dof/result")
         self.get_logger().info("Debug   : /pose6dof/debug_image")
         self.get_logger().info("Service : /box_check/predict")
         self.get_logger().info("Result  : /box_check/result")
@@ -330,10 +324,11 @@ class PoseNode(Node):
             f"Alignment TF: {self.parent_frame} -> {self.ripcord_frame}"
         )
 
-        for label, name in self.label_names.items():
+        for label in self.pose_labels:
+            name = self.label_names[label]
             self.get_logger().info(
-                f"label={label}: "
-                f"/pose6dof/{name}, TF child={name}"
+                f"PoseArray index={self.pose_labels.index(label)}: "
+                f"label={label}, name={name}, TF child={name}"
             )
 
         self.get_logger().info("==============================")
@@ -478,17 +473,17 @@ class PoseNode(Node):
             image,
         )
 
-    def _publish_detection(
+    def _create_pose(
         self,
         detection: Dict[str, Any],
-    ) -> None:
+    ) -> Optional[Pose]:
         label = detection.get("label")
 
         if label is None:
             self.get_logger().warning(
                 "Detection has no label."
             )
-            return
+            return None
 
         label = int(label)
 
@@ -497,10 +492,9 @@ class PoseNode(Node):
                 f"Detected label={label}, "
                 "but it is not configured in LABEL_NAMES."
             )
-            return
+            return None
 
         name = self.label_names[label]
-        publisher = self.pose_publishers[label]
 
         t = detection.get("translation")
         q = detection.get("quat")
@@ -510,7 +504,7 @@ class PoseNode(Node):
                 f"Detection label={label} ({name}) "
                 "has no translation or quaternion."
             )
-            return
+            return None
 
         pose = Pose()
 
@@ -522,8 +516,6 @@ class PoseNode(Node):
         pose.orientation.y = float(q[2])
         pose.orientation.z = float(q[3])
         pose.orientation.w = float(q[0])
-
-        publisher.publish(pose)
 
         tf = TransformStamped()
 
@@ -556,6 +548,8 @@ class PoseNode(Node):
             self.get_logger().info(
                 f"Published {name} (label={label})"
             )
+
+        return pose
 
     def _get_camera_frame(self):
         frame = self.camera.get_frame()
@@ -1268,7 +1262,7 @@ class PoseNode(Node):
                 f"Detected labels: {detected_labels}"
             )
 
-            published_labels = set()
+            detections_by_label = {}
 
             for detection in detections:
                 if not isinstance(detection, dict):
@@ -1284,21 +1278,43 @@ class PoseNode(Node):
                 if label not in self.label_names:
                     continue
 
-                self._publish_detection(detection)
-                published_labels.add(label)
+                detections_by_label[label] = detection
 
-            for label, name in self.label_names.items():
-                if label in published_labels:
-                    continue
+            pose_array = PoseArray()
+            pose_array.header.stamp = (
+                self.get_clock().now().to_msg()
+            )
+            pose_array.header.frame_id = self.parent_frame
 
-                self.pose_publishers[label].publish(
+            published_labels = set()
+
+            for label in self.pose_labels:
+                detection = detections_by_label.get(label)
+
+                if detection is not None:
+                    pose = self._create_pose(detection)
+
+                    if pose is not None:
+                        pose_array.poses.append(pose)
+                        published_labels.add(label)
+                        continue
+
+                pose_array.poses.append(
                     self._failed_pose()
                 )
 
                 self.get_logger().warning(
                     f"No detection for label={label} "
-                    f"({name}). Published invalid pose."
+                    f"({self.label_names[label]}). "
+                    "Published invalid pose."
                 )
+
+            self.pose_pub.publish(pose_array)
+
+            self.get_logger().info(
+                f"Published /pose6dof/result with "
+                f"{len(pose_array.poses)} poses."
+            )
 
             debug_image = result.get("debug_image")
 
@@ -1314,9 +1330,8 @@ class PoseNode(Node):
             if response.success:
                 published_names = [
                     self.label_names[label]
-                    for label in sorted(
-                        published_labels
-                    )
+                    for label in self.pose_labels
+                    if label in published_labels
                 ]
 
                 response.message = (
@@ -1352,16 +1367,22 @@ class PoseNode(Node):
         return response
 
     def _publish_failed_all(self) -> None:
-        failed = self._failed_pose()
+        msg = PoseArray()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.parent_frame
 
-        for label, publisher in self.pose_publishers.items():
-            publisher.publish(failed)
+        for label in self.pose_labels:
+            msg.poses.append(
+                self._failed_pose()
+            )
 
             self.get_logger().warning(
                 f"Published invalid pose for "
                 f"label={label} "
                 f"({self.label_names[label]})."
             )
+
+        self.pose_pub.publish(msg)
 
     def shutdown(self) -> None:
         self.get_logger().info(
