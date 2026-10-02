@@ -20,9 +20,8 @@ GT_PATH = PROJECT_ROOT / "service" / "BOX_CHECK" / "GT" / "gt.json"
 IMAGE_SIZE = 224
 PATCH_GRID = 14
 MASK_THRESHOLD = 0.25
-
-SIM_THRESHOLD = 0.9
-COVERAGE_THRESHOLD = 0.2
+SIM_THRESHOLD = 0.8
+COVERAGE_THRESHOLD = 0.15
 
 PRESENT_LABEL = "PRESENT"
 ABSENT_LABEL = "ABSENT"
@@ -67,29 +66,17 @@ class DINOv3Estimator:
             side = obj["side"]
 
             if "polygon" not in obj:
-                raise KeyError(
-                    f"Missing 'polygon' in GT object: {side}"
-                )
+                raise KeyError(f"Missing 'polygon' in GT object: {side}")
 
-            polygon = np.asarray(
-                obj["polygon"],
-                dtype=np.float32,
-            )
+            polygon = np.asarray(obj["polygon"], dtype=np.float32)
 
             if polygon.ndim != 2 or polygon.shape[1] != 2 or len(polygon) < 3:
                 raise ValueError(
                     f"Invalid polygon for {side}: {obj['polygon']}"
                 )
 
-            bbox = self._polygon_to_bbox(
-                polygon,
-                gt_image.shape,
-            )
-
-            gt_roi = self._crop_bbox(
-                gt_image,
-                bbox,
-            )
+            bbox = self._polygon_to_bbox(polygon, gt_image.shape)
+            gt_roi = self._crop_bbox(gt_image, bbox)
 
             polygon_roi = polygon - np.array(
                 [bbox[0], bbox[1]],
@@ -101,26 +88,14 @@ class DINOv3Estimator:
                 gt_roi.shape[:2],
             )
 
-            ear_mask = self._get_patch_mask(
-                polygon_mask,
-            )
-
-            gt_feat = self._extract_features(
-                gt_roi,
-            )
-
             self.reference[side] = {
                 "polygon": polygon.tolist(),
                 "bbox": bbox,
-                "feature": gt_feat,
-                "mask": ear_mask,
+                "feature": self._extract_features(gt_roi),
+                "mask": self._get_patch_mask(polygon_mask),
             }
 
-    def _polygon_to_bbox(
-        self,
-        polygon: np.ndarray,
-        image_shape,
-    ):
+    def _polygon_to_bbox(self, polygon: np.ndarray, image_shape):
         h, w = image_shape[:2]
 
         x1 = int(np.floor(np.min(polygon[:, 0])))
@@ -134,19 +109,12 @@ class DINOv3Estimator:
         y2 = max(0, min(y2, h - 1))
 
         if x2 <= x1 or y2 <= y1:
-            raise ValueError(
-                f"Invalid polygon bbox: {polygon.tolist()}"
-            )
+            raise ValueError(f"Invalid polygon bbox: {polygon.tolist()}")
 
         return [x1, y1, x2, y2]
 
-    def _crop_bbox(
-        self,
-        image: np.ndarray,
-        bbox,
-    ):
+    def _crop_bbox(self, image: np.ndarray, bbox):
         h, w = image.shape[:2]
-
         x1, y1, x2, y2 = map(int, bbox)
 
         x1 = max(0, x1)
@@ -155,45 +123,19 @@ class DINOv3Estimator:
         y2 = min(h, y2)
 
         if x2 <= x1 or y2 <= y1:
-            raise ValueError(
-                f"Invalid bbox: {bbox}"
-            )
+            raise ValueError(f"Invalid bbox: {bbox}")
 
         return image[y1:y2, x1:x2]
 
-    def _polygon_mask(
-        self,
-        polygon: np.ndarray,
-        shape,
-    ) -> np.ndarray:
+    def _polygon_mask(self, polygon: np.ndarray, shape) -> np.ndarray:
         h, w = shape[:2]
-
-        mask = np.zeros(
-            (h, w),
-            dtype=np.uint8,
-        )
-
-        points = np.round(
-            polygon,
-        ).astype(np.int32)
-
-        cv2.fillPoly(
-            mask,
-            [points],
-            255,
-        )
-
+        mask = np.zeros((h, w), dtype=np.uint8)
+        points = np.round(polygon).astype(np.int32)
+        cv2.fillPoly(mask, [points], 255)
         return mask
 
-    def _extract_features(
-        self,
-        image: np.ndarray,
-    ) -> torch.Tensor:
-        image = cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2RGB,
-        )
-
+    def _extract_features(self, image: np.ndarray) -> torch.Tensor:
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = cv2.resize(
             image,
             (IMAGE_SIZE, IMAGE_SIZE),
@@ -205,10 +147,8 @@ class DINOv3Estimator:
             .permute(2, 0, 1)
             .float()
             .div(255.0)
-        )
-
-        x = x.unsqueeze(0).to(
-            self.device,
+            .unsqueeze(0)
+            .to(self.device)
         )
 
         with torch.inference_mode():
@@ -216,24 +156,15 @@ class DINOv3Estimator:
                 x,
             )["x_norm_patchtokens"][0]
 
-        return F.normalize(
-            feat,
-            dim=-1,
-        )
+        return F.normalize(feat, dim=-1)
 
-    def _get_patch_mask(
-        self,
-        mask: np.ndarray,
-    ) -> np.ndarray:
+    def _get_patch_mask(self, mask: np.ndarray) -> np.ndarray:
         small = cv2.resize(
             mask.astype(np.uint8),
             (PATCH_GRID, PATCH_GRID),
             interpolation=cv2.INTER_AREA,
         )
-
-        return small >= int(
-            MASK_THRESHOLD * 255
-        )
+        return small >= int(MASK_THRESHOLD * 255)
 
     def _evaluate(
         self,
@@ -241,41 +172,20 @@ class DINOv3Estimator:
         input_feat: torch.Tensor,
         roi_mask: np.ndarray,
     ):
-        gt_feat = gt_feat.reshape(
-            PATCH_GRID,
-            PATCH_GRID,
-            -1,
-        )
+        gt_feat = gt_feat.reshape(PATCH_GRID, PATCH_GRID, -1)
+        input_feat = input_feat.reshape(PATCH_GRID, PATCH_GRID, -1)
 
-        input_feat = input_feat.reshape(
-            PATCH_GRID,
-            PATCH_GRID,
-            -1,
-        )
+        similarity = (gt_feat * input_feat).sum(dim=-1)
 
-        similarity = (
-            gt_feat * input_feat
-        ).sum(dim=-1)
-
-        roi_mask_t = torch.from_numpy(
-            roi_mask,
-        ).to(self.device)
-
-        scores = similarity[
-            roi_mask_t
-        ]
+        roi_mask_t = torch.from_numpy(roi_mask).to(self.device)
+        scores = similarity[roi_mask_t]
 
         if scores.numel() == 0:
             raise ValueError(
                 "Polygon does not contain any valid DINOv3 patches"
             )
 
-        scores_np = (
-            scores
-            .detach()
-            .cpu()
-            .numpy()
-        )
+        scores_np = scores.detach().cpu().numpy()
 
         pass_mask = (
             (similarity >= self.sim_threshold)
@@ -283,31 +193,14 @@ class DINOv3Estimator:
         )
 
         coverage = float(
-            pass_mask[roi_mask_t]
-            .float()
-            .mean()
+            pass_mask[roi_mask_t].float().mean()
         )
 
-        mean_similarity = float(
-            scores.mean()
-        )
+        mean_similarity = float(scores.mean())
+        median_similarity = float(scores.median())
+        p10_similarity = float(np.percentile(scores_np, 10))
 
-        median_similarity = float(
-            scores.median()
-        )
-
-        p10_similarity = float(
-            np.percentile(
-                scores_np,
-                10,
-            )
-        )
-
-        is_present = (
-            coverage
-            >= self.coverage_threshold
-        )
-
+        is_present = coverage >= self.coverage_threshold
         label = (
             self.present_label
             if is_present
@@ -324,12 +217,8 @@ class DINOv3Estimator:
             "p10_similarity": p10_similarity,
             "similarity_threshold": self.sim_threshold,
             "coverage_threshold": self.coverage_threshold,
-            "patch_count": int(
-                len(scores_np)
-            ),
-            "pass_patch_count": int(
-                pass_mask.sum().item()
-            ),
+            "patch_count": int(len(scores_np)),
+            "pass_patch_count": int(pass_mask.sum().item()),
             "pass_mask": pass_mask.detach().cpu().numpy(),
             "similarity_map": similarity.detach().cpu().numpy(),
         }
@@ -342,15 +231,8 @@ class DINOv3Estimator:
         bbox,
         evaluation: Dict[str, Any],
     ):
-        polygon = np.asarray(
-            polygon,
-            dtype=np.int32,
-        )
-
-        x1, y1, x2, y2 = map(
-            int,
-            bbox,
-        )
+        polygon = np.asarray(polygon, dtype=np.int32)
+        x1, y1, x2, y2 = map(int, bbox)
 
         color = (
             PRESENT_COLOR
@@ -361,58 +243,15 @@ class DINOv3Estimator:
         debug = image.copy()
         overlay = debug.copy()
 
-        roi_w = max(
-            1,
-            x2 - x1,
-        )
+        roi_w = max(1, x2 - x1)
+        roi_h = max(1, y2 - y1)
+        pass_mask = evaluation["pass_mask"]
 
-        roi_h = max(
-            1,
-            y2 - y1,
-        )
-
-        pass_mask = evaluation[
-            "pass_mask"
-        ]
-
-        for row, col in zip(
-            *np.where(pass_mask)
-        ):
-            px1 = (
-                x1
-                + int(
-                    col
-                    * roi_w
-                    / PATCH_GRID
-                )
-            )
-
-            py1 = (
-                y1
-                + int(
-                    row
-                    * roi_h
-                    / PATCH_GRID
-                )
-            )
-
-            px2 = (
-                x1
-                + int(
-                    (col + 1)
-                    * roi_w
-                    / PATCH_GRID
-                )
-            )
-
-            py2 = (
-                y1
-                + int(
-                    (row + 1)
-                    * roi_h
-                    / PATCH_GRID
-                )
-            )
+        for row, col in zip(*np.where(pass_mask)):
+            px1 = x1 + int(col * roi_w / PATCH_GRID)
+            py1 = y1 + int(row * roi_h / PATCH_GRID)
+            px2 = x1 + int((col + 1) * roi_w / PATCH_GRID)
+            py2 = y1 + int((row + 1) * roi_h / PATCH_GRID)
 
             cv2.rectangle(
                 overlay,
@@ -438,15 +277,10 @@ class DINOv3Estimator:
             3,
         )
 
-        label = evaluation["label"]
-        coverage = evaluation[
-            "coverage_percent"
-        ]
-
         text = (
             f"{side.upper()}: "
-            f"{label}  "
-            f"cov={coverage:.1f}%"
+            f"{evaluation['label']}  "
+            f"cov={evaluation['coverage_percent']:.1f}%"
         )
 
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -460,38 +294,14 @@ class DINOv3Estimator:
             thickness,
         )[0]
 
-        anchor_x = int(
-            np.min(polygon[:, 0])
-        )
+        anchor_x = int(np.min(polygon[:, 0]))
+        anchor_y = int(np.min(polygon[:, 1]))
 
-        anchor_y = int(
-            np.min(polygon[:, 1])
-        )
-
-        text_y = max(
-            th + 10,
-            anchor_y,
-        )
-
-        bg_y1 = max(
-            0,
-            text_y - th - 8,
-        )
-
-        bg_y2 = min(
-            debug.shape[0],
-            text_y + 4,
-        )
-
-        bg_x1 = max(
-            0,
-            anchor_x,
-        )
-
-        bg_x2 = min(
-            debug.shape[1],
-            bg_x1 + tw + 10,
-        )
+        text_y = max(th + 10, anchor_y)
+        bg_y1 = max(0, text_y - th - 8)
+        bg_y2 = min(debug.shape[0], text_y + 4)
+        bg_x1 = max(0, anchor_x)
+        bg_x2 = min(debug.shape[1], bg_x1 + tw + 10)
 
         cv2.rectangle(
             debug,
@@ -504,10 +314,7 @@ class DINOv3Estimator:
         cv2.putText(
             debug,
             text,
-            (
-                bg_x1 + 5,
-                text_y - 2,
-            ),
+            (bg_x1 + 5, text_y - 2),
             font,
             scale,
             (255, 255, 255),
@@ -517,26 +324,17 @@ class DINOv3Estimator:
 
         return debug
 
-    def predict(
-        self,
-        rgb: np.ndarray,
-    ) -> Dict[str, Any]:
-        if (
-            rgb is None
-            or not isinstance(
-                rgb,
-                np.ndarray,
-            )
-        ):
-            raise ValueError(
-                "rgb must be a numpy.ndarray"
-            )
+    def predict(self, rgb: np.ndarray) -> Dict[str, Any]:
+        if rgb is None or not isinstance(rgb, np.ndarray):
+            raise ValueError("rgb must be a numpy.ndarray")
 
         debug_image = rgb.copy()
 
         result = {
             "left": None,
             "right": None,
+            "left_evaluation": None,
+            "right_evaluation": None,
             "debug_image": debug_image,
         }
 
@@ -580,18 +378,8 @@ class DINOv3Estimator:
                 roi_mask,
             )
 
-            pass_mask = evaluation.pop(
-                "pass_mask"
-            )
-
-            similarity_map = evaluation.pop(
-                "similarity_map"
-            )
-
-            evaluation["pass_mask"] = pass_mask
-            evaluation["similarity_map"] = similarity_map
-
-            result[side] = evaluation
+            result[side] = not bool(evaluation["present"])
+            result[f"{side}_evaluation"] = evaluation
 
             debug_image = self._draw_debug(
                 debug_image,
@@ -602,7 +390,6 @@ class DINOv3Estimator:
             )
 
         result["debug_image"] = debug_image
-
         return result
 
 
@@ -612,14 +399,10 @@ if __name__ == "__main__":
     image_path = (
         Path(sys.argv[1])
         if len(sys.argv) > 1
-        else PROJECT_ROOT
-        / "dino_test"
-        / "hard.png"
+        else PROJECT_ROOT / "dino_test" / "hard.png"
     )
 
-    image = cv2.imread(
-        str(image_path)
-    )
+    image = cv2.imread(str(image_path))
 
     if image is None:
         raise FileNotFoundError(
@@ -627,47 +410,23 @@ if __name__ == "__main__":
         )
 
     estimator = DINOv3Estimator()
-    result = estimator.predict(
-        image,
-    )
+    result = estimator.predict(image)
 
-    print(
-        f"Device: {estimator.device}"
-    )
-
-    print(
-        f"SIM_THRESHOLD: "
-        f"{estimator.sim_threshold}"
-    )
-
-    print(
-        f"COVERAGE_THRESHOLD: "
-        f"{estimator.coverage_threshold}"
-    )
+    print(f"Device: {estimator.device}")
+    print(f"SIM_THRESHOLD: {estimator.sim_threshold}")
+    print(f"COVERAGE_THRESHOLD: {estimator.coverage_threshold}")
 
     for side in ("left", "right"):
-        item = result[side]
+        item = result[f"{side}_evaluation"]
 
         print(
             f"{side}: "
             f"{item['label']} | "
-            f"coverage="
-            f"{item['coverage_percent']:.1f}% | "
-            f"mean="
-            f"{item['mean_similarity']:.4f}"
+            f"absent={result[side]} | "
+            f"coverage={item['coverage_percent']:.1f}% | "
+            f"mean={item['mean_similarity']:.4f}"
         )
 
-    debug_path = (
-        PROJECT_ROOT
-        / "dino_test"
-        / "debug_result.png"
-    )
-
-    cv2.imwrite(
-        str(debug_path),
-        result["debug_image"],
-    )
-
-    print(
-        f"Debug image: {debug_path}"
-    )
+    debug_path = PROJECT_ROOT / "dino_test" / "debug_result.png"
+    cv2.imwrite(str(debug_path), result["debug_image"])
+    print(f"Debug image: {debug_path}")
