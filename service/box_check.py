@@ -8,27 +8,18 @@ from pathlib import Path
 
 import cv2
 
-# ============================================================
-# PATH & IMPORTS
-# ============================================================
-
 APP_DIR = Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
 from BOX_CHECK.ear_esitimator import DINOv3Estimator as EarEstimator
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 DEFAULT_OUTPUT_DIR = APP_DIR / "output"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
+SIM_THRESHOLD = 0.8
+COVERAGE_THRESHOLD = 0.05
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
 
 def load_image(path: Path):
     image = cv2.imread(str(path))
@@ -46,11 +37,10 @@ def collect_images(input_path: Path) -> list[Path]:
         return [input_path]
 
     if input_path.is_dir():
-        images = sorted([
+        images = sorted(
             p for p in input_path.iterdir()
-            if p.is_file()
-            and p.suffix.lower() in IMAGE_EXTENSIONS
-        ])
+            if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
+        )
 
         if not images:
             raise RuntimeError(
@@ -65,7 +55,6 @@ def collect_images(input_path: Path) -> list[Path]:
 
 
 def save_json(result: dict, output_path: Path):
-    # Do not save debug_image into JSON.
     json_result = {
         key: value
         for key, value in result.items()
@@ -100,15 +89,8 @@ def process_image(
     debug_image = result.get("debug_image")
 
     if debug_image is None:
-        print(
-            f"[WARNING] No debug_image returned: "
-            f"{image_path}"
-        )
+        print(f"[WARNING] No debug_image returned: {image_path}")
         return False
-
-    # --------------------------------------------------------
-    # Save debug image
-    # --------------------------------------------------------
 
     image_output_path = output_dir / image_path.name
 
@@ -116,47 +98,27 @@ def process_image(
         str(image_output_path),
         debug_image,
     ):
-        print(
-            f"[ERROR] Failed to save: "
-            f"{image_output_path}"
-        )
+        print(f"[ERROR] Failed to save: {image_output_path}")
         return False
 
-    # --------------------------------------------------------
-    # Save JSON result
-    # --------------------------------------------------------
-
-    json_output_path = (
-        output_dir / f"{image_path.stem}.json"
-    )
+    json_output_path = output_dir / f"{image_path.stem}.json"
 
     try:
-        save_json(
-            result,
-            json_output_path,
-        )
+        save_json(result, json_output_path)
     except Exception as e:
-        print(
-            f"[ERROR] Failed to save JSON: "
-            f"{json_output_path}"
-        )
+        print(f"[ERROR] Failed to save JSON: {json_output_path}")
         print(f"        {e}")
         return False
 
     print(f"[OUTPUT] Image: {image_output_path}")
     print(f"[OUTPUT] JSON : {json_output_path}")
 
-    # Print prediction result
     for key, value in result.items():
         if key != "debug_image":
             print(f"  {key}: {value}")
 
     return True
 
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -176,8 +138,8 @@ def main():
         "--output",
         default=str(DEFAULT_OUTPUT_DIR),
         help=(
-            "Output directory for debug images "
-            f"and JSON files. Default: {DEFAULT_OUTPUT_DIR}"
+            "Output directory for debug images and JSON files. "
+            f"Default: {DEFAULT_OUTPUT_DIR}"
         ),
     )
 
@@ -191,12 +153,19 @@ def main():
     print("=" * 60)
     print(f"[INPUT]  {input_path}")
     print(f"[OUTPUT] {output_dir}")
+    print(f"[CONFIG] SIM_THRESHOLD      = {SIM_THRESHOLD}")
+    print(f"[CONFIG] COVERAGE_THRESHOLD = {COVERAGE_THRESHOLD}")
 
     images = collect_images(input_path)
     print(f"[INFO] Found {len(images)} image(s)")
 
     print("[INFO] Initializing EarEstimator...")
-    estimator = EarEstimator()
+
+    estimator = EarEstimator(
+        sim_threshold=SIM_THRESHOLD,
+        coverage_threshold=COVERAGE_THRESHOLD,
+    )
+
     print("[INFO] EarEstimator ready.")
 
     output_dir.mkdir(

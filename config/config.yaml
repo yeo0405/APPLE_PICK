@@ -32,5 +32,5 @@ RACE_6D:
 # ==========================================================
 BOX_CHECK:
   ENABLED: true
-  SIM_THRESHOLD: 0.9
-  COVERAGE_THRESHOLD: 0.1
+  SIM_THRESHOLD: 0.8
+  COVERAGE_THRESHOLD: 0.14
