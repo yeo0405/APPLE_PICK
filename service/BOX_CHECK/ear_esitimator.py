@@ -59,7 +59,9 @@ class DINOv3Estimator:
         gt_image = cv2.imread(str(gt_image_path))
 
         if gt_image is None:
-            raise FileNotFoundError(f"Cannot read GT image: {gt_image_path}")
+            raise FileNotFoundError(
+                f"Cannot read GT image: {gt_image_path}"
+            )
 
         self.reference: Dict[str, Dict[str, Any]] = {}
 
@@ -146,7 +148,6 @@ class DINOv3Estimator:
         bbox,
     ):
         h, w = image.shape[:2]
-
         x1, y1, x2, y2 = map(int, bbox)
 
         x1 = max(0, x1)
@@ -317,6 +318,7 @@ class DINOv3Estimator:
         return {
             "label": label,
             "present": is_present,
+            "absent": not is_present,
             "coverage": coverage,
             "coverage_percent": coverage * 100.0,
             "mean_similarity": mean_similarity,
@@ -537,6 +539,8 @@ class DINOv3Estimator:
         result = {
             "left": None,
             "right": None,
+            "left_evaluation": None,
+            "right_evaluation": None,
             "debug_image": debug_image,
         }
 
@@ -580,18 +584,11 @@ class DINOv3Estimator:
                 roi_mask,
             )
 
-            pass_mask = evaluation.pop(
-                "pass_mask"
+            result[side] = bool(
+                evaluation["absent"]
             )
 
-            similarity_map = evaluation.pop(
-                "similarity_map"
-            )
-
-            evaluation["pass_mask"] = pass_mask
-            evaluation["similarity_map"] = similarity_map
-
-            result[side] = evaluation
+            result[f"{side}_evaluation"] = evaluation
 
             debug_image = self._draw_debug(
                 debug_image,
@@ -646,11 +643,14 @@ if __name__ == "__main__":
     )
 
     for side in ("left", "right"):
-        item = result[side]
+        item = result[
+            f"{side}_evaluation"
+        ]
 
         print(
             f"{side}: "
             f"{item['label']} | "
+            f"absent={result[side]} | "
             f"coverage="
             f"{item['coverage_percent']:.1f}% | "
             f"mean="
