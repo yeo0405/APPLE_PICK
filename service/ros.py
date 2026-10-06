@@ -24,7 +24,7 @@ from tomo_camera_tcp import CameraTCPClient
 
 
 class PoseNode(Node):
-    """Keep RACE-6D, DINOv3, Alignment, Ripcord and camera alive."""
+    """Keep RACE-6D, DINOv3, Alignment, Ripcord and cameras alive."""
 
     def __init__(self, cfg: Dict[str, Any], args: Any) -> None:
         super().__init__("pose6dof_ros_node")
@@ -35,8 +35,10 @@ class PoseNode(Node):
         self.rgb: Optional[np.ndarray] = None
         self.depth: Optional[np.ndarray] = None
         self.camera_matrix: Optional[np.ndarray] = None
+        self.usb_camera_matrix: Optional[np.ndarray] = None
 
         camera_cfg = cfg["CAMERA"]
+        usb_camera_cfg = cfg["USB_CAMERA"]
         race_cfg = cfg["RACE_6D"]
 
         label_names = race_cfg.get("LABEL_NAMES")
@@ -113,6 +115,7 @@ class PoseNode(Node):
             gt_json = Path(
                 alignment_cfg.get("GT_JSON", "ALIGNMENT/GT/gt.json")
             )
+
             if not gt_json.is_absolute():
                 gt_json = alignment_root / gt_json
 
@@ -155,12 +158,37 @@ class PoseNode(Node):
             if not self.camera.start():
                 raise RuntimeError("Camera start failed.")
 
-        self.camera_matrix = self._load_camera_matrix()
+        self.camera_matrix = self._load_intrinsic_matrix(
+            self.camera,
+            "Camera",
+        )
 
         self.get_logger().info(
             "Camera intrinsic matrix loaded successfully:"
         )
         self.get_logger().info(f"\n{self.camera_matrix}")
+
+        self.usb_camera = CameraTCPClient(
+            usb_camera_cfg["IP"],
+            usb_camera_cfg["PORT"],
+        )
+        self.get_logger().info(
+            f"USB Camera: {usb_camera_cfg['IP']}:{usb_camera_cfg['PORT']}"
+        )
+
+        if not self.usb_camera.is_running():
+            if not self.usb_camera.start():
+                raise RuntimeError("USB camera start failed.")
+
+        self.usb_camera_matrix = self._load_intrinsic_matrix(
+            self.usb_camera,
+            "USB Camera",
+        )
+
+        self.get_logger().info(
+            "USB Camera intrinsic matrix loaded successfully:"
+        )
+        self.get_logger().info(f"\n{self.usb_camera_matrix}")
 
         self.predict_srv = self.create_service(
             Trigger,
@@ -255,51 +283,55 @@ class PoseNode(Node):
 
         self.get_logger().info("==============================")
 
-    def _load_camera_matrix(
+    def _load_intrinsic_matrix(
         self,
-        max_retries: int = 10,
-        retry_delay: float = 2.0,
+        camera: CameraTCPClient,
+        camera_name: str,
+        max_retries: int = 30,
+        retry_delay: float = 0.5,
     ) -> np.ndarray:
         self.get_logger().info(
-            "Waiting for camera color intrinsic matrix..."
+            f"Waiting for {camera_name} color intrinsic matrix..."
         )
+
         last_value = None
 
         for attempt in range(1, max_retries + 1):
             try:
-                matrix = self.camera.get_color_intri_matrix()
+                matrix = camera.get_color_intri_matrix()
                 last_value = matrix
 
                 if matrix is not None:
                     matrix = np.asarray(matrix, dtype=np.float32)
-                    self.get_logger().info(
-                        f"Camera intrinsic attempt {attempt}/{max_retries}: "
-                        f"shape={matrix.shape}"
-                    )
 
                     if matrix.shape == (3, 3):
+                        self.get_logger().info(
+                            f"{camera_name} intrinsic ready "
+                            f"(attempt {attempt}/{max_retries})."
+                        )
                         return matrix
 
                     self.get_logger().warning(
-                        f"Invalid intrinsic shape: {matrix.shape}"
+                        f"{camera_name} invalid intrinsic shape: "
+                        f"{matrix.shape}"
                     )
                 else:
-                    self.get_logger().warning(
-                        f"Intrinsic not available "
+                    self.get_logger().info(
+                        f"{camera_name} intrinsic not ready "
                         f"(attempt {attempt}/{max_retries})."
                     )
+
             except Exception as error:
                 self.get_logger().warning(
-                    f"Failed to get intrinsic "
+                    f"Failed to get {camera_name} intrinsic "
                     f"(attempt {attempt}/{max_retries}): "
                     f"{type(error).__name__}: {error}"
                 )
 
-            if attempt < max_retries:
-                time.sleep(retry_delay)
+            time.sleep(retry_delay)
 
         raise RuntimeError(
-            "Failed to obtain valid 3x3 camera intrinsic "
+            f"Failed to obtain valid 3x3 {camera_name} intrinsic "
             f"after {max_retries} attempts. Last value: {last_value}"
         )
 
@@ -474,6 +506,40 @@ class PoseNode(Node):
         rgb = rgb_frame.data
         return rgb if isinstance(rgb, np.ndarray) else np.asarray(rgb)
 
+    def _get_usb_camera_frame(self):
+        frame = self.usb_camera.get_frame()
+
+        if frame.is_empty:
+            self.get_logger().warning(
+                "USB camera returned empty frame."
+            )
+            return None, None
+
+        rgb_frame = self.usb_camera.get_color_frame()
+        depth_frame = self.usb_camera.get_depth_frame()
+
+        if rgb_frame is None or depth_frame is None:
+            self.get_logger().error(
+                "USB camera returned empty RGB or depth frame."
+            )
+            return None, None
+
+        rgb = rgb_frame.data
+        depth = depth_frame.data
+
+        if rgb is None or depth is None:
+            self.get_logger().error(
+                "USB camera returned None RGB/depth data."
+            )
+            return None, None
+
+        if not isinstance(rgb, np.ndarray):
+            rgb = np.asarray(rgb)
+        if not isinstance(depth, np.ndarray):
+            depth = np.asarray(depth)
+
+        return rgb, depth
+
     def box_check_callback(
         self,
         request: Trigger.Request,
@@ -592,11 +658,11 @@ class PoseNode(Node):
             self.get_logger().info("========================================")
             self.get_logger().info("Alignment prediction triggered.")
 
-            rgb, depth = self._get_camera_frame()
+            rgb, depth = self._get_usb_camera_frame()
 
             if rgb is None or depth is None:
                 response.success = False
-                response.message = "camera failed"
+                response.message = "USB camera failed"
                 return response
 
             if rgb.ndim != 3 or rgb.shape[2] != 3:
@@ -611,25 +677,27 @@ class PoseNode(Node):
                     f"RGB={rgb.shape[:2]}, Depth={depth.shape}"
                 )
 
-            if self.camera_matrix is None:
-                raise RuntimeError("Camera intrinsic matrix is None.")
+            if self.usb_camera_matrix is None:
+                raise RuntimeError(
+                    "USB camera intrinsic matrix is None."
+                )
 
             camera_matrix = np.asarray(
-                self.camera_matrix,
+                self.usb_camera_matrix,
                 dtype=np.float64,
             )
 
             if camera_matrix.shape != (3, 3):
                 raise RuntimeError(
-                    "Invalid camera intrinsic matrix shape: "
+                    "Invalid USB camera intrinsic matrix shape: "
                     f"{camera_matrix.shape}"
                 )
 
             self.get_logger().info(
-                f"RGB   : shape={rgb.shape}, dtype={rgb.dtype}"
+                f"USB RGB   : shape={rgb.shape}, dtype={rgb.dtype}"
             )
             self.get_logger().info(
-                f"Depth : shape={depth.shape}, dtype={depth.dtype}"
+                f"USB Depth : shape={depth.shape}, dtype={depth.dtype}"
             )
             self.get_logger().info("Running Alignment...")
 
@@ -1151,6 +1219,14 @@ class PoseNode(Node):
         except Exception as error:
             self.get_logger().warning(
                 f"Camera stop error: {error}"
+            )
+
+        try:
+            if self.usb_camera is not None:
+                self.usb_camera.stop()
+        except Exception as error:
+            self.get_logger().warning(
+                f"USB camera stop error: {error}"
             )
 
 
