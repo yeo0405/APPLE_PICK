@@ -576,15 +576,17 @@ class PoseNode(Node):
 
             left = bool(result.get("left", False))
             right = bool(result.get("right", False))
-            result_data = {"left": left, "right": right}
+            left_state = "absent" if left else "present"
+            right_state = "absent" if right else "present"
+            result_data = {"left_ear": left_state, "right_ear": right_state}
 
             result_msg = DiagnosticStatus()
             result_msg.name = "box_check"
             result_msg.level = DiagnosticStatus.OK
             result_msg.message = "success"
             result_msg.values = [
-                KeyValue(key="left", value=str(left).lower()),
-                KeyValue(key="right", value=str(right).lower()),
+                KeyValue(key="left_ear", value=left_state),
+                KeyValue(key="right_ear", value=right_state),
             ]
             self.box_check_result_pub.publish(result_msg)
 
@@ -608,7 +610,7 @@ class PoseNode(Node):
                 f"Box Check exception: {type(error).__name__}: {error}"
             )
             response.success = False
-            response.message = f"left:false right:false error:{error}"
+            response.message = f"left_ear:None right_ear:None error:{error}"
 
         finally:
             self.processing = False
