@@ -9,6 +9,7 @@ import time
 
 import numpy as np
 from cv_bridge import CvBridge
+from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
 from geometry_msgs.msg import Pose, PoseArray, TransformStamped
 from rclpy.node import Node
 from sensor_msgs.msg import Image
@@ -222,7 +223,7 @@ class PoseNode(Node):
             10,
         )
         self.box_check_result_pub = self.create_publisher(
-            String,
+            DiagnosticStatus,
             "/box_check/result",
             10,
         )
@@ -593,13 +594,20 @@ class PoseNode(Node):
                 "right": right,
             }
 
-            result_msg = String()
-            result_msg.data = json.dumps(
+            result_msg = DiagnosticStatus()
+            result_msg.name = "box_check"
+            result_msg.level = DiagnosticStatus.OK
+            result_msg.message = "success"
+            result_msg.values = [
+                KeyValue(key="left", value=str(left).lower()),
+                KeyValue(key="right", value=str(right).lower()),
+            ]
+            self.box_check_result_pub.publish(result_msg)
+            result_text = json.dumps(
                 result_data,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-            self.box_check_result_pub.publish(result_msg)
 
             debug_image = result.get("debug_image")
             self._publish_box_debug(
@@ -607,10 +615,10 @@ class PoseNode(Node):
             )
 
             response.success = True
-            response.message = result_msg.data
+            response.message = result_text
 
             self.get_logger().info(
-                f"Box Check result: {result_msg.data}"
+                f"Box Check result: {result_text}"
             )
             self.get_logger().info("========================================")
 
