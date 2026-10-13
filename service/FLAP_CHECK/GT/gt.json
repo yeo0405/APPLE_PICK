@@ -1,0 +1,102 @@
+{
+    "image": "service/FLAP_CHECK/GT/GT.png",
+    "image_size": [
+        1920,
+        1080
+    ],
+    "object_count": 2,
+    "objects": [
+        {
+            "index": 0,
+            "side": "left",
+            "polygon": [
+                [
+                    651,
+                    330
+                ],
+                [
+                    633,
+                    367
+                ],
+                [
+                    641,
+                    386
+                ],
+                [
+                    663,
+                    376
+                ],
+                [
+                    676,
+                    335
+                ]
+            ],
+            "bbox": [
+                633,
+                330,
+                676,
+                386
+            ],
+            "mask": {
+                "index": 0,
+                "side": "left",
+                "file": "service/FLAP_CHECK/GT/gt_masks/ear_0.png",
+                "score": 0.8294316530227661,
+                "area": 1452
+            }
+        },
+        {
+            "index": 1,
+            "side": "right",
+            "polygon": [
+                [
+                    1282,
+                    316
+                ],
+                [
+                    1304,
+                    344
+                ],
+                [
+                    1311,
+                    367
+                ],
+                [
+                    1300,
+                    375
+                ],
+                [
+                    1282,
+                    361
+                ],
+                [
+                    1260,
+                    334
+                ]
+            ],
+            "bbox": [
+                1260,
+                316,
+                1311,
+                375
+            ],
+            "mask": {
+                "index": 1,
+                "side": "right",
+                "file": "service/FLAP_CHECK/GT/gt_masks/ear_1.png",
+                "score": 0.8596377372741699,
+                "area": 1495
+            }
+        }
+    ],
+    "sam2": {
+        "checkpoint": "model/sam2.1_hiera_small.pt",
+        "config": "model/sam2.1_hiera_s.yaml",
+        "prompt_type": "polygon_to_bbox",
+        "selection": "highest_score",
+        "multimask_output": true,
+        "dynamic_multimask_via_stability": true,
+        "dynamic_multimask_stability_delta": 0.05,
+        "dynamic_multimask_stability_thresh": 0.98
+    }
+}

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""ROS 2 endpoint for RACE-6D, DINOv3 Box Check, Alignment and Ripcord."""
+"""ROS 2 endpoint for RACE-6D, DINOv3 Box Check, Flap Check, Alignment and Ripcord."""
 
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -20,6 +20,7 @@ from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithP
 
 from RACE_6D.core import PoseEstimator
 from BOX_CHECK.ear_esitimator import DINOv3Estimator
+from FLAP_CHECK.ear_esitimator import DINOv3Estimator as FlapCheckEstimator
 from ALIGNMENT.alignment import AlignmentEstimator
 from RIPCORD.ripcord_estimator import RipcordEstimator
 from tomo_camera_tcp import CameraTCPClient
@@ -108,6 +109,20 @@ class PoseNode(Node):
         else:
             self.get_logger().info("DINOv3 Box Check disabled.")
 
+        flap_cfg = cfg.get("FLAP_CHECK", {})
+        self.flap_check_enabled = bool(flap_cfg.get("ENABLED", True))
+        self.flap_check_estimator: Optional[FlapCheckEstimator] = None
+
+        if self.flap_check_enabled:
+            self.get_logger().info("Initializing DINOv3 Flap Check...")
+            self.flap_check_estimator = FlapCheckEstimator(
+                sim_threshold=float(flap_cfg.get("SIM_THRESHOLD", 0.8)),
+                coverage_threshold=float(flap_cfg.get("COVERAGE_THRESHOLD", 0.2)),
+            )
+            self.get_logger().info("DINOv3 Flap Check initialized.")
+        else:
+            self.get_logger().info("DINOv3 Flap Check disabled.")
+
         alignment_cfg = cfg.get("ALIGNMENT", {})
         self.alignment_enabled = bool(alignment_cfg.get("ENABLED", True))
         self.alignment_estimator: Optional[AlignmentEstimator] = None
@@ -182,6 +197,11 @@ class PoseNode(Node):
             "/box_check/predict",
             self.box_check_callback,
         )
+        self.flap_check_srv = self.create_service(
+            Trigger,
+            "/flap_check/predict",
+            self.flap_check_callback,
+        )
         self.alignment_srv = self.create_service(
             Trigger,
             "/alignment/predict",
@@ -211,6 +231,16 @@ class PoseNode(Node):
         self.box_check_debug_pub = self.create_publisher(
             Image,
             "/box_check/debug_image",
+            10,
+        )
+        self.flap_check_result_pub = self.create_publisher(
+            DiagnosticStatus,
+            "/flap_check/result",
+            10,
+        )
+        self.flap_check_debug_pub = self.create_publisher(
+            Image,
+            "/flap_check/debug_image",
             10,
         )
         self.alignment_result_pub = self.create_publisher(
@@ -246,6 +276,9 @@ class PoseNode(Node):
         self.get_logger().info("Service : /box_check/predict")
         self.get_logger().info("Result  : /box_check/result")
         self.get_logger().info("Debug   : /box_check/debug_image")
+        self.get_logger().info("Service : /flap_check/predict")
+        self.get_logger().info("Result  : /flap_check/result")
+        self.get_logger().info("Debug   : /flap_check/debug_image")
         self.get_logger().info("Service : /alignment/predict")
         self.get_logger().info("Result  : /alignment/result")
         self.get_logger().info("Debug   : /alignment/debug_image")
@@ -348,6 +381,9 @@ class PoseNode(Node):
 
     def _publish_box_debug(self, image: Optional[np.ndarray]) -> None:
         self._publish_image(self.box_check_debug_pub, image)
+
+    def _publish_flap_debug(self, image: Optional[np.ndarray]) -> None:
+        self._publish_image(self.flap_check_debug_pub, image)
 
     def _publish_alignment_debug(self, image: Optional[np.ndarray]) -> None:
         self._publish_image(self.alignment_debug_pub, image)
@@ -533,16 +569,19 @@ class PoseNode(Node):
 
         return rgb, depth
 
-    def box_check_callback(
+    def _ear_check(
         self,
-        request: Trigger.Request,
+        key: str,
+        title: str,
+        enabled: bool,
+        estimator,
+        result_pub,
+        publish_debug,
         response: Trigger.Response,
     ) -> Trigger.Response:
-        del request
-
-        if not self.box_check_enabled:
+        if not enabled:
             response.success = False
-            response.message = "Box Check disabled."
+            response.message = f"{title} disabled."
             return response
 
         if self.processing:
@@ -550,16 +589,16 @@ class PoseNode(Node):
             response.message = "busy"
             return response
 
-        if self.box_check_estimator is None:
+        if estimator is None:
             response.success = False
-            response.message = "DINOv3 estimator unavailable."
+            response.message = f"{title} estimator unavailable."
             return response
 
         self.processing = True
 
         try:
             self.get_logger().info("========================================")
-            self.get_logger().info("Box Check prediction triggered.")
+            self.get_logger().info(f"{title} prediction triggered.")
             rgb = self._get_camera_rgb()
 
             if rgb is None:
@@ -571,8 +610,8 @@ class PoseNode(Node):
                 raise RuntimeError(f"Invalid RGB shape: {rgb.shape}")
 
             self.get_logger().info(f"RGB: shape={rgb.shape}, dtype={rgb.dtype}")
-            self.get_logger().info("Running DINOv3 Box Check...")
-            result = self.box_check_estimator.predict(rgb)
+            self.get_logger().info(f"Running DINOv3 {title}...")
+            result = estimator.predict(rgb)
 
             left = bool(result.get("left", False))
             right = bool(result.get("right", False))
@@ -581,14 +620,14 @@ class PoseNode(Node):
             result_data = {"left_ear": left_state, "right_ear": right_state}
 
             result_msg = DiagnosticStatus()
-            result_msg.name = "box_check"
+            result_msg.name = key
             result_msg.level = DiagnosticStatus.OK
             result_msg.message = "success"
             result_msg.values = [
                 KeyValue(key="left_ear", value=left_state),
                 KeyValue(key="right_ear", value=right_state),
             ]
-            self.box_check_result_pub.publish(result_msg)
+            result_pub.publish(result_msg)
 
             result_text = json.dumps(
                 result_data,
@@ -596,18 +635,16 @@ class PoseNode(Node):
                 separators=(",", ":"),
             )
             debug_image = result.get("debug_image")
-            self._publish_box_debug(
-                debug_image if debug_image is not None else rgb
-            )
+            publish_debug(debug_image if debug_image is not None else rgb)
 
             response.success = True
             response.message = result_text
-            self.get_logger().info(f"Box Check result: {result_text}")
+            self.get_logger().info(f"{title} result: {result_text}")
             self.get_logger().info("========================================")
 
         except Exception as error:
             self.get_logger().error(
-                f"Box Check exception: {type(error).__name__}: {error}"
+                f"{title} exception: {type(error).__name__}: {error}"
             )
             response.success = False
             response.message = f"left_ear:None right_ear:None error:{error}"
@@ -616,6 +653,38 @@ class PoseNode(Node):
             self.processing = False
 
         return response
+
+    def box_check_callback(
+        self,
+        request: Trigger.Request,
+        response: Trigger.Response,
+    ) -> Trigger.Response:
+        del request
+        return self._ear_check(
+            "box_check",
+            "Box Check",
+            self.box_check_enabled,
+            self.box_check_estimator,
+            self.box_check_result_pub,
+            self._publish_box_debug,
+            response,
+        )
+
+    def flap_check_callback(
+        self,
+        request: Trigger.Request,
+        response: Trigger.Response,
+    ) -> Trigger.Response:
+        del request
+        return self._ear_check(
+            "flap_check",
+            "Flap Check",
+            self.flap_check_enabled,
+            self.flap_check_estimator,
+            self.flap_check_result_pub,
+            self._publish_flap_debug,
+            response,
+        )
 
     def alignment_callback(
         self,
