@@ -26,6 +26,9 @@ PREPROCESS_MODE = "retinex"  # none | clahe | retinex | chroma
 RETINEX_SIGMA_RATIO = 0.08
 IMAGENET_NORM = False
 
+USE_GT_MASK = True  # True: 用 gt.json 里的 SAM2 mask;False: 用 polygon
+MASK_ERODE_PX = 0
+
 PRESENT_LABEL = "PRESENT"
 ABSENT_LABEL = "ABSENT"
 
@@ -60,6 +63,7 @@ class DINOv3Estimator:
         gt_image = cv2.imread(str(gt_image_path))
         if gt_image is None:
             raise FileNotFoundError(f"Cannot read GT image: {gt_image_path}")
+        self.gt_shape = gt_image.shape[:2]
         gt_proc = self._preprocess(gt_image)
 
         self.reference: Dict[str, Dict[str, Any]] = {}
@@ -73,15 +77,40 @@ class DINOv3Estimator:
 
             bbox = self._polygon_to_bbox(polygon, gt_proc.shape)
             gt_roi = self._crop_bbox(gt_proc, bbox)
-            polygon_roi = polygon - np.array(bbox[:2], dtype=np.float32)
-            polygon_mask = self._polygon_mask(polygon_roi, gt_roi.shape[:2])
+            roi_mask = self._load_roi_mask(obj, polygon, bbox, gt_roi.shape[:2])
+            patch_mask = self._get_patch_mask(roi_mask)
+            if not patch_mask.any():
+                raise ValueError(f"Mask does not contain any valid DINOv3 patches: {side}")
 
+            patch_index = torch.from_numpy(np.flatnonzero(patch_mask.reshape(-1))).to(self.device)
             self.reference[side] = {
                 "polygon": polygon.tolist(),
                 "bbox": bbox,
-                "feature": self._extract_features(gt_roi),
-                "mask": self._get_patch_mask(polygon_mask),
+                "roi_mask": roi_mask,
+                "patch_index": patch_index,
+                "feature": self._extract_features(gt_roi)[patch_index],
             }
+
+    def _load_roi_mask(self, obj: Dict[str, Any], polygon: np.ndarray, bbox, roi_shape) -> np.ndarray:
+        mask_file = (obj.get("mask") or {}).get("file")
+
+        if USE_GT_MASK and mask_file:
+            mask_path = PROJECT_ROOT / mask_file
+            full = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+            if full is None:
+                raise FileNotFoundError(f"Cannot read GT mask: {mask_path}")
+            if full.shape != self.gt_shape:
+                raise ValueError(f"Mask size {full.shape} != GT image size {self.gt_shape}: {mask_path}")
+            mask = np.where(self._crop_bbox(full, bbox) > 127, 255, 0).astype(np.uint8)
+        else:
+            mask = self._polygon_mask(polygon - np.array(bbox[:2], dtype=np.float32), roi_shape)
+
+        if MASK_ERODE_PX > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * MASK_ERODE_PX + 1,) * 2)
+            mask = cv2.erode(mask, kernel)
+        if not mask.any():
+            raise ValueError(f"Empty GT mask for side: {obj['side']}")
+        return mask
 
     def _preprocess(self, bgr: np.ndarray) -> np.ndarray:
         if PREPROCESS_MODE == "none":
@@ -142,19 +171,18 @@ class DINOv3Estimator:
         small = cv2.resize(mask.astype(np.uint8), (PATCH_GRID, PATCH_GRID), interpolation=cv2.INTER_AREA)
         return small >= int(MASK_THRESHOLD * 255)
 
-    def _evaluate(self, gt_feat: torch.Tensor, input_feat: torch.Tensor, roi_mask: np.ndarray):
-        gt_feat = gt_feat.reshape(PATCH_GRID, PATCH_GRID, -1)
-        input_feat = input_feat.reshape(PATCH_GRID, PATCH_GRID, -1)
-        similarity = (gt_feat * input_feat).sum(dim=-1)
-        roi_mask_t = torch.from_numpy(roi_mask).to(self.device)
-        scores = similarity[roi_mask_t]
-        if scores.numel() == 0:
-            raise ValueError("Polygon does not contain any valid DINOv3 patches")
-
-        scores_np = scores.detach().cpu().numpy()
-        pass_mask = (similarity >= self.sim_threshold) & roi_mask_t
-        coverage = float(pass_mask[roi_mask_t].float().mean())
+    def _evaluate(self, ref_feat: torch.Tensor, ref_index: torch.Tensor, input_feat: torch.Tensor):
+        best, best_idx = (ref_feat @ input_feat.T).max(dim=1)
+        passed = best >= self.sim_threshold
+        coverage = float(passed.float().mean())
         is_present = coverage >= self.coverage_threshold
+
+        n_patch = PATCH_GRID * PATCH_GRID
+        pass_mask = torch.zeros(n_patch, dtype=torch.bool, device=self.device)
+        pass_mask[best_idx[passed]] = True
+        similarity = torch.zeros(n_patch, device=self.device)
+        similarity[ref_index] = best
+        scores_np = best.detach().cpu().numpy()
 
         return {
             "label": self.present_label if is_present else self.absent_label,
@@ -162,18 +190,18 @@ class DINOv3Estimator:
             "absent": not is_present,
             "coverage": coverage,
             "coverage_percent": coverage * 100.0,
-            "mean_similarity": float(scores.mean()),
-            "median_similarity": float(scores.median()),
+            "mean_similarity": float(best.mean()),
+            "median_similarity": float(best.median()),
             "p10_similarity": float(np.percentile(scores_np, 10)),
             "similarity_threshold": self.sim_threshold,
             "coverage_threshold": self.coverage_threshold,
             "patch_count": int(len(scores_np)),
-            "pass_patch_count": int(pass_mask.sum().item()),
-            "pass_mask": pass_mask.detach().cpu().numpy(),
-            "similarity_map": similarity.detach().cpu().numpy(),
+            "pass_patch_count": int(passed.sum().item()),
+            "pass_mask": pass_mask.reshape(PATCH_GRID, PATCH_GRID).cpu().numpy(),
+            "similarity_map": similarity.reshape(PATCH_GRID, PATCH_GRID).cpu().numpy(),
         }
 
-    def _draw_debug(self, image: np.ndarray, side: str, polygon, bbox, evaluation: Dict[str, Any]):
+    def _draw_debug(self, image: np.ndarray, side: str, polygon, bbox, roi_mask, evaluation: Dict[str, Any]):
         polygon = np.asarray(polygon, dtype=np.int32)
         x1, y1, x2, y2 = map(int, bbox)
         color = PRESENT_COLOR if evaluation["present"] else ABSENT_COLOR
@@ -185,7 +213,10 @@ class DINOv3Estimator:
             p2 = (x1 + int((col + 1) * roi_w / PATCH_GRID), y1 + int((row + 1) * roi_h / PATCH_GRID))
             cv2.rectangle(overlay, p1, p2, PATCH_COLOR, -1)
         debug = cv2.addWeighted(overlay, 0.28, image, 0.72, 0)
-        cv2.polylines(debug, [polygon.reshape(-1, 1, 2)], True, color, 3)
+
+        contours, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(debug, contours, -1, color, 2, offset=(x1, y1))
+        cv2.rectangle(debug, (x1, y1), (x2, y2), color, 1)
 
         text = f"{side.upper()}: {evaluation['label']}  cov={evaluation['coverage_percent']:.1f}%"
         font, scale, thickness = cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2
@@ -202,6 +233,8 @@ class DINOv3Estimator:
     def predict(self, rgb: np.ndarray) -> Dict[str, Any]:
         if rgb is None or not isinstance(rgb, np.ndarray):
             raise ValueError("rgb must be a numpy.ndarray")
+        if rgb.shape[:2] != self.gt_shape:
+            raise ValueError(f"Input size {rgb.shape[:2]} != GT image size {self.gt_shape}")
 
         proc = self._preprocess(rgb)
         debug_image = rgb.copy()
@@ -214,16 +247,13 @@ class DINOv3Estimator:
         }
 
         for side, ref in self.reference.items():
-            polygon = np.asarray(ref["polygon"], dtype=np.float32)
-            bbox = self._polygon_to_bbox(polygon, rgb.shape)
-            input_roi = self._crop_bbox(proc, bbox)
-            polygon_roi = polygon - np.array(bbox[:2], dtype=np.float32)
-            roi_mask = self._get_patch_mask(self._polygon_mask(polygon_roi, input_roi.shape[:2]))
-
-            evaluation = self._evaluate(ref["feature"], self._extract_features(input_roi), roi_mask)
+            input_feat = self._extract_features(self._crop_bbox(proc, ref["bbox"]))
+            evaluation = self._evaluate(ref["feature"], ref["patch_index"], input_feat)
             result[side] = bool(evaluation["absent"])
             result[f"{side}_evaluation"] = evaluation
-            debug_image = self._draw_debug(debug_image, side, polygon, bbox, evaluation)
+            debug_image = self._draw_debug(
+                debug_image, side, ref["polygon"], ref["bbox"], ref["roi_mask"], evaluation
+            )
 
         result["debug_image"] = debug_image
         return result
@@ -242,6 +272,7 @@ if __name__ == "__main__":
 
     print(f"Device: {estimator.device}")
     print(f"PREPROCESS_MODE: {PREPROCESS_MODE}")
+    print(f"USE_GT_MASK: {USE_GT_MASK}")
     print(f"SIM_THRESHOLD: {estimator.sim_threshold}")
     print(f"COVERAGE_THRESHOLD: {estimator.coverage_threshold}")
 
