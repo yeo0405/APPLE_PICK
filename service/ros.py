@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""ROS 2 endpoint for RACE-6D, DINOv3 Box Check, Alignment and Ripcord."""
+"""ROS 2 endpoint for RACE-6D, DINOv3 Box Check, Flap Check, Ripcord Check, Alignment and Ripcord."""
 
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -10,16 +10,19 @@ import time
 import numpy as np
 from cv_bridge import CvBridge
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
-from geometry_msgs.msg import Pose, PoseArray, TransformStamped
+from geometry_msgs.msg import Pose, TransformStamped
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
+from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithPose
 
 from RACE_6D.core import PoseEstimator
 from BOX_CHECK.ear_esitimator import DINOv3Estimator
+from FLAP_CHECK.ear_esitimator import DINOv3Estimator as FlapCheckEstimator
 from ALIGNMENT.alignment import AlignmentEstimator
 from RIPCORD.ripcord_estimator import RipcordEstimator
+from RIPCORD_CHECK.ripcord_esitimator import DINOv3Estimator as RipcordCheckEstimator
 from tomo_camera_tcp import CameraTCPClient
 
 
@@ -45,11 +48,11 @@ class PoseNode(Node):
         if not isinstance(label_names, dict) or not label_names:
             raise ValueError(
                 "RACE_6D.LABEL_NAMES must be a non-empty mapping, "
-                "for example: {0: iphone, 1: box}"
+                "for example: {0: iphone14_plus_blue, 1: brown_box}"
             )
 
         self.label_names = {
-            int(label): str(name)
+            int(label): str(name).strip()
             for label, name in label_names.items()
         }
 
@@ -106,15 +109,27 @@ class PoseNode(Node):
         else:
             self.get_logger().info("DINOv3 Box Check disabled.")
 
+        flap_cfg = cfg.get("FLAP_CHECK", {})
+        self.flap_check_enabled = bool(flap_cfg.get("ENABLED", True))
+        self.flap_check_estimator: Optional[FlapCheckEstimator] = None
+
+        if self.flap_check_enabled:
+            self.get_logger().info("Initializing DINOv3 Flap Check...")
+            self.flap_check_estimator = FlapCheckEstimator(
+                sim_threshold=float(flap_cfg.get("SIM_THRESHOLD", 0.8)),
+                coverage_threshold=float(flap_cfg.get("COVERAGE_THRESHOLD", 0.2)),
+            )
+            self.get_logger().info("DINOv3 Flap Check initialized.")
+        else:
+            self.get_logger().info("DINOv3 Flap Check disabled.")
+
         alignment_cfg = cfg.get("ALIGNMENT", {})
         self.alignment_enabled = bool(alignment_cfg.get("ENABLED", True))
         self.alignment_estimator: Optional[AlignmentEstimator] = None
 
         if self.alignment_enabled:
             alignment_root = Path(__file__).resolve().parent
-            gt_json = Path(
-                alignment_cfg.get("GT_JSON", "ALIGNMENT/GT/gt.json")
-            )
+            gt_json = Path(alignment_cfg.get("GT_JSON", "ALIGNMENT/GT/gt.json"))
 
             if not gt_json.is_absolute():
                 gt_json = alignment_root / gt_json
@@ -123,9 +138,7 @@ class PoseNode(Node):
             self.get_logger().info(f"Alignment GT: {gt_json}")
 
             if not gt_json.is_file():
-                raise FileNotFoundError(
-                    f"Alignment GT JSON not found: {gt_json}"
-                )
+                raise FileNotFoundError(f"Alignment GT JSON not found: {gt_json}")
 
             self.alignment_estimator = AlignmentEstimator(
                 gt_json=gt_json,
@@ -146,26 +159,28 @@ class PoseNode(Node):
         else:
             self.get_logger().info("Ripcord disabled.")
 
-        self.camera = CameraTCPClient(
-            camera_cfg["IP"],
-            camera_cfg["PORT"],
-        )
-        self.get_logger().info(
-            f"Camera: {camera_cfg['IP']}:{camera_cfg['PORT']}"
-        )
+        ripcord_check_cfg = cfg.get("RIPCORD_CHECK", {})
+        self.ripcord_check_enabled = bool(ripcord_check_cfg.get("ENABLED", True))
+        self.ripcord_check_estimator: Optional[RipcordCheckEstimator] = None
 
-        if not self.camera.is_running():
-            if not self.camera.start():
-                raise RuntimeError("Camera start failed.")
+        if self.ripcord_check_enabled:
+            self.get_logger().info("Initializing DINOv3 Ripcord Check...")
+            self.ripcord_check_estimator = RipcordCheckEstimator(
+                sim_threshold=float(ripcord_check_cfg.get("SIM_THRESHOLD", 0.8)),
+                coverage_threshold=float(ripcord_check_cfg.get("COVERAGE_THRESHOLD", 0.2)),
+            )
+            self.get_logger().info("DINOv3 Ripcord Check initialized.")
+        else:
+            self.get_logger().info("DINOv3 Ripcord Check disabled.")
 
-        self.camera_matrix = self._load_intrinsic_matrix(
-            self.camera,
-            "Camera",
-        )
+        self.camera = CameraTCPClient(camera_cfg["IP"], camera_cfg["PORT"])
+        self.get_logger().info(f"Camera: {camera_cfg['IP']}:{camera_cfg['PORT']}")
 
-        self.get_logger().info(
-            "Camera intrinsic matrix loaded successfully:"
-        )
+        if not self.camera.is_running() and not self.camera.start():
+            raise RuntimeError("Camera start failed.")
+
+        self.camera_matrix = self._load_intrinsic_matrix(self.camera, "Camera")
+        self.get_logger().info("Camera intrinsic matrix loaded successfully:")
         self.get_logger().info(f"\n{self.camera_matrix}")
 
         self.usb_camera = CameraTCPClient(
@@ -176,18 +191,14 @@ class PoseNode(Node):
             f"USB Camera: {usb_camera_cfg['IP']}:{usb_camera_cfg['PORT']}"
         )
 
-        if not self.usb_camera.is_running():
-            if not self.usb_camera.start():
-                raise RuntimeError("USB camera start failed.")
+        if not self.usb_camera.is_running() and not self.usb_camera.start():
+            raise RuntimeError("USB camera start failed.")
 
         self.usb_camera_matrix = self._load_intrinsic_matrix(
             self.usb_camera,
             "USB Camera",
         )
-
-        self.get_logger().info(
-            "USB Camera intrinsic matrix loaded successfully:"
-        )
+        self.get_logger().info("USB Camera intrinsic matrix loaded successfully:")
         self.get_logger().info(f"\n{self.usb_camera_matrix}")
 
         self.predict_srv = self.create_service(
@@ -200,6 +211,11 @@ class PoseNode(Node):
             "/box_check/predict",
             self.box_check_callback,
         )
+        self.flap_check_srv = self.create_service(
+            Trigger,
+            "/flap_check/predict",
+            self.flap_check_callback,
+        )
         self.alignment_srv = self.create_service(
             Trigger,
             "/alignment/predict",
@@ -210,9 +226,14 @@ class PoseNode(Node):
             "/ripcord/predict",
             self.ripcord_callback,
         )
+        self.ripcord_check_srv = self.create_service(
+            Trigger,
+            "/ripcord_check/predict",
+            self.ripcord_check_callback,
+        )
 
         self.pose_pub = self.create_publisher(
-            PoseArray,
+            Detection3DArray,
             "/pose6dof/result",
             10,
         )
@@ -229,6 +250,16 @@ class PoseNode(Node):
         self.box_check_debug_pub = self.create_publisher(
             Image,
             "/box_check/debug_image",
+            10,
+        )
+        self.flap_check_result_pub = self.create_publisher(
+            DiagnosticStatus,
+            "/flap_check/result",
+            10,
+        )
+        self.flap_check_debug_pub = self.create_publisher(
+            Image,
+            "/flap_check/debug_image",
             10,
         )
         self.alignment_result_pub = self.create_publisher(
@@ -251,6 +282,16 @@ class PoseNode(Node):
             "/ripcord/debug_image",
             10,
         )
+        self.ripcord_check_result_pub = self.create_publisher(
+            DiagnosticStatus,
+            "/ripcord_check/result",
+            10,
+        )
+        self.ripcord_check_debug_pub = self.create_publisher(
+            Image,
+            "/ripcord_check/debug_image",
+            10,
+        )
 
         self.tf_broadcaster = TransformBroadcaster(self)
         self.parent_frame = "Head_camera_link"
@@ -259,26 +300,30 @@ class PoseNode(Node):
         self.get_logger().info("==============================")
         self.get_logger().info("RACE-6D ROS node started.")
         self.get_logger().info("Service : /pose6dof/predict")
-        self.get_logger().info("Result  : /pose6dof/result")
+        self.get_logger().info("Result  : /pose6dof/result [Detection3DArray]")
         self.get_logger().info("Debug   : /pose6dof/debug_image")
         self.get_logger().info("Service : /box_check/predict")
         self.get_logger().info("Result  : /box_check/result")
         self.get_logger().info("Debug   : /box_check/debug_image")
+        self.get_logger().info("Service : /flap_check/predict")
+        self.get_logger().info("Result  : /flap_check/result")
+        self.get_logger().info("Debug   : /flap_check/debug_image")
         self.get_logger().info("Service : /alignment/predict")
         self.get_logger().info("Result  : /alignment/result")
         self.get_logger().info("Debug   : /alignment/debug_image")
         self.get_logger().info("Service : /ripcord/predict")
-        self.get_logger().info("Result  : /ripcord/result")
+        self.get_logger().info("Result  : /ripcord/result [DiagnosticStatus]")
         self.get_logger().info("Debug   : /ripcord/debug_image")
+        self.get_logger().info("Service : /ripcord_check/predict")
+        self.get_logger().info("Result  : /ripcord_check/result [DiagnosticStatus]")
+        self.get_logger().info("Debug   : /ripcord_check/debug_image")
         self.get_logger().info(
             f"Alignment TF: {self.parent_frame} -> {self.ripcord_frame}"
         )
 
         for label in self.pose_labels:
-            name = self.label_names[label]
             self.get_logger().info(
-                f"PoseArray index={self.pose_labels.index(label)}: "
-                f"label={label}, name={name}, TF child={name}"
+                f"RACE-6D label={label}, name={self.label_names[label]}"
             )
 
         self.get_logger().info("==============================")
@@ -293,7 +338,6 @@ class PoseNode(Node):
         self.get_logger().info(
             f"Waiting for {camera_name} color intrinsic matrix..."
         )
-
         last_value = None
 
         for attempt in range(1, max_retries + 1):
@@ -312,15 +356,13 @@ class PoseNode(Node):
                         return matrix
 
                     self.get_logger().warning(
-                        f"{camera_name} invalid intrinsic shape: "
-                        f"{matrix.shape}"
+                        f"{camera_name} invalid intrinsic shape: {matrix.shape}"
                     )
                 else:
                     self.get_logger().info(
                         f"{camera_name} intrinsic not ready "
                         f"(attempt {attempt}/{max_retries})."
                     )
-
             except Exception as error:
                 self.get_logger().warning(
                     f"Failed to get {camera_name} intrinsic "
@@ -347,11 +389,7 @@ class PoseNode(Node):
         pose.orientation.w = float("nan")
         return pose
 
-    def _publish_image(
-        self,
-        publisher,
-        image: Optional[np.ndarray],
-    ) -> None:
+    def _publish_image(self, publisher, image: Optional[np.ndarray]) -> None:
         if image is None:
             return
 
@@ -359,9 +397,7 @@ class PoseNode(Node):
             image = np.asarray(image)
 
         if image.ndim != 3 or image.shape[2] != 3:
-            self.get_logger().warning(
-                f"Invalid debug image shape: {image.shape}"
-            )
+            self.get_logger().warning(f"Invalid debug image shape: {image.shape}")
             return
 
         if image.dtype != np.uint8:
@@ -378,22 +414,19 @@ class PoseNode(Node):
     def _publish_box_debug(self, image: Optional[np.ndarray]) -> None:
         self._publish_image(self.box_check_debug_pub, image)
 
-    def _publish_alignment_debug(
-        self,
-        image: Optional[np.ndarray],
-    ) -> None:
+    def _publish_flap_debug(self, image: Optional[np.ndarray]) -> None:
+        self._publish_image(self.flap_check_debug_pub, image)
+
+    def _publish_alignment_debug(self, image: Optional[np.ndarray]) -> None:
         self._publish_image(self.alignment_debug_pub, image)
 
-    def _publish_ripcord_debug(
-        self,
-        image: Optional[np.ndarray],
-    ) -> None:
+    def _publish_ripcord_debug(self, image: Optional[np.ndarray]) -> None:
         self._publish_image(self.ripcord_debug_pub, image)
 
-    def _create_pose(
-        self,
-        detection: Dict[str, Any],
-    ) -> Optional[Pose]:
+    def _publish_ripcord_check_debug(self, image: Optional[np.ndarray]) -> None:
+        self._publish_image(self.ripcord_check_debug_pub, image)
+
+    def _create_pose(self, detection: Dict[str, Any]) -> Optional[Pose]:
         label = detection.get("label")
 
         if label is None:
@@ -404,8 +437,7 @@ class PoseNode(Node):
 
         if label not in self.label_names:
             self.get_logger().warning(
-                f"Detected label={label}, "
-                "but it is not configured in LABEL_NAMES."
+                f"Detected label={label}, but it is not configured in LABEL_NAMES."
             )
             return None
 
@@ -415,8 +447,23 @@ class PoseNode(Node):
 
         if t is None or q is None:
             self.get_logger().warning(
-                f"Detection label={label} ({name}) "
-                "has no translation or quaternion."
+                f"Detection label={label} ({name}) has no translation or quaternion."
+            )
+            return None
+
+        t = np.asarray(t, dtype=np.float64)
+        q = np.asarray(q, dtype=np.float64)
+
+        if t.shape != (3,) or q.shape != (4,):
+            self.get_logger().warning(
+                f"Detection label={label} ({name}) has invalid pose shapes: "
+                f"translation={t.shape}, quat={q.shape}."
+            )
+            return None
+
+        if not np.all(np.isfinite(t)) or not np.all(np.isfinite(q)):
+            self.get_logger().warning(
+                f"Detection label={label} ({name}) has non-finite pose."
             )
             return None
 
@@ -445,16 +492,45 @@ class PoseNode(Node):
         confidence = detection.get("confidence")
         if confidence is not None:
             self.get_logger().info(
-                f"Published {name} "
-                f"(label={label}) "
+                f"Published {name} (label={label}) "
                 f"confidence={float(confidence):.6f}"
             )
         else:
-            self.get_logger().info(
-                f"Published {name} (label={label})"
-            )
+            self.get_logger().info(f"Published {name} (label={label})")
 
         return pose
+
+    def _create_detection3d(
+        self,
+        label: int,
+        detection: Dict[str, Any],
+        pose: Pose,
+    ) -> Detection3D:
+        name = self.label_names[label]
+        confidence = detection.get("confidence", 0.0)
+
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+
+        if not np.isfinite(confidence):
+            confidence = 0.0
+
+        confidence = float(np.clip(confidence, 0.0, 1.0))
+
+        result = Detection3D()
+        result.header.stamp = self.get_clock().now().to_msg()
+        result.header.frame_id = self.parent_frame
+        result.id = name
+
+        hypothesis = ObjectHypothesisWithPose()
+        hypothesis.hypothesis.class_id = name
+        hypothesis.hypothesis.score = confidence
+        hypothesis.pose.pose = pose
+
+        result.results.append(hypothesis)
+        return result
 
     def _get_camera_frame(self):
         frame = self.camera.get_frame()
@@ -467,18 +543,14 @@ class PoseNode(Node):
         depth_frame = self.camera.get_depth_frame()
 
         if rgb_frame is None or depth_frame is None:
-            self.get_logger().error(
-                "Camera returned empty RGB or depth frame."
-            )
+            self.get_logger().error("Camera returned empty RGB or depth frame.")
             return None, None
 
         rgb = rgb_frame.data
         depth = depth_frame.data
 
         if rgb is None or depth is None:
-            self.get_logger().error(
-                "Camera returned None RGB/depth data."
-            )
+            self.get_logger().error("Camera returned None RGB/depth data.")
             return None, None
 
         if not isinstance(rgb, np.ndarray):
@@ -498,9 +570,7 @@ class PoseNode(Node):
         rgb_frame = self.camera.get_color_frame()
 
         if rgb_frame is None or rgb_frame.data is None:
-            self.get_logger().error(
-                "Camera returned empty RGB frame."
-            )
+            self.get_logger().error("Camera returned empty RGB frame.")
             return None
 
         rgb = rgb_frame.data
@@ -510,27 +580,21 @@ class PoseNode(Node):
         frame = self.usb_camera.get_frame()
 
         if frame.is_empty:
-            self.get_logger().warning(
-                "USB camera returned empty frame."
-            )
+            self.get_logger().warning("USB camera returned empty frame.")
             return None, None
 
         rgb_frame = self.usb_camera.get_color_frame()
         depth_frame = self.usb_camera.get_depth_frame()
 
         if rgb_frame is None or depth_frame is None:
-            self.get_logger().error(
-                "USB camera returned empty RGB or depth frame."
-            )
+            self.get_logger().error("USB camera returned empty RGB or depth frame.")
             return None, None
 
         rgb = rgb_frame.data
         depth = depth_frame.data
 
         if rgb is None or depth is None:
-            self.get_logger().error(
-                "USB camera returned None RGB/depth data."
-            )
+            self.get_logger().error("USB camera returned None RGB/depth data.")
             return None, None
 
         if not isinstance(rgb, np.ndarray):
@@ -540,16 +604,19 @@ class PoseNode(Node):
 
         return rgb, depth
 
-    def box_check_callback(
+    def _ear_check(
         self,
-        request: Trigger.Request,
+        key: str,
+        title: str,
+        enabled: bool,
+        estimator,
+        result_pub,
+        publish_debug,
         response: Trigger.Response,
     ) -> Trigger.Response:
-        del request
-
-        if not self.box_check_enabled:
+        if not enabled:
             response.success = False
-            response.message = "Box Check disabled."
+            response.message = f"{title} disabled."
             return response
 
         if self.processing:
@@ -557,17 +624,16 @@ class PoseNode(Node):
             response.message = "busy"
             return response
 
-        if self.box_check_estimator is None:
+        if estimator is None:
             response.success = False
-            response.message = "DINOv3 estimator unavailable."
+            response.message = f"{title} estimator unavailable."
             return response
 
         self.processing = True
 
         try:
             self.get_logger().info("========================================")
-            self.get_logger().info("Box Check prediction triggered.")
-
+            self.get_logger().info(f"{title} prediction triggered.")
             rgb = self._get_camera_rgb()
 
             if rgb is None:
@@ -578,64 +644,82 @@ class PoseNode(Node):
             if rgb.ndim != 3 or rgb.shape[2] != 3:
                 raise RuntimeError(f"Invalid RGB shape: {rgb.shape}")
 
-            self.get_logger().info(
-                f"RGB: shape={rgb.shape}, dtype={rgb.dtype}"
-            )
-            self.get_logger().info("Running DINOv3 Box Check...")
-
-            result = self.box_check_estimator.predict(rgb)
+            self.get_logger().info(f"RGB: shape={rgb.shape}, dtype={rgb.dtype}")
+            self.get_logger().info(f"Running DINOv3 {title}...")
+            result = estimator.predict(rgb)
 
             left = bool(result.get("left", False))
             right = bool(result.get("right", False))
-
-            result_data = {
-                "left": left,
-                "right": right,
-            }
+            left_state = "absent" if left else "present"
+            right_state = "absent" if right else "present"
+            result_data = {"left_ear": left_state, "right_ear": right_state}
 
             result_msg = DiagnosticStatus()
-            result_msg.name = "box_check"
+            result_msg.name = key
             result_msg.level = DiagnosticStatus.OK
             result_msg.message = "success"
             result_msg.values = [
-                KeyValue(key="left", value=str(left).lower()),
-                KeyValue(key="right", value=str(right).lower()),
+                KeyValue(key="left_ear", value=left_state),
+                KeyValue(key="right_ear", value=right_state),
             ]
-            self.box_check_result_pub.publish(result_msg)
+            result_pub.publish(result_msg)
+
             result_text = json.dumps(
                 result_data,
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
-
             debug_image = result.get("debug_image")
-            self._publish_box_debug(
-                debug_image if debug_image is not None else rgb
-            )
+            publish_debug(debug_image if debug_image is not None else rgb)
 
             response.success = True
             response.message = result_text
-
-            self.get_logger().info(
-                f"Box Check result: {result_text}"
-            )
+            self.get_logger().info(f"{title} result: {result_text}")
             self.get_logger().info("========================================")
 
         except Exception as error:
             self.get_logger().error(
-                f"Box Check exception: "
-                f"{type(error).__name__}: {error}"
+                f"{title} exception: {type(error).__name__}: {error}"
             )
-
             response.success = False
-            response.message = (
-                f"left:false right:false error:{error}"
-            )
+            response.message = f"left_ear:None right_ear:None error:{error}"
 
         finally:
             self.processing = False
 
         return response
+
+    def box_check_callback(
+        self,
+        request: Trigger.Request,
+        response: Trigger.Response,
+    ) -> Trigger.Response:
+        del request
+        return self._ear_check(
+            "box_check",
+            "Box Check",
+            self.box_check_enabled,
+            self.box_check_estimator,
+            self.box_check_result_pub,
+            self._publish_box_debug,
+            response,
+        )
+
+    def flap_check_callback(
+        self,
+        request: Trigger.Request,
+        response: Trigger.Response,
+    ) -> Trigger.Response:
+        del request
+        return self._ear_check(
+            "flap_check",
+            "Flap Check",
+            self.flap_check_enabled,
+            self.flap_check_estimator,
+            self.flap_check_result_pub,
+            self._publish_flap_debug,
+            response,
+        )
 
     def alignment_callback(
         self,
@@ -664,7 +748,6 @@ class PoseNode(Node):
         try:
             self.get_logger().info("========================================")
             self.get_logger().info("Alignment prediction triggered.")
-
             rgb, depth = self._get_usb_camera_frame()
 
             if rgb is None or depth is None:
@@ -680,24 +763,18 @@ class PoseNode(Node):
 
             if depth.shape != rgb.shape[:2]:
                 raise RuntimeError(
-                    "RGB/depth resolution mismatch: "
-                    f"RGB={rgb.shape[:2]}, Depth={depth.shape}"
+                    f"RGB/depth resolution mismatch: RGB={rgb.shape[:2]}, "
+                    f"Depth={depth.shape}"
                 )
 
             if self.usb_camera_matrix is None:
-                raise RuntimeError(
-                    "USB camera intrinsic matrix is None."
-                )
+                raise RuntimeError("USB camera intrinsic matrix is None.")
 
-            camera_matrix = np.asarray(
-                self.usb_camera_matrix,
-                dtype=np.float64,
-            )
+            camera_matrix = np.asarray(self.usb_camera_matrix, dtype=np.float64)
 
             if camera_matrix.shape != (3, 3):
                 raise RuntimeError(
-                    "Invalid USB camera intrinsic matrix shape: "
-                    f"{camera_matrix.shape}"
+                    f"Invalid USB camera intrinsic matrix shape: {camera_matrix.shape}"
                 )
 
             self.get_logger().info(
@@ -717,7 +794,6 @@ class PoseNode(Node):
             input_pose = result.get("input_pose")
             delta = result.get("delta")
             debug_image = result.get("debug_image")
-
             self._publish_alignment_debug(
                 debug_image if debug_image is not None else rgb
             )
@@ -732,22 +808,10 @@ class PoseNode(Node):
                 response.message = "Alignment failed: no delta."
                 return response
 
-            location = np.asarray(
-                input_pose.get("location"),
-                dtype=np.float64,
-            )
-            rotation = np.asarray(
-                input_pose.get("rotation"),
-                dtype=np.float64,
-            )
-            delta_location = np.asarray(
-                delta.get("location"),
-                dtype=np.float64,
-            )
-            delta_rotation = np.asarray(
-                delta.get("rotation"),
-                dtype=np.float64,
-            )
+            location = np.asarray(input_pose.get("location"), dtype=np.float64)
+            rotation = np.asarray(input_pose.get("rotation"), dtype=np.float64)
+            delta_location = np.asarray(delta.get("location"), dtype=np.float64)
+            delta_rotation = np.asarray(delta.get("rotation"), dtype=np.float64)
 
             if (
                 location.shape != (3,)
@@ -755,9 +819,7 @@ class PoseNode(Node):
                 or delta_location.shape != (3,)
                 or delta_rotation.shape != (4,)
             ):
-                raise RuntimeError(
-                    "Invalid Alignment pose/delta shape."
-                )
+                raise RuntimeError("Invalid Alignment pose/delta shape.")
 
             if not (
                 np.all(np.isfinite(location))
@@ -765,9 +827,7 @@ class PoseNode(Node):
                 and np.all(np.isfinite(delta_location))
                 and np.all(np.isfinite(delta_rotation))
             ):
-                raise RuntimeError(
-                    "Alignment returned non-finite pose/delta."
-                )
+                raise RuntimeError("Alignment returned non-finite pose/delta.")
 
             pose_msg = Pose()
             pose_msg.position.x = float(delta_location[0])
@@ -793,24 +853,17 @@ class PoseNode(Node):
             self.tf_broadcaster.sendTransform(tf)
 
             angle_deg = delta.get("angle_deg")
-
             self.get_logger().info(
-                "Alignment input pose: "
-                f"XYZ=({location[0]:.6f}, {location[1]:.6f}, "
-                f"{location[2]:.6f}) "
+                f"Alignment input pose: XYZ=({location[0]:.6f}, "
+                f"{location[1]:.6f}, {location[2]:.6f}) "
                 f"Q=({rotation[0]:.6f}, {rotation[1]:.6f}, "
                 f"{rotation[2]:.6f}, {rotation[3]:.6f})"
             )
-
             self.get_logger().info(
-                "Alignment delta: "
-                f"XYZ=({delta_location[0]:.6f}, "
-                f"{delta_location[1]:.6f}, "
-                f"{delta_location[2]:.6f}) "
-                f"Q=({delta_rotation[0]:.6f}, "
-                f"{delta_rotation[1]:.6f}, "
-                f"{delta_rotation[2]:.6f}, "
-                f"{delta_rotation[3]:.6f})"
+                f"Alignment delta: XYZ=({delta_location[0]:.6f}, "
+                f"{delta_location[1]:.6f}, {delta_location[2]:.6f}) "
+                f"Q=({delta_rotation[0]:.6f}, {delta_rotation[1]:.6f}, "
+                f"{delta_rotation[2]:.6f}, {delta_rotation[3]:.6f})"
             )
 
             if angle_deg is not None:
@@ -820,13 +873,11 @@ class PoseNode(Node):
 
             response.success = True
             response.message = "Alignment prediction successful."
-
             self.get_logger().info("========================================")
 
         except Exception as error:
             self.get_logger().error(
-                f"Alignment exception: "
-                f"{type(error).__name__}: {error}"
+                f"Alignment exception: {type(error).__name__}: {error}"
             )
             response.success = False
             response.message = str(error)
@@ -863,7 +914,6 @@ class PoseNode(Node):
         try:
             self.get_logger().info("========================================")
             self.get_logger().info("Ripcord prediction triggered.")
-
             rgb = self._get_camera_rgb()
 
             if rgb is None:
@@ -874,17 +924,12 @@ class PoseNode(Node):
             if rgb.ndim != 3 or rgb.shape[2] != 3:
                 raise RuntimeError(f"Invalid RGB shape: {rgb.shape}")
 
-            self.get_logger().info(
-                f"RGB: shape={rgb.shape}, dtype={rgb.dtype}"
-            )
+            self.get_logger().info(f"RGB: shape={rgb.shape}, dtype={rgb.dtype}")
             self.get_logger().info("Running Ripcord...")
-
             result = self.ripcord_estimator.predict(rgb)
 
             if not isinstance(result, dict):
-                raise RuntimeError(
-                    "RipcordEstimator returned an invalid result."
-                )
+                raise RuntimeError("RipcordEstimator returned an invalid result.")
 
             index = result.get("index")
 
@@ -925,17 +970,12 @@ class PoseNode(Node):
             self._publish_ripcord_debug(
                 debug_image if debug_image is not None else rgb
             )
-
-            self.get_logger().info(
-                f"Ripcord index: {index_text}"
-            )
+            self.get_logger().info(f"Ripcord index: {index_text}")
 
             for index_value in range(4):
                 item = ripcords.get(index_value)
-
                 if item is None:
                     item = ripcords.get(str(index_value))
-
                 if not isinstance(item, dict):
                     continue
 
@@ -946,12 +986,10 @@ class PoseNode(Node):
                 mask_area = item.get("mask_area", 0)
 
                 self.get_logger().info(
-                    f"  Ripcord {index_value}: "
-                    f"{label} | "
+                    f"  Ripcord {index_value}: {label} | "
                     f"SAM={float(sam_score):.3f} | "
                     f"DINO={float(dino_similarity):.3f} | "
-                    f"Ref={reference_index} | "
-                    f"Area={mask_area}"
+                    f"Ref={reference_index} | Area={mask_area}"
                 )
 
             response.success = True
@@ -961,13 +999,97 @@ class PoseNode(Node):
 
         except Exception as error:
             self.get_logger().error(
-                f"Ripcord exception: "
-                f"{type(error).__name__}: {error}"
+                f"Ripcord exception: {type(error).__name__}: {error}"
             )
             response.success = False
-            response.message = (
-                f"0:ABSENT 1:ABSENT 2:ABSENT 3:ABSENT error:{error}"
+            response.message = f"0:None 1:None 2:None 3:None error:{error}"
+
+        finally:
+            self.processing = False
+
+        return response
+
+    def ripcord_check_callback(
+        self,
+        request: Trigger.Request,
+        response: Trigger.Response,
+    ) -> Trigger.Response:
+        del request
+
+        if not self.ripcord_check_enabled:
+            response.success = False
+            response.message = "Ripcord Check disabled."
+            return response
+
+        if self.processing:
+            response.success = False
+            response.message = "busy"
+            return response
+
+        if self.ripcord_check_estimator is None:
+            response.success = False
+            response.message = "Ripcord Check estimator unavailable."
+            return response
+
+        self.processing = True
+
+        try:
+            self.get_logger().info("========================================")
+            self.get_logger().info("Ripcord Check prediction triggered.")
+            rgb = self._get_camera_rgb()
+
+            if rgb is None:
+                response.success = False
+                response.message = "camera failed"
+                return response
+
+            if rgb.ndim != 3 or rgb.shape[2] != 3:
+                raise RuntimeError(f"Invalid RGB shape: {rgb.shape}")
+
+            self.get_logger().info(f"RGB: shape={rgb.shape}, dtype={rgb.dtype}")
+            self.get_logger().info("Running DINOv3 Ripcord Check...")
+            result = self.ripcord_check_estimator.predict(rgb)
+
+            absent = bool(result.get("ripcord", False))
+            state = "ABSENT" if absent else "PRESENT"
+            result_data = {"ripcord": state}
+
+            result_msg = DiagnosticStatus()
+            result_msg.name = "ripcord_check"
+            result_msg.level = DiagnosticStatus.OK
+            result_msg.message = "success"
+            result_msg.values = [KeyValue(key="ripcord", value=state)]
+            self.ripcord_check_result_pub.publish(result_msg)
+
+            result_text = json.dumps(
+                result_data,
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
+            debug_image = result.get("debug_image")
+            self._publish_ripcord_check_debug(
+                debug_image if debug_image is not None else rgb
+            )
+
+            evaluation = result.get("ripcord_evaluation") or {}
+            if evaluation:
+                self.get_logger().info(
+                    f"  coverage={float(evaluation.get('coverage_percent', 0.0)):.1f}% | "
+                    f"mean={float(evaluation.get('mean_similarity', 0.0)):.4f} | "
+                    f"p10={float(evaluation.get('p10_similarity', 0.0)):.4f}"
+                )
+
+            response.success = True
+            response.message = result_text
+            self.get_logger().info(f"Ripcord Check result: {result_text}")
+            self.get_logger().info("========================================")
+
+        except Exception as error:
+            self.get_logger().error(
+                f"Ripcord Check exception: {type(error).__name__}: {error}"
+            )
+            response.success = False
+            response.message = f"ripcord:None error:{error}"
 
         finally:
             self.processing = False
@@ -991,7 +1113,6 @@ class PoseNode(Node):
         try:
             self.get_logger().info("========================================")
             self.get_logger().info("Pose prediction triggered.")
-
             rgb, depth = self._get_camera_frame()
 
             if rgb is None or depth is None:
@@ -1003,9 +1124,7 @@ class PoseNode(Node):
             self.rgb = rgb
             self.depth = depth
 
-            self.get_logger().info(
-                f"RGB   : shape={rgb.shape}, dtype={rgb.dtype}"
-            )
+            self.get_logger().info(f"RGB   : shape={rgb.shape}, dtype={rgb.dtype}")
             self.get_logger().info(
                 f"Depth : shape={depth.shape}, dtype={depth.dtype}"
             )
@@ -1018,28 +1137,21 @@ class PoseNode(Node):
 
             if depth.shape != rgb.shape[:2]:
                 raise RuntimeError(
-                    "RGB/depth resolution mismatch: "
-                    f"RGB={rgb.shape[:2]}, Depth={depth.shape}"
+                    f"RGB/depth resolution mismatch: RGB={rgb.shape[:2]}, "
+                    f"Depth={depth.shape}"
                 )
 
             if self.camera_matrix is None:
                 raise RuntimeError("Camera intrinsic matrix is None.")
 
-            camera_matrix = np.asarray(
-                self.camera_matrix,
-                dtype=np.float32,
-            )
+            camera_matrix = np.asarray(self.camera_matrix, dtype=np.float32)
 
             if camera_matrix.shape != (3, 3):
                 raise RuntimeError(
-                    "Invalid camera intrinsic matrix shape: "
-                    f"{camera_matrix.shape}"
+                    f"Invalid camera intrinsic matrix shape: {camera_matrix.shape}"
                 )
 
-            self.get_logger().info(
-                "Running RACE-6D prediction..."
-            )
-
+            self.get_logger().info("Running RACE-6D prediction...")
             result = self.pose_estimator.predict(
                 rgb=rgb,
                 depth=depth,
@@ -1050,8 +1162,7 @@ class PoseNode(Node):
 
             if not isinstance(detections, list):
                 self.get_logger().error(
-                    "RACE-6D returned invalid "
-                    "'detections' result."
+                    "RACE-6D returned invalid 'detections' result."
                 )
                 self._publish_failed_all()
                 response.success = False
@@ -1066,45 +1177,31 @@ class PoseNode(Node):
 
             for i, detection in enumerate(detections):
                 if not isinstance(detection, dict):
-                    self.get_logger().warning(
-                        f"Detection #{i} is not a dict."
-                    )
+                    self.get_logger().warning(f"Detection #{i} is not a dict.")
                     continue
 
                 label = detection.get("label")
                 confidence = detection.get("confidence")
 
                 if label is None:
-                    self.get_logger().warning(
-                        f"Detection #{i} has no label."
-                    )
+                    self.get_logger().warning(f"Detection #{i} has no label.")
                     continue
 
                 label = int(label)
                 detected_labels.append(label)
-
-                name = self.label_names.get(
-                    label,
-                    "UNCONFIGURED",
-                )
+                name = self.label_names.get(label, "UNCONFIGURED")
 
                 if confidence is not None:
                     self.get_logger().info(
-                        f"  Detection #{i}: "
-                        f"label={label}, "
-                        f"name={name}, "
+                        f"  Detection #{i}: label={label}, name={name}, "
                         f"confidence={float(confidence):.6f}"
                     )
                 else:
                     self.get_logger().info(
-                        f"  Detection #{i}: "
-                        f"label={label}, "
-                        f"name={name}"
+                        f"  Detection #{i}: label={label}, name={name}"
                     )
 
-            self.get_logger().info(
-                f"Detected labels: {detected_labels}"
-            )
+            self.get_logger().info(f"Detected labels: {detected_labels}")
 
             detections_by_label = {}
 
@@ -1113,56 +1210,52 @@ class PoseNode(Node):
                     continue
 
                 label = detection.get("label")
-
                 if label is None:
                     continue
 
                 label = int(label)
-
                 if label not in self.label_names:
                     continue
 
                 detections_by_label[label] = detection
 
-            pose_array = PoseArray()
-            pose_array.header.stamp = self.get_clock().now().to_msg()
-            pose_array.header.frame_id = self.parent_frame
+            detection_array = Detection3DArray()
+            detection_array.header.stamp = self.get_clock().now().to_msg()
+            detection_array.header.frame_id = self.parent_frame
 
             published_labels = set()
 
             for label in self.pose_labels:
                 detection = detections_by_label.get(label)
 
-                if detection is not None:
-                    pose = self._create_pose(detection)
+                if detection is None:
+                    self.get_logger().warning(
+                        f"No detection for label={label} "
+                        f"({self.label_names[label]})."
+                    )
+                    continue
 
-                    if pose is not None:
-                        pose_array.poses.append(pose)
-                        published_labels.add(label)
-                        continue
+                pose = self._create_pose(detection)
 
-                pose_array.poses.append(
-                    self._failed_pose()
+                if pose is None:
+                    continue
+
+                detection_msg = self._create_detection3d(
+                    label=label,
+                    detection=detection,
+                    pose=pose,
                 )
+                detection_array.detections.append(detection_msg)
+                published_labels.add(label)
 
-                self.get_logger().warning(
-                    f"No detection for label={label} "
-                    f"({self.label_names[label]}). "
-                    "Published invalid pose."
-                )
-
-            self.pose_pub.publish(pose_array)
-
+            self.pose_pub.publish(detection_array)
             self.get_logger().info(
                 f"Published /pose6dof/result with "
-                f"{len(pose_array.poses)} poses."
+                f"{len(detection_array.detections)} detections."
             )
 
             debug_image = result.get("debug_image")
-
-            self._debug(
-                debug_image if debug_image is not None else rgb
-            )
+            self._debug(debug_image if debug_image is not None else rgb)
 
             response.success = len(published_labels) > 0
 
@@ -1172,28 +1265,19 @@ class PoseNode(Node):
                     for label in self.pose_labels
                     if label in published_labels
                 ]
-                response.message = (
-                    "Pose estimated for: "
-                    + ", ".join(published_names)
+                response.message = "Pose estimated for: " + ", ".join(
+                    published_names
                 )
             else:
-                response.message = (
-                    "No configured RACE-6D "
-                    "object detected."
-                )
+                response.message = "No configured RACE-6D object detected."
 
-            self.get_logger().info(
-                "========================================"
-            )
+            self.get_logger().info("========================================")
 
         except Exception as error:
             self.get_logger().error(
-                f"Pose prediction exception: "
-                f"{type(error).__name__}: {error}"
+                f"Pose prediction exception: {type(error).__name__}: {error}"
             )
-
             self._publish_failed_all()
-
             response.success = False
             response.message = str(error)
 
@@ -1205,19 +1289,13 @@ class PoseNode(Node):
         return response
 
     def _publish_failed_all(self) -> None:
-        msg = PoseArray()
+        msg = Detection3DArray()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.parent_frame
-
-        for label in self.pose_labels:
-            msg.poses.append(self._failed_pose())
-            self.get_logger().warning(
-                f"Published invalid pose for "
-                f"label={label} "
-                f"({self.label_names[label]})."
-            )
-
         self.pose_pub.publish(msg)
+        self.get_logger().warning(
+            "Published empty /pose6dof/result because no valid result is available."
+        )
 
     def shutdown(self) -> None:
         self.get_logger().info("Shutting down PoseNode...")
@@ -1226,17 +1304,13 @@ class PoseNode(Node):
             if self.camera is not None:
                 self.camera.stop()
         except Exception as error:
-            self.get_logger().warning(
-                f"Camera stop error: {error}"
-            )
+            self.get_logger().warning(f"Camera stop error: {error}")
 
         try:
             if self.usb_camera is not None:
                 self.usb_camera.stop()
         except Exception as error:
-            self.get_logger().warning(
-                f"USB camera stop error: {error}"
-            )
+            self.get_logger().warning(f"USB camera stop error: {error}")
 
 
 def main():
@@ -1260,9 +1334,7 @@ def main():
     config_path = Path(args.config).resolve()
 
     if not config_path.is_file():
-        raise FileNotFoundError(
-            f"Config file not found: {config_path}"
-        )
+        raise FileNotFoundError(f"Config file not found: {config_path}")
 
     with config_path.open("r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -1276,15 +1348,13 @@ def main():
     except KeyboardInterrupt:
         pass
     except Exception as error:
-        print(
-            f"[ERROR] ROS node failed: "
-            f"{type(error).__name__}: {error}"
-        )
+        print(f"[ERROR] ROS node failed: {type(error).__name__}: {error}")
     finally:
         if node is not None:
             node.shutdown()
             node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
