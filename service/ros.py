@@ -3,7 +3,7 @@
 """ROS 2 endpoint for RACE-6D, DINOv3 Box Check, Flap Check, Ripcord Check, Alignment and Ripcord."""
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 import json
 import time
 
@@ -12,6 +12,7 @@ from cv_bridge import CvBridge
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
 from geometry_msgs.msg import Pose, TransformStamped
 from rclpy.node import Node
+from robot_localization.srv import SetPose
 from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 from tf2_ros import TransformBroadcaster
@@ -52,8 +53,7 @@ class PoseNode(Node):
             )
 
         self.label_names = {
-            int(label): str(name).strip()
-            for label, name in label_names.items()
+            int(label): str(name).strip() for label, name in label_names.items()
         }
 
         names = list(self.label_names.values())
@@ -128,21 +128,28 @@ class PoseNode(Node):
         self.alignment_estimator: Optional[AlignmentEstimator] = None
 
         if self.alignment_enabled:
-            alignment_root = Path(__file__).resolve().parent
-            gt_json = Path(alignment_cfg.get("GT_JSON", "ALIGNMENT/GT/gt.json"))
+            for key in ("HEIGHT", "WIDTH"):
+                if key not in alignment_cfg:
+                    raise ValueError(
+                        f"ALIGNMENT.{key} is required in the config "
+                        "(ROI size in meters)."
+                    )
 
-            if not gt_json.is_absolute():
-                gt_json = alignment_root / gt_json
+            alignment_height = float(alignment_cfg["HEIGHT"])
+            alignment_width = float(alignment_cfg["WIDTH"])
+            alignment_roi_scale = float(alignment_cfg.get("ROI_SCALE", 1.0))
 
             self.get_logger().info("Initializing Alignment...")
-            self.get_logger().info(f"Alignment GT: {gt_json}")
-
-            if not gt_json.is_file():
-                raise FileNotFoundError(f"Alignment GT JSON not found: {gt_json}")
+            self.get_logger().info(
+                f"Alignment ROI: height={alignment_height} m, "
+                f"width={alignment_width} m, scale={alignment_roi_scale}"
+            )
 
             self.alignment_estimator = AlignmentEstimator(
-                gt_json=gt_json,
+                height=alignment_height,
+                width=alignment_width,
                 device=args.device,
+                roi_scale=alignment_roi_scale,
             )
             self.get_logger().info("Alignment initialized.")
         else:
@@ -167,7 +174,9 @@ class PoseNode(Node):
             self.get_logger().info("Initializing DINOv3 Ripcord Check...")
             self.ripcord_check_estimator = RipcordCheckEstimator(
                 sim_threshold=float(ripcord_check_cfg.get("SIM_THRESHOLD", 0.8)),
-                coverage_threshold=float(ripcord_check_cfg.get("COVERAGE_THRESHOLD", 0.2)),
+                coverage_threshold=float(
+                    ripcord_check_cfg.get("COVERAGE_THRESHOLD", 0.2)
+                ),
             )
             self.get_logger().info("DINOv3 Ripcord Check initialized.")
         else:
@@ -216,8 +225,9 @@ class PoseNode(Node):
             "/flap_check/predict",
             self.flap_check_callback,
         )
+        # Alignment: request carries the target pose (robot_localization/srv/SetPose)
         self.alignment_srv = self.create_service(
-            Trigger,
+            SetPose,
             "/alignment/predict",
             self.alignment_callback,
         )
@@ -308,8 +318,12 @@ class PoseNode(Node):
         self.get_logger().info("Service : /flap_check/predict")
         self.get_logger().info("Result  : /flap_check/result")
         self.get_logger().info("Debug   : /flap_check/debug_image")
-        self.get_logger().info("Service : /alignment/predict")
-        self.get_logger().info("Result  : /alignment/result")
+        self.get_logger().info(
+            "Service : /alignment/predict [robot_localization/SetPose]"
+        )
+        self.get_logger().info(
+            "Result  : /alignment/result [Pose] = T_target * inv(T_input)"
+        )
         self.get_logger().info("Debug   : /alignment/debug_image")
         self.get_logger().info("Service : /ripcord/predict")
         self.get_logger().info("Result  : /ripcord/result [DiagnosticStatus]")
@@ -335,9 +349,7 @@ class PoseNode(Node):
         max_retries: int = 30,
         retry_delay: float = 0.5,
     ) -> np.ndarray:
-        self.get_logger().info(
-            f"Waiting for {camera_name} color intrinsic matrix..."
-        )
+        self.get_logger().info(f"Waiting for {camera_name} color intrinsic matrix...")
         last_value = None
 
         for attempt in range(1, max_retries + 1):
@@ -388,6 +400,42 @@ class PoseNode(Node):
         pose.orientation.z = float("nan")
         pose.orientation.w = float("nan")
         return pose
+
+    @staticmethod
+    def _parse_request_pose(
+        request: SetPose.Request,
+    ) -> Tuple[np.ndarray, np.ndarray, str]:
+        """Return (location[3], rotation_xyzw[4], frame_id) from a SetPose request.
+
+        request.pose is PoseWithCovarianceStamped,
+        so the Pose itself is request.pose.pose.pose.
+        """
+        stamped = request.pose
+        pose = stamped.pose.pose
+
+        location = np.array(
+            [pose.position.x, pose.position.y, pose.position.z],
+            dtype=np.float64,
+        )
+        rotation = np.array(
+            [
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w,
+            ],
+            dtype=np.float64,
+        )
+
+        if not (np.all(np.isfinite(location)) and np.all(np.isfinite(rotation))):
+            raise ValueError("Request pose contains non-finite values.")
+
+        norm = np.linalg.norm(rotation)
+        if norm < 1e-8:
+            raise ValueError("Request orientation quaternion has zero norm.")
+        rotation = rotation / norm
+
+        return location, rotation, stamped.header.frame_id
 
     def _publish_image(self, publisher, image: Optional[np.ndarray]) -> None:
         if image is None:
@@ -723,24 +771,21 @@ class PoseNode(Node):
 
     def alignment_callback(
         self,
-        request: Trigger.Request,
-        response: Trigger.Response,
-    ) -> Trigger.Response:
-        del request
-
+        request: SetPose.Request,
+        response: SetPose.Response,
+    ) -> SetPose.Response:
+        # SetPose has an empty response: failures can only be logged, and a
+        # NaN pose is published on /alignment/result so callers can detect them.
         if not self.alignment_enabled:
-            response.success = False
-            response.message = "Alignment disabled."
+            self.get_logger().warning("Alignment disabled.")
             return response
 
         if self.processing:
-            response.success = False
-            response.message = "busy"
+            self.get_logger().warning("Alignment request ignored: busy")
             return response
 
         if self.alignment_estimator is None:
-            response.success = False
-            response.message = "Alignment estimator unavailable."
+            self.get_logger().error("Alignment estimator unavailable.")
             return response
 
         self.processing = True
@@ -748,11 +793,31 @@ class PoseNode(Node):
         try:
             self.get_logger().info("========================================")
             self.get_logger().info("Alignment prediction triggered.")
+
+            # Target (GT) pose carried by the request:
+            # location (x, y, z), rotation (x, y, z, w)
+            req_location, req_rotation, req_frame = self._parse_request_pose(request)
+            self.get_logger().info(
+                f"Target pose in '{req_frame or self.parent_frame}': "
+                f"XYZ=({req_location[0]:.6f}, {req_location[1]:.6f}, "
+                f"{req_location[2]:.6f}) "
+                f"Q=({req_rotation[0]:.6f}, {req_rotation[1]:.6f}, "
+                f"{req_rotation[2]:.6f}, {req_rotation[3]:.6f})"
+            )
+
+            if req_frame and req_frame != self.parent_frame:
+                self.get_logger().warning(
+                    f"Target pose frame '{req_frame}' differs from "
+                    f"'{self.parent_frame}'. The target must be expressed in "
+                    "the same camera frame as the detected pose; no TF "
+                    "transform is applied."
+                )
+
             rgb, depth = self._get_usb_camera_frame()
 
             if rgb is None or depth is None:
-                response.success = False
-                response.message = "USB camera failed"
+                self.get_logger().error("USB camera failed")
+                self.alignment_result_pub.publish(self._failed_pose())
                 return response
 
             if rgb.ndim != 3 or rgb.shape[2] != 3:
@@ -777,18 +842,20 @@ class PoseNode(Node):
                     f"Invalid USB camera intrinsic matrix shape: {camera_matrix.shape}"
                 )
 
-            self.get_logger().info(
-                f"USB RGB   : shape={rgb.shape}, dtype={rgb.dtype}"
-            )
+            self.get_logger().info(f"USB RGB   : shape={rgb.shape}, dtype={rgb.dtype}")
             self.get_logger().info(
                 f"USB Depth : shape={depth.shape}, dtype={depth.dtype}"
             )
             self.get_logger().info("Running Alignment...")
 
+            # The SAM2 ROI is derived from the target pose + configured
+            # height/width; delta = T_target @ inv(T_input).
             result = self.alignment_estimator.predict(
                 image=rgb,
                 depth=depth,
                 K=camera_matrix,
+                location=req_location,  # np.ndarray (3,)  x, y, z
+                rotation=req_rotation,  # np.ndarray (4,)  x, y, z, w (normalized)
             )
 
             input_pose = result.get("input_pose")
@@ -799,13 +866,13 @@ class PoseNode(Node):
             )
 
             if input_pose is None:
-                response.success = False
-                response.message = "Alignment failed: no input pose."
+                self.get_logger().error("Alignment failed: no input pose.")
+                self.alignment_result_pub.publish(self._failed_pose())
                 return response
 
             if delta is None:
-                response.success = False
-                response.message = "Alignment failed: no delta."
+                self.get_logger().error("Alignment failed: no delta.")
+                self.alignment_result_pub.publish(self._failed_pose())
                 return response
 
             location = np.asarray(input_pose.get("location"), dtype=np.float64)
@@ -871,16 +938,14 @@ class PoseNode(Node):
                     f"Alignment delta angle: {float(angle_deg):.6f} deg"
                 )
 
-            response.success = True
-            response.message = "Alignment prediction successful."
+            self.get_logger().info("Alignment prediction successful.")
             self.get_logger().info("========================================")
 
         except Exception as error:
             self.get_logger().error(
                 f"Alignment exception: {type(error).__name__}: {error}"
             )
-            response.success = False
-            response.message = str(error)
+            self.alignment_result_pub.publish(self._failed_pose())
 
         finally:
             self.processing = False
@@ -945,7 +1010,9 @@ class PoseNode(Node):
             result_data = {}
             for index_value in range(4):
                 item = ripcords.get(index_value, ripcords.get(str(index_value)))
-                label = item.get("label", "ABSENT") if isinstance(item, dict) else "ABSENT"
+                label = (
+                    item.get("label", "ABSENT") if isinstance(item, dict) else "ABSENT"
+                )
                 result_data[str(index_value)] = (
                     "PRESENT" if str(label).upper() == "PRESENT" else "ABSENT"
                 )
@@ -955,8 +1022,7 @@ class PoseNode(Node):
             result_msg.level = DiagnosticStatus.OK
             result_msg.message = "success"
             result_msg.values = [
-                KeyValue(key=key, value=value)
-                for key, value in result_data.items()
+                KeyValue(key=key, value=value) for key, value in result_data.items()
             ]
             self.ripcord_result_pub.publish(result_msg)
 
@@ -967,9 +1033,7 @@ class PoseNode(Node):
             )
 
             debug_image = result.get("debug_image")
-            self._publish_ripcord_debug(
-                debug_image if debug_image is not None else rgb
-            )
+            self._publish_ripcord_debug(debug_image if debug_image is not None else rgb)
             self.get_logger().info(f"Ripcord index: {index_text}")
 
             for index_value in range(4):
@@ -1125,9 +1189,7 @@ class PoseNode(Node):
             self.depth = depth
 
             self.get_logger().info(f"RGB   : shape={rgb.shape}, dtype={rgb.dtype}")
-            self.get_logger().info(
-                f"Depth : shape={depth.shape}, dtype={depth.dtype}"
-            )
+            self.get_logger().info(f"Depth : shape={depth.shape}, dtype={depth.dtype}")
 
             if rgb.ndim != 3 or rgb.shape[2] != 3:
                 raise RuntimeError(f"Invalid RGB shape: {rgb.shape}")
@@ -1161,17 +1223,13 @@ class PoseNode(Node):
             detections = result.get("detections")
 
             if not isinstance(detections, list):
-                self.get_logger().error(
-                    "RACE-6D returned invalid 'detections' result."
-                )
+                self.get_logger().error("RACE-6D returned invalid 'detections' result.")
                 self._publish_failed_all()
                 response.success = False
                 response.message = "Invalid RACE-6D result."
                 return response
 
-            self.get_logger().info(
-                f"RACE-6D returned {len(detections)} detections."
-            )
+            self.get_logger().info(f"RACE-6D returned {len(detections)} detections.")
 
             detected_labels = []
 
@@ -1265,9 +1323,7 @@ class PoseNode(Node):
                     for label in self.pose_labels
                     if label in published_labels
                 ]
-                response.message = "Pose estimated for: " + ", ".join(
-                    published_names
-                )
+                response.message = "Pose estimated for: " + ", ".join(published_names)
             else:
                 response.message = "No configured RACE-6D object detected."
 

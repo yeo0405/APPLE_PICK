@@ -18,7 +18,6 @@ from omegaconf import OmegaConf
 from sam2.build_sam import _load_checkpoint
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DINOV3_ROOT = PROJECT_ROOT / "service" / "dinov3"
 MODEL_DIR = PROJECT_ROOT / "model"
@@ -38,6 +37,7 @@ MIN_MASK_AREA = 20
 
 PRESENT_LABEL = "PRESENT"
 ABSENT_LABEL = "ABSENT"
+
 
 PRESENT_COLOR = (0, 255, 0)
 ABSENT_COLOR = (0, 0, 255)
@@ -70,32 +70,24 @@ class RipcordEstimator:
         if not GT_PATH.is_file():
             raise FileNotFoundError(f"GT JSON not found: {GT_PATH}")
 
-        data = json.loads(
-            GT_PATH.read_text(encoding="utf-8")
-        )
+        data = json.loads(GT_PATH.read_text(encoding="utf-8"))
 
         for field in ("image", "roi", "ripcords"):
             if field not in data:
-                raise RuntimeError(
-                    f"GT JSON does not contain '{field}'"
-                )
+                raise RuntimeError(f"GT JSON does not contain '{field}'")
 
         if len(data["ripcords"]) != 4:
-            raise RuntimeError(
-                "GT JSON must contain exactly 4 ripcords"
-            )
+            raise RuntimeError("GT JSON must contain exactly 4 ripcords")
 
         for ripcord in data["ripcords"]:
             if "mask" not in ripcord:
                 raise RuntimeError(
-                    f"Ripcord {ripcord.get('index', '?')} "
-                    "has no mask"
+                    f"Ripcord {ripcord.get('index', '?')} " "has no mask"
                 )
 
             if "file" not in ripcord["mask"]:
                 raise RuntimeError(
-                    f"Ripcord {ripcord.get('index', '?')} "
-                    "has no mask.file"
+                    f"Ripcord {ripcord.get('index', '?')} " "has no mask.file"
                 )
 
         return data
@@ -106,9 +98,7 @@ class RipcordEstimator:
         roi_h = y2 - y1
 
         if roi_w <= 0 or roi_h <= 0:
-            raise RuntimeError(
-                f"Invalid ROI: {self.roi}"
-            )
+            raise RuntimeError(f"Invalid ROI: {self.roi}")
 
         results = []
 
@@ -122,9 +112,7 @@ class RipcordEstimator:
             mask_path = PROJECT_ROOT / ripcord["mask"]["file"]
 
             if not mask_path.is_file():
-                raise FileNotFoundError(
-                    f"GT mask not found: {mask_path}"
-                )
+                raise FileNotFoundError(f"GT mask not found: {mask_path}")
 
             mask = cv2.imread(
                 str(mask_path),
@@ -132,9 +120,7 @@ class RipcordEstimator:
             )
 
             if mask is None:
-                raise RuntimeError(
-                    f"Cannot read GT mask: {mask_path}"
-                )
+                raise RuntimeError(f"Cannot read GT mask: {mask_path}")
 
             mask = mask > 127
 
@@ -148,32 +134,28 @@ class RipcordEstimator:
             area = int(np.count_nonzero(mask))
 
             if area < self.min_mask_area:
-                raise RuntimeError(
-                    f"GT mask {index} is too small: {area}"
-                )
+                raise RuntimeError(f"GT mask {index} is too small: {area}")
 
-            results.append({
-                "index": index,
-                "center": (
-                    int(center[0]),
-                    int(center[1]),
-                ),
-                "mask": mask,
-                "area": area,
-            })
+            results.append(
+                {
+                    "index": index,
+                    "center": (
+                        int(center[0]),
+                        int(center[1]),
+                    ),
+                    "mask": mask,
+                    "area": area,
+                }
+            )
 
         return results
 
     def _load_sam2(self) -> SAM2ImagePredictor:
         if not SAM2_CONFIG.is_file():
-            raise FileNotFoundError(
-                f"SAM2 config not found: {SAM2_CONFIG}"
-            )
+            raise FileNotFoundError(f"SAM2 config not found: {SAM2_CONFIG}")
 
         if not SAM2_CHECKPOINT.is_file():
-            raise FileNotFoundError(
-                f"SAM2 checkpoint not found: {SAM2_CHECKPOINT}"
-            )
+            raise FileNotFoundError(f"SAM2 checkpoint not found: {SAM2_CHECKPOINT}")
 
         if GlobalHydra.instance().is_initialized():
             GlobalHydra.instance().clear()
@@ -211,9 +193,7 @@ class RipcordEstimator:
 
     def _load_dino(self):
         if not DINO_WEIGHTS.is_file():
-            raise FileNotFoundError(
-                f"DINOv3 checkpoint not found: {DINO_WEIGHTS}"
-            )
+            raise FileNotFoundError(f"DINOv3 checkpoint not found: {DINO_WEIGHTS}")
 
         model = torch.hub.load(
             str(DINOV3_ROOT),
@@ -281,9 +261,7 @@ class RipcordEstimator:
         )
 
         with torch.inference_mode():
-            features = self.dino.forward_features(
-                tensor
-            )["x_norm_patchtokens"][0]
+            features = self.dino.forward_features(tensor)["x_norm_patchtokens"][0]
 
         return F.normalize(
             features,
@@ -295,17 +273,15 @@ class RipcordEstimator:
         gt_image = cv2.imread(str(gt_image_path))
 
         if gt_image is None:
-            raise FileNotFoundError(
-                f"Cannot read GT image: {gt_image_path}"
-            )
+            raise FileNotFoundError(f"Cannot read GT image: {gt_image_path}")
 
         features = []
 
         for ripcord in self.ripcords:
             feature = self._dino_features(
                 gt_image[
-                    self.roi[1]:self.roi[3],
-                    self.roi[0]:self.roi[2],
+                    self.roi[1] : self.roi[3],
+                    self.roi[0] : self.roi[2],
                 ],
                 ripcord["mask"],
             )
@@ -334,19 +310,7 @@ class RipcordEstimator:
                         device_type="cuda",
                         dtype=torch.bfloat16,
                     ):
-                        masks, scores, _ = (
-                            self.sam2.predict(
-                                point_coords=point_coords,
-                                point_labels=point_labels,
-                                box=None,
-                                mask_input=None,
-                                multimask_output=True,
-                                return_logits=False,
-                            )
-                        )
-                else:
-                    masks, scores, _ = (
-                        self.sam2.predict(
+                        masks, scores, _ = self.sam2.predict(
                             point_coords=point_coords,
                             point_labels=point_labels,
                             box=None,
@@ -354,11 +318,17 @@ class RipcordEstimator:
                             multimask_output=True,
                             return_logits=False,
                         )
+                else:
+                    masks, scores, _ = self.sam2.predict(
+                        point_coords=point_coords,
+                        point_labels=point_labels,
+                        box=None,
+                        mask_input=None,
+                        multimask_output=True,
+                        return_logits=False,
                     )
         except Exception as e:
-            print(
-                f"[ERROR] SAM2 prediction failed: {e}"
-            )
+            print(f"[ERROR] SAM2 prediction failed: {e}")
             return None, 0.0
 
         masks = np.asarray(masks)
@@ -419,32 +389,20 @@ class RipcordEstimator:
             self.reference_features,
         )[0]
 
-        best_index = int(
-            torch.argmax(similarities).item()
-        )
+        best_index = int(torch.argmax(similarities).item())
 
-        best_similarity = float(
-            similarities[best_index].item()
-        )
+        best_similarity = float(similarities[best_index].item())
 
-        present = (
-            best_similarity
-            >= self.dino_sim_threshold
-        )
+        present = best_similarity >= self.dino_sim_threshold
 
         return {
-            "label": (
-                PRESENT_LABEL
-                if present
-                else ABSENT_LABEL
-            ),
+            "label": (PRESENT_LABEL if present else ABSENT_LABEL),
             "present": present,
             "sam_score": float(sam_score),
             "dino_similarity": best_similarity,
             "dino_reference_index": best_index,
             "dino_similarities": [
-                float(v)
-                for v in similarities.detach().cpu().numpy()
+                float(v) for v in similarities.detach().cpu().numpy()
             ],
             "mask_area": area,
         }
@@ -530,35 +488,21 @@ class RipcordEstimator:
         rgb: np.ndarray,
     ) -> Dict[str, Any]:
         if rgb is None or not isinstance(rgb, np.ndarray):
-            raise ValueError(
-                "rgb must be a numpy.ndarray"
-            )
+            raise ValueError("rgb must be a numpy.ndarray")
 
         if rgb.ndim != 3 or rgb.shape[2] != 3:
-            raise ValueError(
-                "rgb must have shape HxWx3"
-            )
+            raise ValueError("rgb must have shape HxWx3")
 
         x1, y1, x2, y2 = self.roi
         h, w = rgb.shape[:2]
 
-        if (
-            x1 < 0
-            or y1 < 0
-            or x2 > w
-            or y2 > h
-        ):
-            raise ValueError(
-                f"ROI {self.roi} is outside "
-                f"input image size {w}x{h}"
-            )
+        if x1 < 0 or y1 < 0 or x2 > w or y2 > h:
+            raise ValueError(f"ROI {self.roi} is outside " f"input image size {w}x{h}")
 
         roi_image = rgb[y1:y2, x1:x2]
 
         if roi_image.size == 0:
-            raise RuntimeError(
-                "Input ROI is empty"
-            )
+            raise RuntimeError("Input ROI is empty")
 
         roi_rgb = cv2.cvtColor(
             roi_image,
@@ -584,18 +528,11 @@ class RipcordEstimator:
             rx = gx - x1
             ry = gy - y1
 
-            if (
-                rx < 0
-                or ry < 0
-                or rx >= roi_image.shape[1]
-                or ry >= roi_image.shape[0]
-            ):
+            if rx < 0 or ry < 0 or rx >= roi_image.shape[1] or ry >= roi_image.shape[0]:
                 mask = None
                 sam_score = 0.0
             else:
-                mask, sam_score = self._predict_mask(
-                    (rx, ry)
-                )
+                mask, sam_score = self._predict_mask((rx, ry))
 
             evaluation = self._classify_mask(
                 roi_image,
@@ -603,12 +540,14 @@ class RipcordEstimator:
                 sam_score,
             )
 
-            results.append({
-                "index": index,
-                "center": ripcord["center"],
-                "mask": mask,
-                "evaluation": evaluation,
-            })
+            results.append(
+                {
+                    "index": index,
+                    "center": ripcord["center"],
+                    "mask": mask,
+                    "evaluation": evaluation,
+                }
+            )
 
         debug_image = self._draw_debug(
             rgb,
@@ -634,9 +573,7 @@ class RipcordEstimator:
             evaluation = result["evaluation"]
 
             output["ripcords"][index] = {
-                key: value
-                for key, value in evaluation.items()
-                if key != "mask"
+                key: value for key, value in evaluation.items() if key != "mask"
             }
 
         return output
@@ -648,26 +585,19 @@ if __name__ == "__main__":
     image_path = (
         Path(sys.argv[1])
         if len(sys.argv) > 1
-        else PROJECT_ROOT
-        / "dino_test"
-        / "hard.png"
+        else PROJECT_ROOT / "dino_test" / "hard.png"
     )
 
     image = cv2.imread(str(image_path))
 
     if image is None:
-        raise FileNotFoundError(
-            f"Cannot read image: {image_path}"
-        )
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
 
     estimator = RipcordEstimator()
     result = estimator.predict(image)
 
     print(f"Device: {estimator.device}")
-    print(
-        f"DINO threshold: "
-        f"{estimator.dino_sim_threshold}"
-    )
+    print(f"DINO threshold: " f"{estimator.dino_sim_threshold}")
 
     for index in range(4):
         item = result["ripcords"][index]
@@ -679,16 +609,9 @@ if __name__ == "__main__":
             f"DINO={item['dino_similarity']:.4f}"
         )
 
-    print(
-        f"FINAL INDEX: "
-        f"{result['detected_index']}"
-    )
+    print(f"FINAL INDEX: " f"{result['detected_index']}")
 
-    output_path = (
-        PROJECT_ROOT
-        / "dino_test"
-        / "ripcord_debug.png"
-    )
+    output_path = PROJECT_ROOT / "dino_test" / "ripcord_debug.png"
 
     cv2.imwrite(
         str(output_path),

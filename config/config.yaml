@@ -39,5 +39,19 @@ RACE_6D:
 # ==========================================================
 BOX_CHECK:
   ENABLED: true
-  SIM_THRESHOLD: 0.8
-  COVERAGE_THRESHOLD: 0.17
+  SIM_THRESHOLD: 0.85
+  COVERAGE_THRESHOLD: 0.15
+
+# ==========================================================
+# ALIGNMENT
+# ROI size of the target, in METERS (same unit as the pose sent
+# to /alignment/predict). The rectangle lies in the object's XY
+# plane: WIDTH along X, HEIGHT along Y, centered on the pose.
+# It is projected into the USB camera image as the SAM2 prompt box.
+# The returned delta is T_target @ inv(T_input), in the camera frame.
+# ==========================================================
+ALIGNMENT:
+  ENABLED: true
+  HEIGHT: 0.05    # TODO: replace with the measured size (m)
+  WIDTH: 0.08     # TODO: replace with the measured size (m)
+  ROI_SCALE: 1.0  # >1 enlarges the SAM2 prompt box

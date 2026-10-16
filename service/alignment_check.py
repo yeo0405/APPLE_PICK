@@ -8,12 +8,28 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from ALIGNMENT.alignment import AlignmentEstimator
-
+from ALIGNMENT.alignment import AlignmentEstimator, GT_PATH
 
 APP_DIR = Path(__file__).resolve().parent
-DEFAULT_GT_JSON = APP_DIR / "ALIGNMENT" / "GT" / "gt.json"
 DEFAULT_OUTPUT = APP_DIR / "ALIGNMENT" / "output"
+
+HEIGHT = 0.02
+WIDTH = 0.05
+ROI_SCALE = 1.0
+DEVICE = "cuda"
+
+TARGET_XYZ = [
+    -0.1437396978855786,
+    -0.06308379248382938,
+    0.25,
+]
+
+TARGET_QUATERNION = [
+    -0.1852490322102135,
+    0.01065864156467927,
+    0.015970591181817106,
+    0.9825040099879889,
+]
 
 K = np.array(
     [
@@ -28,14 +44,13 @@ K = np.array(
 def find_images(input_path: Path) -> list[Path]:
     if input_path.is_file():
         if not input_path.name.endswith("_color.jpg"):
-            raise ValueError(
-                f"Input file must end with '_color.jpg': {input_path}"
-            )
+            raise ValueError(f"Input file must end with '_color.jpg': {input_path}")
         return [input_path]
 
     if input_path.is_dir():
         return sorted(
-            p for p in input_path.iterdir()
+            p
+            for p in input_path.iterdir()
             if p.is_file()
             and p.suffix.lower() == ".jpg"
             and p.name.endswith("_color.jpg")
@@ -45,9 +60,7 @@ def find_images(input_path: Path) -> list[Path]:
 
 
 def get_depth_path(image_path: Path) -> Path:
-    return image_path.with_name(
-        image_path.name.replace("_color.jpg", "_depth.png")
-    )
+    return image_path.with_name(image_path.name.replace("_color.jpg", "_depth.png"))
 
 
 def make_json_safe(value, key=None):
@@ -166,28 +179,16 @@ def print_geometry_debug(pose):
         plane_mask = plane.get("plane_mask")
 
         if obb_mask is not None:
-            print(
-                f"  OBB mask pixels: "
-                f"{int(np.count_nonzero(obb_mask))}"
-            )
+            print(f"  OBB mask pixels: {int(np.count_nonzero(obb_mask))}")
 
         if plane_mask is not None:
-            print(
-                f"  Plane mask pixels: "
-                f"{int(np.count_nonzero(plane_mask))}"
-            )
+            print(f"  Plane mask pixels: {int(np.count_nonzero(plane_mask))}")
 
         if plane.get("horizontal_inset") is not None:
-            print(
-                f"  H inset: "
-                f"{plane['horizontal_inset']}"
-            )
+            print(f"  H inset: {plane['horizontal_inset']}")
 
         if plane.get("vertical_inset") is not None:
-            print(
-                f"  V inset: "
-                f"{plane['vertical_inset']}"
-            )
+            print(f"  V inset: {plane['vertical_inset']}")
 
     orientation = pose.get("orientation_debug")
 
@@ -197,65 +198,76 @@ def print_geometry_debug(pose):
     print("-" * 60)
     print("INPUT ORIENTATION")
 
-    image_axis = np.asarray(
-        orientation["image_axis"],
-        dtype=np.float64,
-    )
+    for key, label in (
+        ("image_axis", "image_axis"),
+        ("x_axis", "X axis"),
+        ("y_axis", "Y axis"),
+        ("z_axis", "Z axis"),
+    ):
+        axis = np.asarray(
+            orientation[key],
+            dtype=np.float64,
+        ).reshape(-1)
+        print(f"  {label}: {axis.tolist()}")
 
-    x_axis = np.asarray(
-        orientation["x_axis"],
-        dtype=np.float64,
-    )
-
-    y_axis = np.asarray(
-        orientation["y_axis"],
-        dtype=np.float64,
-    )
-
-    z_axis = np.asarray(
-        orientation["z_axis"],
-        dtype=np.float64,
-    )
-
-    print(f"  image_axis: {image_axis.tolist()}")
-    print(f"  X axis: {x_axis.tolist()}")
-    print(f"  Y axis: {y_axis.tolist()}")
-    print(f"  Z axis: {z_axis.tolist()}")
-
-    R = np.asarray(
+    rotation_matrix = np.asarray(
         orientation["rotation_matrix"],
         dtype=np.float64,
     )
 
     print("  Rotation matrix:")
-    for row in R:
-        print(
-            "    " + " ".join(
-                f"{value: .6f}" for value in row
-            )
-        )
+    for row in rotation_matrix:
+        print("    " + " ".join(f"{value: .6f}" for value in row))
+
+
+def print_delta(delta):
+    if delta is None:
+        print("DELTA: None")
+        return
+
+    location = delta.get("location")
+    rotation = delta.get("rotation")
+    euler = delta.get("rotation_euler_deg")
+    angle = delta.get("rotation_angle_deg")
+
+    if location is not None:
+        xyz = np.asarray(location, dtype=np.float64).reshape(-1)
+        if xyz.size == 3:
+            print("DELTA XYZ [m]:")
+            print(f"  x: {xyz[0]:.6f}")
+            print(f"  y: {xyz[1]:.6f}")
+            print(f"  z: {xyz[2]:.6f}")
+
+    if rotation is not None:
+        print_quaternion("DELTA Quaternion", rotation)
+
+    if angle is not None:
+        print(f"DELTA Rotation Angle: {float(angle):.6f} deg")
+
+    if euler is not None:
+        values = np.asarray(euler, dtype=np.float64).reshape(-1)
+        if values.size == 3:
+            print("DELTA RPY [deg]:")
+            print(f"  roll : {values[0]:.6f}")
+            print(f"  pitch: {values[1]:.6f}")
+            print(f"  yaw  : {values[2]:.6f}")
 
 
 def process_image(
     image_path: Path,
     output_dir: Path,
     estimator: AlignmentEstimator,
+    location: np.ndarray,
+    rotation: np.ndarray,
 ) -> bool:
     depth_path = get_depth_path(image_path)
 
-    if not depth_path.exists():
+    if not depth_path.is_file():
         print(f"[ERROR] Depth not found: {depth_path}")
         return False
 
-    image = cv2.imread(
-        str(image_path),
-        cv2.IMREAD_COLOR,
-    )
-
-    depth = cv2.imread(
-        str(depth_path),
-        cv2.IMREAD_UNCHANGED,
-    )
+    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
 
     if image is None:
         print(f"[ERROR] Cannot load RGB: {image_path}")
@@ -266,10 +278,7 @@ def process_image(
         return False
 
     if depth.ndim != 2:
-        print(
-            f"[ERROR] Depth must be single-channel: "
-            f"{depth_path}"
-        )
+        print(f"[ERROR] Depth must be single-channel: {depth_path}")
         return False
 
     if image.shape[:2] != depth.shape[:2]:
@@ -284,113 +293,55 @@ def process_image(
             image,
             depth,
             K,
+            location.tolist(),
+            rotation.tolist(),
         )
     except Exception as error:
-        print(
-            f"[ERROR] Inference failed for "
-            f"{image_path.name}: {error}"
-        )
+        print(f"[ERROR] Inference failed for {image_path.name}: {error}")
         return False
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     debug_path = output_dir / image_path.name
     json_path = output_dir / f"{image_path.stem}.json"
+    mask_dir = output_dir / "masks" / image_path.stem
+    mask_dir.mkdir(parents=True, exist_ok=True)
 
-    mask_dir = (
-        output_dir
-        / "masks"
-        / image_path.stem
-    )
-
-    mask_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    if not cv2.imwrite(
-        str(debug_path),
-        result["debug_image"],
-    ):
-        print(
-            f"[ERROR] Failed to save debug image: "
-            f"{debug_path}"
-        )
+    if not cv2.imwrite(str(debug_path), result["debug_image"]):
+        print(f"[ERROR] Failed to save debug image: {debug_path}")
         return False
 
     input_pose = result.get("input_pose")
     sam_mask = result.get("mask")
 
-    sam_mask_path = mask_dir / "sam_mask.png"
-
     if sam_mask is not None:
-        if not save_mask(
-            sam_mask_path,
-            sam_mask,
-        ):
-            print(
-                f"[WARNING] Failed to save "
-                f"SAM2 mask: {sam_mask_path}"
-            )
+        sam_mask_path = mask_dir / "sam_mask.png"
+        if not save_mask(sam_mask_path, sam_mask):
+            print(f"[WARNING] Failed to save SAM2 mask: {sam_mask_path}")
 
     if input_pose is not None:
         plane = input_pose.get("plane")
 
         if plane is not None:
-            obb_mask = plane.get("obb_mask")
-            plane_mask = plane.get("plane_mask")
+            for key, filename in (
+                ("obb_mask", "obb_mask.png"),
+                ("plane_mask", "plane_mask.png"),
+            ):
+                mask = plane.get(key)
+                if mask is not None:
+                    mask_path = mask_dir / filename
+                    if not save_mask(mask_path, mask):
+                        print(f"[WARNING] Failed to save mask: {mask_path}")
 
-            if obb_mask is not None:
-                obb_mask_path = (
-                    mask_dir / "obb_mask.png"
-                )
-
-                if not save_mask(
-                    obb_mask_path,
-                    obb_mask,
-                ):
-                    print(
-                        f"[WARNING] Failed to save "
-                        f"OBB mask: {obb_mask_path}"
-                    )
-
-            if plane_mask is not None:
-                plane_mask_path = (
-                    mask_dir / "plane_mask.png"
-                )
-
-                if not save_mask(
-                    plane_mask_path,
-                    plane_mask,
-                ):
-                    print(
-                        f"[WARNING] Failed to save "
-                        f"plane mask: {plane_mask_path}"
-                    )
-
-    json_result = make_json_safe(result)
-
-    with open(
-        json_path,
-        "w",
-        encoding="utf-8",
-    ) as f:
+    with open(json_path, "w", encoding="utf-8") as file:
         json.dump(
-            json_result,
-            f,
+            make_json_safe(result),
+            file,
             indent=4,
             ensure_ascii=False,
         )
 
-    mask_area = (
-        int(np.count_nonzero(sam_mask))
-        if sam_mask is not None
-        else 0
-    )
-
+    mask_area = int(np.count_nonzero(sam_mask)) if sam_mask is not None else 0
     score = result.get("sam_score")
 
     print()
@@ -401,142 +352,103 @@ def process_image(
     print(f"[OUTPUT] JSON : {json_path}")
     print(f"[OUTPUT] Masks: {mask_dir}")
     print("=" * 60)
-
-    print(f"[RESULT] Present: {result['present']}")
-
+    print(f"[RESULT] Present: {result.get('present')}")
     print(
-        f"         BBox={result['bbox']} | "
-        f"SAM={score:.3f}"
+        f"         BBox={result.get('bbox')} | SAM={score:.3f}"
         if score is not None
-        else (
-            f"         BBox={result['bbox']} | "
-            f"SAM=N/A"
-        )
+        else f"         BBox={result.get('bbox')} | SAM=N/A"
     )
-
     print(f"         SAM mask area={mask_area}")
-
     print("-" * 60)
 
-    print_pose(
-        "GT",
-        result.get("gt_pose"),
-    )
-
+    print_pose("GT", result.get("gt_pose"))
     print("-" * 60)
-
-    print_pose(
-        "INPUT",
-        input_pose,
-    )
-
+    print_pose("INPUT", input_pose)
     print_geometry_debug(input_pose)
-
     print("-" * 60)
-
-    delta = result.get("delta")
-
-    if delta is None:
-        print("DELTA: None")
-    else:
-        delta_location = delta.get("location")
-        delta_rotation = delta.get("rotation")
-        delta_euler = delta.get("rotation_euler_deg")
-        delta_angle = delta.get("rotation_angle_deg")
-
-        if delta_location is not None:
-            xyz = np.asarray(
-                delta_location,
-                dtype=np.float64,
-            ).reshape(-1)
-
-            if xyz.size == 3:
-                print("DELTA XYZ [m]:")
-                print(f"  x: {xyz[0]:.6f}")
-                print(f"  y: {xyz[1]:.6f}")
-                print(f"  z: {xyz[2]:.6f}")
-
-        if delta_rotation is not None:
-            print_quaternion(
-                "DELTA Quaternion",
-                delta_rotation,
-            )
-
-        if delta_angle is not None:
-            print("DELTA Rotation Angle:")
-            print(
-                f"  angle: "
-                f"{float(delta_angle):.6f} deg"
-            )
-
-        if delta_euler is not None:
-            euler = np.asarray(
-                delta_euler,
-                dtype=np.float64,
-            ).reshape(-1)
-
-            if euler.size == 3:
-                print("DELTA RPY [deg]:")
-                print(f"  roll : {euler[0]:.6f}")
-                print(f"  pitch: {euler[1]:.6f}")
-                print(f"  yaw  : {euler[2]:.6f}")
-
+    print_delta(result.get("delta"))
     print("=" * 60)
 
     return True
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="SAM2 6DoF Alignment inference"
-    )
-
+    parser = argparse.ArgumentParser(description="Offline 6DoF Alignment inference")
     parser.add_argument(
         "--input",
         required=True,
-        help="Directory containing *_color.jpg and *_depth.png",
+        help="Directory or *_color.jpg image path",
     )
-
     parser.add_argument(
         "--output",
         default=str(DEFAULT_OUTPUT),
         help="Output directory",
     )
-
+    parser.add_argument(
+        "--device",
+        default=DEVICE,
+        help="Inference device, e.g. cuda or cpu",
+    )
     args = parser.parse_args()
+
+    if HEIGHT <= 0 or WIDTH <= 0 or ROI_SCALE <= 0:
+        parser.error("HEIGHT, WIDTH and ROI_SCALE must be > 0")
 
     input_path = Path(args.input).resolve()
     output_dir = Path(args.output).resolve()
 
-    if not DEFAULT_GT_JSON.is_file():
-        raise FileNotFoundError(
-            f"GT JSON not found: {DEFAULT_GT_JSON}"
-        )
+    if not GT_PATH.is_file():
+        raise FileNotFoundError(f"GT JSON not found: {GT_PATH}")
 
     images = find_images(input_path)
 
     if not images:
-        raise RuntimeError(
-            f"No *_color.jpg images found in: {input_path}"
-        )
+        raise RuntimeError(f"No *_color.jpg images found in: {input_path}")
+
+    location = np.asarray(TARGET_XYZ, dtype=np.float64)
+    rotation = np.asarray(TARGET_QUATERNION, dtype=np.float64)
+
+    if location.shape != (3,) or not np.all(np.isfinite(location)):
+        raise ValueError("TARGET_XYZ must contain three finite values")
+
+    if rotation.shape != (4,) or not np.all(np.isfinite(rotation)):
+        raise ValueError("TARGET_QUATERNION must contain four finite values")
+
+    quaternion_norm = np.linalg.norm(rotation)
+    if quaternion_norm < 1e-8:
+        raise ValueError("TARGET_QUATERNION must not be a zero quaternion")
+
+    rotation /= quaternion_norm
 
     print("=" * 60)
-    print("6DoF ALIGNMENT INFERENCE")
+    print("6DoF ALIGNMENT OFFLINE INFERENCE")
     print("=" * 60)
     print(f"[INPUT]       {input_path}")
     print(f"[OUTPUT]      {output_dir}")
-    print(f"[GT]          {DEFAULT_GT_JSON}")
+    print(f"[GT]          {GT_PATH}")
     print(f"[INFO]        Found {len(images)} RGB image(s)")
+    print(f"[INFO]        Height: {HEIGHT:.6f} m")
+    print(f"[INFO]        Width : {WIDTH:.6f} m")
+    print(f"[INFO]        ROI scale: {ROI_SCALE:.3f}")
+    print(f"[INFO]        Device: {args.device}")
     print(f"[INFO]        fx = {K[0, 0]:.6f}")
     print(f"[INFO]        fy = {K[1, 1]:.6f}")
     print(f"[INFO]        cx = {K[0, 2]:.6f}")
     print(f"[INFO]        cy = {K[1, 2]:.6f}")
     print("=" * 60)
 
+    print_pose(
+        "TARGET",
+        {"location": location, "rotation": rotation},
+    )
+
     print("[INFO] Initializing AlignmentEstimator...")
 
     estimator = AlignmentEstimator(
-        gt_json=DEFAULT_GT_JSON,
+        height=HEIGHT,
+        width=WIDTH,
+        device=args.device,
+        roi_scale=ROI_SCALE,
     )
 
     print("[INFO] AlignmentEstimator ready.")
@@ -549,6 +461,8 @@ def main():
             image_path,
             output_dir,
             estimator,
+            location,
+            rotation,
         ):
             success += 1
 
