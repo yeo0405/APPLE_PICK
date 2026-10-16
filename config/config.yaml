@@ -52,6 +52,6 @@ BOX_CHECK:
 # ==========================================================
 ALIGNMENT:
   ENABLED: true
-  HEIGHT: 0.05    # TODO: replace with the measured size (m)
-  WIDTH: 0.08     # TODO: replace with the measured size (m)
+  HEIGHT: 0.07    # TODO: replace with the measured size (m)
+  WIDTH: 0.2    # TODO: replace with the measured size (m)
   ROI_SCALE: 1.0  # >1 enlarges the SAM2 prompt box

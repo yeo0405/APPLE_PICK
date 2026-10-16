@@ -18,11 +18,14 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from geometry import calculate_pose
 
-K = np.array([
-    [1070.7897900136718, 0.0, 962.3093872070312],
-    [0.0, 1070.5269785615235, 512.0372314453125],
-    [0.0, 0.0, 1.0],
-], dtype=np.float64)
+K = np.array(
+    [
+        [339.97906, 0.0, 318.17065],
+        [0.0, 339.77747, 241.6358],
+        [0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
 
 
 def find_gt_image():
@@ -58,9 +61,7 @@ def load_mask(data):
     )
 
     if mask is None:
-        raise RuntimeError(
-            f"Failed to load mask: {mask_path}"
-        )
+        raise RuntimeError(f"Failed to load mask: {mask_path}")
 
     return mask, mask_path
 
@@ -74,14 +75,10 @@ def load_depth():
     )
 
     if depth is None:
-        raise RuntimeError(
-            f"Failed to load depth: {path}"
-        )
+        raise RuntimeError(f"Failed to load depth: {path}")
 
     if depth.ndim != 2:
-        raise RuntimeError(
-            f"Depth must be single-channel, got {depth.shape}"
-        )
+        raise RuntimeError(f"Depth must be single-channel, got {depth.shape}")
 
     return depth, path
 
@@ -90,11 +87,7 @@ def save_mask(path: Path, mask):
     if mask is None:
         return
 
-    mask = (
-        (np.asarray(mask) > 0)
-        .astype(np.uint8)
-        * 255
-    )
+    mask = (np.asarray(mask) > 0).astype(np.uint8) * 255
 
     path.parent.mkdir(
         parents=True,
@@ -105,9 +98,7 @@ def save_mask(path: Path, mask):
         str(path),
         mask,
     ):
-        raise RuntimeError(
-            f"Failed to save mask: {path}"
-        )
+        raise RuntimeError(f"Failed to save mask: {path}")
 
 
 def convert_value(value, exclude=None):
@@ -136,10 +127,7 @@ def convert_value(value, exclude=None):
         }
 
     if isinstance(value, (list, tuple)):
-        return [
-            convert_value(v, exclude)
-            for v in value
-        ]
+        return [convert_value(v, exclude) for v in value]
 
     return value
 
@@ -156,22 +144,18 @@ def main():
     )
 
     if image is None:
-        raise RuntimeError(
-            f"Failed to load image: {image_path}"
-        )
+        raise RuntimeError(f"Failed to load image: {image_path}")
 
     image_shape = image.shape[:2]
 
     if mask.shape != image_shape:
         raise RuntimeError(
-            f"Mask/image resolution mismatch: "
-            f"{mask.shape} vs {image_shape}"
+            f"Mask/image resolution mismatch: " f"{mask.shape} vs {image_shape}"
         )
 
     if depth.shape != image_shape:
         raise RuntimeError(
-            f"Depth/image resolution mismatch: "
-            f"{depth.shape} vs {image_shape}"
+            f"Depth/image resolution mismatch: " f"{depth.shape} vs {image_shape}"
         )
 
     print("=" * 60)
@@ -189,17 +173,13 @@ def main():
     )
 
     if result is None:
-        raise RuntimeError(
-            "geometry.calculate_pose() failed"
-        )
+        raise RuntimeError("geometry.calculate_pose() failed")
 
     location = result.get("location")
     rotation = result.get("rotation")
 
     if location is None:
-        raise RuntimeError(
-            "geometry.calculate_pose() returned no location"
-        )
+        raise RuntimeError("geometry.calculate_pose() returned no location")
 
     if rotation is None:
         raise RuntimeError(
@@ -218,33 +198,21 @@ def main():
     ).reshape(-1)
 
     if location.size != 3:
-        raise RuntimeError(
-            f"Invalid location: {location}"
-        )
+        raise RuntimeError(f"Invalid location: {location}")
 
     if rotation.size != 4:
-        raise RuntimeError(
-            f"Invalid quaternion: {rotation}"
-        )
+        raise RuntimeError(f"Invalid quaternion: {rotation}")
 
     objects = data.get("objects")
 
     if not objects:
-        raise RuntimeError(
-            "gt.json contains no objects"
-        )
+        raise RuntimeError("gt.json contains no objects")
 
     obj = objects[0]
 
-    obj["xyz"] = [
-        float(v)
-        for v in location
-    ]
+    obj["xyz"] = [float(v) for v in location]
 
-    obj["quaternion"] = [
-        float(v)
-        for v in rotation
-    ]
+    obj["quaternion"] = [float(v) for v in rotation]
 
     obj["pose"] = {
         "xyz_unit": "meter",
@@ -252,9 +220,7 @@ def main():
     }
 
     if result.get("obb") is not None:
-        obj["obb"] = convert_value(
-            result["obb"]
-        )
+        obj["obb"] = convert_value(result["obb"])
 
     plane = result.get("plane")
 
@@ -279,9 +245,7 @@ def main():
         )
 
     if result.get("orientation_debug") is not None:
-        obj["orientation_debug"] = convert_value(
-            result["orientation_debug"]
-        )
+        obj["orientation_debug"] = convert_value(result["orientation_debug"])
 
     with open(
         json_path,
@@ -307,62 +271,23 @@ def main():
         print(f"OBB        : {obj['obb']}")
 
     if plane is not None:
-        print(
-            f"OBB mask   : "
-            f"{GT_MASK_DIR / 'obb_mask.png'}"
-        )
-        print(
-            f"Plane mask : "
-            f"{GT_MASK_DIR / 'plane_mask.png'}"
-        )
-        print(
-            f"OBB pixels : "
-            f"{int(np.count_nonzero(plane.get('obb_mask')))}"
-        )
-        print(
-            f"Plane pixels: "
-            f"{int(np.count_nonzero(plane.get('plane_mask')))}"
-        )
-        print(
-            f"Plane RMSE : "
-            f"{plane.get('rmse')}"
-        )
-        print(
-            f"Plane pts  : "
-            f"{plane.get('point_count')}"
-        )
-        print(
-            f"Normal     : "
-            f"{plane.get('normal')}"
-        )
-        print(
-            f"H inset    : "
-            f"{plane.get('horizontal_inset')}"
-        )
-        print(
-            f"V inset    : "
-            f"{plane.get('vertical_inset')}"
-        )
+        print(f"OBB mask   : " f"{GT_MASK_DIR / 'obb_mask.png'}")
+        print(f"Plane mask : " f"{GT_MASK_DIR / 'plane_mask.png'}")
+        print(f"OBB pixels : " f"{int(np.count_nonzero(plane.get('obb_mask')))}")
+        print(f"Plane pixels: " f"{int(np.count_nonzero(plane.get('plane_mask')))}")
+        print(f"Plane RMSE : " f"{plane.get('rmse')}")
+        print(f"Plane pts  : " f"{plane.get('point_count')}")
+        print(f"Normal     : " f"{plane.get('normal')}")
+        print(f"H inset    : " f"{plane.get('horizontal_inset')}")
+        print(f"V inset    : " f"{plane.get('vertical_inset')}")
 
     if "orientation_debug" in obj:
         debug = obj["orientation_debug"]
 
-        print(
-            f"Image axis : "
-            f"{debug.get('image_axis')}"
-        )
-        print(
-            f"X axis     : "
-            f"{debug.get('x_axis')}"
-        )
-        print(
-            f"Y axis     : "
-            f"{debug.get('y_axis')}"
-        )
-        print(
-            f"Z axis     : "
-            f"{debug.get('z_axis')}"
-        )
+        print(f"Image axis : " f"{debug.get('image_axis')}")
+        print(f"X axis     : " f"{debug.get('x_axis')}")
+        print(f"Y axis     : " f"{debug.get('y_axis')}")
+        print(f"Z axis     : " f"{debug.get('z_axis')}")
 
     print("=" * 60)
 
