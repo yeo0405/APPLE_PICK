@@ -1,5 +1,5 @@
 {
-    "image": "service/RIPCORD_CHECK/GT/GT.png",
+    "image": "service/RIPCORD_CHECK/GT/gt.png",
     "image_size": [
         1920,
         1080
@@ -11,34 +11,34 @@
             "side": "ripcord",
             "polygon": [
                 [
-                    723,
-                    567
+                    952,
+                    521
                 ],
                 [
-                    1211,
-                    561
+                    1041,
+                    552
                 ],
                 [
-                    1218,
-                    633
+                    896,
+                    791
                 ],
                 [
-                    728,
-                    640
+                    805,
+                    749
                 ]
             ],
             "bbox": [
-                723,
-                561,
-                1218,
-                640
+                805,
+                521,
+                1041,
+                791
             ],
             "mask": {
                 "index": 0,
                 "side": "ripcord",
                 "file": "service/RIPCORD_CHECK/GT/gt_masks/ripcord_0.png",
-                "score": 0.9707682132720947,
-                "area": 35933
+                "score": 0.9229889512062073,
+                "area": 17129
             }
         }
     ],

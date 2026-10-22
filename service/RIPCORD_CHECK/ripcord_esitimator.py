@@ -22,7 +22,7 @@ PATCH_GRID = 14
 MASK_THRESHOLD = 0.25
 
 SIM_THRESHOLD = 0.8
-COVERAGE_THRESHOLD = 0.17
+COVERAGE_THRESHOLD = 0.8
 
 PREPROCESS_MODE = "retinex"  # none | clahe | retinex | chroma
 RETINEX_SIGMA_RATIO = 0.08
@@ -56,9 +56,13 @@ class DINOv3Estimator:
         self.absent_label = absent_label
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.model = torch.hub.load(
-            str(DINOV3_ROOT), "dinov3_vits16", source="local", weights=str(WEIGHTS)
-        ).to(self.device).eval()
+        self.model = (
+            torch.hub.load(
+                str(DINOV3_ROOT), "dinov3_vits16", source="local", weights=str(WEIGHTS)
+            )
+            .to(self.device)
+            .eval()
+        )
 
         self.gt_data = json.loads(GT_PATH.read_text())
         gt_image_path = PROJECT_ROOT / self.gt_data["image"]
@@ -84,9 +88,13 @@ class DINOv3Estimator:
             roi_mask = self._load_roi_mask(obj, polygon, bbox, gt_roi.shape[:2])
             patch_mask = self._get_patch_mask(roi_mask)
             if not patch_mask.any():
-                raise ValueError(f"Mask does not contain any valid DINOv3 patches: {name}")
+                raise ValueError(
+                    f"Mask does not contain any valid DINOv3 patches: {name}"
+                )
 
-            patch_index = torch.from_numpy(np.flatnonzero(patch_mask.reshape(-1))).to(self.device)
+            patch_index = torch.from_numpy(np.flatnonzero(patch_mask.reshape(-1))).to(
+                self.device
+            )
             self.reference[name] = {
                 "polygon": polygon.tolist(),
                 "bbox": bbox,
@@ -98,7 +106,9 @@ class DINOv3Estimator:
         if TARGET_NAME not in self.reference:
             raise KeyError(f"GT object '{TARGET_NAME}' not found in: {GT_PATH}")
 
-    def _load_roi_mask(self, obj: Dict[str, Any], polygon: np.ndarray, bbox, roi_shape) -> np.ndarray:
+    def _load_roi_mask(
+        self, obj: Dict[str, Any], polygon: np.ndarray, bbox, roi_shape
+    ) -> np.ndarray:
         mask_file = (obj.get("mask") or {}).get("file")
 
         if USE_GT_MASK and mask_file:
@@ -107,13 +117,19 @@ class DINOv3Estimator:
             if full is None:
                 raise FileNotFoundError(f"Cannot read GT mask: {mask_path}")
             if full.shape != self.gt_shape:
-                raise ValueError(f"Mask size {full.shape} != GT image size {self.gt_shape}: {mask_path}")
+                raise ValueError(
+                    f"Mask size {full.shape} != GT image size {self.gt_shape}: {mask_path}"
+                )
             mask = np.where(self._crop_bbox(full, bbox) > 127, 255, 0).astype(np.uint8)
         else:
-            mask = self._polygon_mask(polygon - np.array(bbox[:2], dtype=np.float32), roi_shape)
+            mask = self._polygon_mask(
+                polygon - np.array(bbox[:2], dtype=np.float32), roi_shape
+            )
 
         if MASK_ERODE_PX > 0:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * MASK_ERODE_PX + 1,) * 2)
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * MASK_ERODE_PX + 1,) * 2
+            )
             mask = cv2.erode(mask, kernel)
         if not mask.any():
             raise ValueError(f"Empty GT mask for: {obj['side']}")
@@ -127,7 +143,9 @@ class DINOv3Estimator:
             l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
         elif PREPROCESS_MODE == "retinex":
             l_f = l.astype(np.float32) + 1.0
-            illum = cv2.GaussianBlur(l_f, (0, 0), max(bgr.shape[:2]) * RETINEX_SIGMA_RATIO)
+            illum = cv2.GaussianBlur(
+                l_f, (0, 0), max(bgr.shape[:2]) * RETINEX_SIGMA_RATIO
+            )
             r = np.log(l_f) - np.log(illum)
             r = (r - r.mean()) / (r.std() + 1e-6)
             l = np.clip(r * 40.0 + 128.0, 0, 255).astype(np.uint8)
@@ -165,7 +183,9 @@ class DINOv3Estimator:
 
     def _extract_features(self, image: np.ndarray) -> torch.Tensor:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image = cv2.resize(image, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA)
+        image = cv2.resize(
+            image, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA
+        )
         x = torch.from_numpy(image).permute(2, 0, 1).float().div(255.0)
         if IMAGENET_NORM:
             x = (x - MEAN) / STD
@@ -175,10 +195,16 @@ class DINOv3Estimator:
         return F.normalize(feat, dim=-1)
 
     def _get_patch_mask(self, mask: np.ndarray) -> np.ndarray:
-        small = cv2.resize(mask.astype(np.uint8), (PATCH_GRID, PATCH_GRID), interpolation=cv2.INTER_AREA)
+        small = cv2.resize(
+            mask.astype(np.uint8),
+            (PATCH_GRID, PATCH_GRID),
+            interpolation=cv2.INTER_AREA,
+        )
         return small >= int(MASK_THRESHOLD * 255)
 
-    def _evaluate(self, ref_feat: torch.Tensor, ref_index: torch.Tensor, input_feat: torch.Tensor):
+    def _evaluate(
+        self, ref_feat: torch.Tensor, ref_index: torch.Tensor, input_feat: torch.Tensor
+    ):
         best, best_idx = (ref_feat @ input_feat.T).max(dim=1)
         passed = best >= self.sim_threshold
         coverage = float(passed.float().mean())
@@ -208,7 +234,15 @@ class DINOv3Estimator:
             "similarity_map": similarity.reshape(PATCH_GRID, PATCH_GRID).cpu().numpy(),
         }
 
-    def _draw_debug(self, image: np.ndarray, name: str, polygon, bbox, roi_mask, evaluation: Dict[str, Any]):
+    def _draw_debug(
+        self,
+        image: np.ndarray,
+        name: str,
+        polygon,
+        bbox,
+        roi_mask,
+        evaluation: Dict[str, Any],
+    ):
         polygon = np.asarray(polygon, dtype=np.int32)
         x1, y1, x2, y2 = map(int, bbox)
         color = PRESENT_COLOR if evaluation["present"] else ABSENT_COLOR
@@ -216,12 +250,20 @@ class DINOv3Estimator:
 
         overlay = image.copy()
         for row, col in zip(*np.where(evaluation["pass_mask"])):
-            p1 = (x1 + int(col * roi_w / PATCH_GRID), y1 + int(row * roi_h / PATCH_GRID))
-            p2 = (x1 + int((col + 1) * roi_w / PATCH_GRID), y1 + int((row + 1) * roi_h / PATCH_GRID))
+            p1 = (
+                x1 + int(col * roi_w / PATCH_GRID),
+                y1 + int(row * roi_h / PATCH_GRID),
+            )
+            p2 = (
+                x1 + int((col + 1) * roi_w / PATCH_GRID),
+                y1 + int((row + 1) * roi_h / PATCH_GRID),
+            )
             cv2.rectangle(overlay, p1, p2, PATCH_COLOR, -1)
         debug = cv2.addWeighted(overlay, 0.28, image, 0.72, 0)
 
-        contours, _ = cv2.findContours(roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         cv2.drawContours(debug, contours, -1, color, 2, offset=(x1, y1))
         cv2.rectangle(debug, (x1, y1), (x2, y2), color, 1)
 
@@ -234,20 +276,38 @@ class DINOv3Estimator:
         bg_y1 = max(0, text_y - th - 8)
         bg_y2 = min(debug.shape[0], text_y + 4)
         cv2.rectangle(debug, (bg_x1, bg_y1), (bg_x2, bg_y2), color, -1)
-        cv2.putText(debug, text, (bg_x1 + 5, text_y - 2), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+        cv2.putText(
+            debug,
+            text,
+            (bg_x1 + 5, text_y - 2),
+            font,
+            scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
         return debug
 
     def predict(self, rgb: np.ndarray) -> Dict[str, Any]:
         if rgb is None or not isinstance(rgb, np.ndarray):
             raise ValueError("rgb must be a numpy.ndarray")
         if rgb.shape[:2] != self.gt_shape:
-            raise ValueError(f"Input size {rgb.shape[:2]} != GT image size {self.gt_shape}")
+            raise ValueError(
+                f"Input size {rgb.shape[:2]} != GT image size {self.gt_shape}"
+            )
 
         ref = self.reference[TARGET_NAME]
-        input_feat = self._extract_features(self._crop_bbox(self._preprocess(rgb), ref["bbox"]))
+        input_feat = self._extract_features(
+            self._crop_bbox(self._preprocess(rgb), ref["bbox"])
+        )
         evaluation = self._evaluate(ref["feature"], ref["patch_index"], input_feat)
         debug_image = self._draw_debug(
-            rgb.copy(), TARGET_NAME, ref["polygon"], ref["bbox"], ref["roi_mask"], evaluation
+            rgb.copy(),
+            TARGET_NAME,
+            ref["polygon"],
+            ref["bbox"],
+            ref["roi_mask"],
+            evaluation,
         )
 
         return {
@@ -260,7 +320,11 @@ class DINOv3Estimator:
 if __name__ == "__main__":
     import sys
 
-    image_path = Path(sys.argv[1]) if len(sys.argv) > 1 else PROJECT_ROOT / "dino_test" / "hard.png"
+    image_path = (
+        Path(sys.argv[1])
+        if len(sys.argv) > 1
+        else PROJECT_ROOT / "dino_test" / "hard.png"
+    )
     image = cv2.imread(str(image_path))
     if image is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")

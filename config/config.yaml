@@ -55,3 +55,11 @@ ALIGNMENT:
   HEIGHT: 0.07    # TODO: replace with the measured size (m)
   WIDTH: 0.2    # TODO: replace with the measured size (m)
   ROI_SCALE: 1.0  # >1 enlarges the SAM2 prompt box
+
+# ==========================================================
+# RIPCORD CHECK
+# ==========================================================
+RIPCORD_CHECK:
+  ENABLED: true
+  SIM_THRESHOLD: 0.8
+  COVERAGE_THRESHOLD: 0.8
