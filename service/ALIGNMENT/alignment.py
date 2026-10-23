@@ -33,14 +33,15 @@ DINO_THRESHOLD = 0.75
 MIN_MASK_AREA = 100
 MIN_ROI_SIZE = 4
 
-
-RESOLVE_TARGET_SYMMETRY = True
-TARGET_FLIPS = (
-    ("none", np.diag([1.0, 1.0, 1.0])),
-    ("flip_x", np.diag([1.0, -1.0, -1.0])),
-    ("flip_y", np.diag([-1.0, 1.0, -1.0])),
-    ("flip_z", np.diag([-1.0, -1.0, 1.0])),
-)
+# ----------------------------------------------------------------------
+# 预测姿态的坐标系修正（固定）
+# calculate_pose 的原始输出：x 指向右，y 指向下，z 背离相机（指进表面）。
+# target 的约定：        x 指向左，y 指向下，z 朝向相机。
+# 两者相差绕物体自身 y 轴转 180°，这里对预测结果右乘该矩阵：
+#     R_pred = R_raw @ AXIS_CORRECTION
+# 之后 input_pose、TF、delta 看到的都是和 target 一致的坐标系。
+# ----------------------------------------------------------------------
+AXIS_CORRECTION = np.diag([-1.0, 1.0, -1.0])
 
 
 def normalize_quaternion(q: np.ndarray) -> np.ndarray:
@@ -148,12 +149,6 @@ def rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
         )
 
     return normalize_quaternion(q)
-
-
-def rotation_angle_between(Ra: np.ndarray, Rb: np.ndarray) -> float:
-    """Geodesic angle (rad) between two rotation matrices."""
-    cos = (np.trace(Ra @ Rb.T) - 1.0) / 2.0
-    return float(np.arccos(np.clip(cos, -1.0, 1.0)))
 
 
 class AlignmentDINO:
@@ -303,9 +298,6 @@ class AlignmentEstimator:
             self.device,
         )
         self.gt_height, self.gt_width = self.gt_image.shape[:2]
-
-        # 仅用于 debug 图显示：最近一次 delta 选用的目标翻转
-        self._last_target_flip = "none"
 
         print(f"[Alignment] GT JSON: {self.gt_json}")
         print(f"[Alignment] GT image: {self.gt_image_path}")
@@ -525,6 +517,30 @@ class AlignmentEstimator:
         )
         return None, best["sam_score"], best["dino_similarity"]
 
+    @staticmethod
+    def _apply_axis_correction(pose: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert the pose from calculate_pose's axis convention to the
+        target's convention: R_pred = R_raw @ AXIS_CORRECTION.
+
+        rotation, orientation_debug and geometry_debug are updated together
+        so the pose, the debug axes and any TF built from it stay consistent.
+        plane (raw measured plane) is left untouched.
+        """
+        R = quaternion_to_matrix(pose["rotation"]) @ AXIS_CORRECTION
+        pose["rotation"] = rotation_matrix_to_quaternion(R)
+
+        debug = pose.get("orientation_debug")
+        if debug is not None:
+            debug = dict(debug)
+            debug["rotation_matrix"] = R.tolist()
+            debug["x_axis"] = R[:, 0].tolist()
+            debug["y_axis"] = R[:, 1].tolist()
+            debug["z_axis"] = R[:, 2].tolist()
+            pose["orientation_debug"] = debug
+            pose["geometry_debug"] = debug
+
+        return pose
+
     def _calculate_input_pose(
         self,
         mask: np.ndarray,
@@ -543,32 +559,11 @@ class AlignmentEstimator:
             }
 
         pose["geometry_debug"] = pose.get("orientation_debug")
+
+        if pose.get("rotation") is not None:
+            pose = self._apply_axis_correction(pose)
+
         return pose
-
-    def _resolve_target_rotation(
-        self,
-        R_target: np.ndarray,
-        R_input: np.ndarray,
-    ) -> Tuple[str, np.ndarray]:
-        """Pick, among the target's 180-degree-symmetric equivalents, the
-        rotation closest to the detected one.
-
-        Returns (flip_name, R_target_resolved).
-        """
-        if not RESOLVE_TARGET_SYMMETRY:
-            return "none", R_target
-
-        best_name = "none"
-        best_R = R_target
-        best_angle = rotation_angle_between(R_target, R_input)
-
-        for name, S in TARGET_FLIPS[1:]:
-            candidate = R_target @ S
-            angle = rotation_angle_between(candidate, R_input)
-            if angle < best_angle - 1e-9:
-                best_name, best_R, best_angle = name, candidate, angle
-
-        return best_name, best_R
 
     def _calculate_delta(
         self,
@@ -578,10 +573,8 @@ class AlignmentEstimator:
     ) -> Dict[str, Any]:
         """T_delta = T_target @ inv(T_input), in the camera frame.
 
-        The target rotation is first resolved against the 180-degree
-        symmetries of the target rectangle (see RESOLVE_TARGET_SYMMETRY),
-        so a target whose axes use a different convention than
-        calculate_pose does not produce a spurious ~180 degree delta.
+        input_pose already uses the target's axis convention, so
+        T_delta @ T_input == T_target.
         """
         target_location = np.asarray(
             target_location,
@@ -594,18 +587,12 @@ class AlignmentEstimator:
         ).reshape(3)
         input_rotation = normalize_quaternion(input_pose["rotation"])
 
-        R_target_raw = quaternion_to_matrix(target_rotation)
-        R_input = quaternion_to_matrix(input_rotation)
-
-        flip_name, R_target = self._resolve_target_rotation(R_target_raw, R_input)
-        self._last_target_flip = flip_name
-
         T_target = np.eye(4, dtype=np.float64)
-        T_target[:3, :3] = R_target
+        T_target[:3, :3] = quaternion_to_matrix(target_rotation)
         T_target[:3, 3] = target_location
 
         T_input = np.eye(4, dtype=np.float64)
-        T_input[:3, :3] = R_input
+        T_input[:3, :3] = quaternion_to_matrix(input_rotation)
         T_input[:3, 3] = input_location
 
         T_delta = np.matmul(T_target, np.linalg.inv(T_input))
@@ -781,8 +768,6 @@ class AlignmentEstimator:
                     f"Delta RPY: {e[0]:.2f}, {e[1]:.2f}, {e[2]:.2f}",
                 ]
             )
-            if self._last_target_flip != "none":
-                lines.append(f"Target axes flipped: {self._last_target_flip}")
 
         y = 28
         for line in lines:
@@ -838,10 +823,10 @@ class AlignmentEstimator:
         input_obb = self._fit_obb(mask) if mask is not None else None
         input_pose = None
         delta = None
-        self._last_target_flip = "none"
 
         if mask is not None:
             input_pose = self._calculate_input_pose(mask, depth, K)
+
             if (
                 input_pose is not None
                 and input_pose.get("rotation") is not None
