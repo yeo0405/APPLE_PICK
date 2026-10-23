@@ -6,7 +6,6 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
-
 DEFAULT_DEPTH_SCALE = 0.001
 DEFAULT_CENTER_RADIUS = 3
 DEFAULT_PLANE_HORIZONTAL_INSET = 0.2
@@ -94,16 +93,20 @@ def get_inset_mask(
     mask: np.ndarray,
     obb: Dict[str, Any],
 ) -> np.ndarray:
-    horizontal_inset = float(np.clip(
-        DEFAULT_PLANE_HORIZONTAL_INSET,
-        0.0,
-        0.49,
-    ))
-    vertical_inset = float(np.clip(
-        DEFAULT_PLANE_VERTICAL_INSET,
-        0.0,
-        0.49,
-    ))
+    horizontal_inset = float(
+        np.clip(
+            DEFAULT_PLANE_HORIZONTAL_INSET,
+            0.0,
+            0.49,
+        )
+    )
+    vertical_inset = float(
+        np.clip(
+            DEFAULT_PLANE_VERTICAL_INSET,
+            0.0,
+            0.49,
+        )
+    )
 
     center = np.asarray(obb["center"], dtype=np.float32)
     width = float(obb["width"])
@@ -116,11 +119,13 @@ def get_inset_mask(
     if width <= 1.0 or height <= 1.0:
         return np.zeros_like(mask, dtype=bool)
 
-    box = cv2.boxPoints((
-        tuple(center),
-        (width, height),
-        angle,
-    )).astype(np.int32)
+    box = cv2.boxPoints(
+        (
+            tuple(center),
+            (width, height),
+            angle,
+        )
+    ).astype(np.int32)
 
     inset_obb_mask = np.zeros_like(mask, dtype=np.uint8)
     cv2.fillConvexPoly(inset_obb_mask, box, 1)
@@ -170,10 +175,7 @@ def fit_plane(
         DEFAULT_PLANE_MIN_DEPTH_METERS / DEFAULT_DEPTH_SCALE,
     )
 
-    depth_valid = (
-        np.abs(depth_values - depth_median)
-        <= depth_threshold
-    )
+    depth_valid = np.abs(depth_values - depth_median) <= depth_threshold
 
     xs = xs[depth_valid]
     ys = ys[depth_valid]
@@ -188,9 +190,7 @@ def fit_plane(
         xs.astype(np.int32),
     ] = True
 
-    valid_ratio = float(
-        xs.size / max(np.count_nonzero(valid), 1)
-    )
+    valid_ratio = float(xs.size / max(np.count_nonzero(valid), 1))
 
     depth_values *= DEFAULT_DEPTH_SCALE
 
@@ -227,7 +227,7 @@ def fit_plane(
         normal = -normal
 
     distances = np.abs(centered @ normal)
-    rmse = float(np.sqrt(np.mean(distances ** 2)))
+    rmse = float(np.sqrt(np.mean(distances**2)))
 
     return {
         "center": center,
@@ -307,15 +307,16 @@ def fit_orientation(
     else:
         image_axis = edge12 / len12
 
-    image_axis_3d = np.array([
-        image_axis[0],
-        image_axis[1],
-        0.0,
-    ], dtype=np.float64)
-
-    image_axis_3d -= (
-        np.dot(image_axis_3d, normal) * normal
+    image_axis_3d = np.array(
+        [
+            image_axis[0],
+            image_axis[1],
+            0.0,
+        ],
+        dtype=np.float64,
     )
+
+    image_axis_3d -= np.dot(image_axis_3d, normal) * normal
 
     axis_norm = np.linalg.norm(image_axis_3d)
 
@@ -324,15 +325,9 @@ def fit_orientation(
 
     x_axis = image_axis_3d / axis_norm
 
-    projected = (
-        points
-        - np.outer(points @ normal, normal)
-    )
+    projected = points - np.outer(points @ normal, normal)
 
-    centered = (
-        projected
-        - np.mean(projected, axis=0)
-    )
+    centered = projected - np.mean(projected, axis=0)
 
     covariance = centered.T @ centered
 
@@ -343,9 +338,7 @@ def fit_orientation(
         np.argmax(eigenvalues),
     ]
 
-    principal_axis -= (
-        np.dot(principal_axis, normal) * normal
-    )
+    principal_axis -= np.dot(principal_axis, normal) * normal
 
     principal_norm = np.linalg.norm(principal_axis)
 
@@ -375,11 +368,18 @@ def fit_orientation(
 
     x_axis /= x_norm
 
-    R = np.column_stack((
-        x_axis,
-        y_axis,
-        normal,
-    ))
+    # Flip X and Z axes (Y unchanged). Equivalent to a 180 deg rotation
+    # about Y, so det(R) stays +1 (still a valid right-handed frame).
+    x_axis = -x_axis
+    z_axis = -normal
+
+    R = np.column_stack(
+        (
+            x_axis,
+            y_axis,
+            z_axis,
+        )
+    )
 
     if not np.isfinite(R).all():
         return None
@@ -394,15 +394,9 @@ def fit_orientation(
     if np.linalg.det(R) < 0:
         return None
 
-    p1_2d = (
-        obb_center
-        - image_axis * width * 0.35
-    )
+    p1_2d = obb_center - image_axis * width * 0.35
 
-    p2_2d = (
-        obb_center
-        + image_axis * width * 0.35
-    )
+    p2_2d = obb_center + image_axis * width * 0.35
 
     p1 = pixel_to_3d(
         p1_2d[0],
@@ -426,7 +420,7 @@ def fit_orientation(
         "p2": p2.copy() if p2 is not None else None,
         "x_axis": x_axis.copy(),
         "y_axis": y_axis.copy(),
-        "z_axis": normal.copy(),
+        "z_axis": z_axis.copy(),
         "rotation_matrix": R.copy(),
         "center_radius": DEFAULT_CENTER_RADIUS,
         "plane_point_count": int(points.shape[0]),
@@ -455,34 +449,19 @@ def rotation_matrix_to_quaternion(
         qy = (R[0, 2] - R[2, 0]) / s
         qz = (R[1, 0] - R[0, 1]) / s
     elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
-        s = np.sqrt(
-            1.0
-            + R[0, 0]
-            - R[1, 1]
-            - R[2, 2]
-        ) * 2.0
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
         qw = (R[2, 1] - R[1, 2]) / s
         qx = 0.25 * s
         qy = (R[0, 1] + R[1, 0]) / s
         qz = (R[0, 2] + R[2, 0]) / s
     elif R[1, 1] > R[2, 2]:
-        s = np.sqrt(
-            1.0
-            + R[1, 1]
-            - R[0, 0]
-            - R[2, 2]
-        ) * 2.0
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
         qw = (R[0, 2] - R[2, 0]) / s
         qx = (R[0, 1] + R[1, 0]) / s
         qy = 0.25 * s
         qz = (R[1, 2] + R[2, 1]) / s
     else:
-        s = np.sqrt(
-            1.0
-            + R[2, 2]
-            - R[0, 0]
-            - R[1, 1]
-        ) * 2.0
+        s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
         qw = (R[1, 0] - R[0, 1]) / s
         qx = (R[0, 2] + R[2, 0]) / s
         qy = (R[1, 2] + R[2, 1]) / s
@@ -557,11 +536,7 @@ def calculate_pose(
 
     return {
         "location": location.tolist(),
-        "rotation": (
-            rotation.tolist()
-            if rotation is not None
-            else None
-        ),
+        "rotation": (rotation.tolist() if rotation is not None else None),
         "obb": obb,
         "plane": plane,
         "orientation_debug": orientation_debug,

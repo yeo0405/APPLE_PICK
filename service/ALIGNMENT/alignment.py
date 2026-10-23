@@ -28,20 +28,27 @@ SAM2_CONFIG = MODEL_DIR / "sam2.1_hiera_s.yaml"
 SAM2_CHECKPOINT = MODEL_DIR / "sam2.1_hiera_small.pt"
 DINO_WEIGHTS = MODEL_DIR / "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
 
-IMAGE_SIZE = 224
-DINO_THRESHOLD = 0.75
+# ---- DINO patch-level filtering ----
+PATCH_SIZE = 16
+ROI_LONG_SIDE = (
+    448  # ROI / GT crop is resized so its long side is ~this (multiple of 16)
+)
+GT_CROP_MARGIN = 0.1  # margin around GT mask bbox, similar to the inference ROI
+GT_PATCH_COVERAGE = 0.9  # GT patches with >= this mask coverage build the prototype
+PATCH_SIM_THRESHOLD = 0.65  # cosine(patch token, GT prototype); tune on your data
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
 MIN_MASK_AREA = 100
 MIN_ROI_SIZE = 4
 
-# ----------------------------------------------------------------------
-# 预测姿态的坐标系修正（固定）
-# calculate_pose 的原始输出：x 指向右，y 指向下，z 背离相机（指进表面）。
-# target 的约定：        x 指向左，y 指向下，z 朝向相机。
-# 两者相差绕物体自身 y 轴转 180°，这里对预测结果右乘该矩阵：
-#     R_pred = R_raw @ AXIS_CORRECTION
-# 之后 input_pose、TF、delta 看到的都是和 target 一致的坐标系。
-# ----------------------------------------------------------------------
-AXIS_CORRECTION = np.diag([-1.0, 1.0, -1.0])
+RESOLVE_TARGET_SYMMETRY = True
+TARGET_FLIPS = (
+    ("none", np.diag([1.0, 1.0, 1.0])),
+    ("flip_x", np.diag([1.0, -1.0, -1.0])),
+    ("flip_y", np.diag([-1.0, 1.0, -1.0])),
+    ("flip_z", np.diag([-1.0, -1.0, 1.0])),
+)
 
 
 def normalize_quaternion(q: np.ndarray) -> np.ndarray:
@@ -151,7 +158,20 @@ def rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
     return normalize_quaternion(q)
 
 
+def rotation_angle_between(Ra: np.ndarray, Rb: np.ndarray) -> float:
+    """Geodesic angle (rad) between two rotation matrices."""
+    cos = (np.trace(Ra @ Rb.T) - 1.0) / 2.0
+    return float(np.arccos(np.clip(cos, -1.0, 1.0)))
+
+
 class AlignmentDINO:
+    """Patch-level DINOv3 similarity against a GT object prototype.
+
+    The prototype is the mean patch token of the patches that lie inside the GT mask.
+    At inference, every patch of the ROI crop is compared with the prototype, giving a
+    per-pixel similarity map that is later intersected with the SAM2 mask.
+    """
+
     def __init__(
         self,
         gt_image: np.ndarray,
@@ -160,7 +180,7 @@ class AlignmentDINO:
     ):
         self.device = device
         self.dino = self._load_dino()
-        self.gt_feature = self._extract_feature(gt_image, gt_mask)
+        self.prototype = self._build_prototype(gt_image, gt_mask)
 
     def _load_dino(self):
         if not DINO_WEIGHTS.is_file():
@@ -181,71 +201,89 @@ class AlignmentDINO:
         return model
 
     @staticmethod
-    def _crop_mask(
-        image: np.ndarray,
-        mask: np.ndarray,
-    ) -> np.ndarray:
-        if image is None or image.ndim != 3 or image.shape[2] != 3:
+    def _resized_shape(h: int, w: int) -> Tuple[int, int]:
+        """Keep aspect ratio, long side ~ROI_LONG_SIDE, both sides multiples of PATCH_SIZE."""
+        scale = ROI_LONG_SIDE / float(max(h, w))
+        new_h = max(PATCH_SIZE, int(round(h * scale / PATCH_SIZE)) * PATCH_SIZE)
+        new_w = max(PATCH_SIZE, int(round(w * scale / PATCH_SIZE)) * PATCH_SIZE)
+        return new_h, new_w
+
+    def _patch_tokens(self, bgr: np.ndarray) -> torch.Tensor:
+        """Return L2-normalised patch tokens with shape [gh, gw, C]."""
+        if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:
             raise ValueError("Image must have shape HxWx3")
 
-        mask = np.asarray(mask)
-        if mask.ndim != 2:
-            raise ValueError("Mask must be single-channel")
+        h, w = bgr.shape[:2]
+        new_h, new_w = self._resized_shape(h, w)
 
-        if mask.shape != image.shape[:2]:
-            mask = cv2.resize(
-                mask.astype(np.uint8),
-                (image.shape[1], image.shape[0]),
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        tensor = torch.from_numpy(rgb).permute(2, 0, 1).float().div(255.0)
+        mean = torch.tensor(IMAGENET_MEAN).view(3, 1, 1)
+        std = torch.tensor(IMAGENET_STD).view(3, 1, 1)
+        tensor = ((tensor - mean) / std).unsqueeze(0).to(self.device)
+
+        gh, gw = new_h // PATCH_SIZE, new_w // PATCH_SIZE
+
+        with torch.inference_mode():
+            tokens = self.dino.forward_features(tensor)["x_norm_patchtokens"][0]
+
+        tokens = tokens.reshape(gh, gw, -1)
+        return F.normalize(tokens, dim=-1)
+
+    def _build_prototype(
+        self, gt_image: np.ndarray, gt_mask: np.ndarray
+    ) -> torch.Tensor:
+        if gt_mask.shape != gt_image.shape[:2]:
+            gt_mask = cv2.resize(
+                gt_mask.astype(np.uint8),
+                (gt_image.shape[1], gt_image.shape[0]),
                 interpolation=cv2.INTER_NEAREST,
             )
 
-        binary = mask > 0
+        binary = gt_mask > 0
         ys, xs = np.where(binary)
         if len(xs) == 0:
-            raise ValueError("Mask is empty")
+            raise ValueError("GT mask is empty")
 
+        H, W = gt_image.shape[:2]
         x1, x2 = int(xs.min()), int(xs.max()) + 1
         y1, y2 = int(ys.min()), int(ys.max()) + 1
-        crop = image[y1:y2, x1:x2].copy()
-        crop_mask = binary[y1:y2, x1:x2]
-        crop[~crop_mask] = 0
-        return crop
+        mx = int(round((x2 - x1) * GT_CROP_MARGIN))
+        my = int(round((y2 - y1) * GT_CROP_MARGIN))
+        x1, x2 = max(0, x1 - mx), min(W, x2 + mx)
+        y1, y2 = max(0, y1 - my), min(H, y2 + my)
 
-    def _extract_feature(
-        self,
-        image: np.ndarray,
-        mask: np.ndarray,
-    ) -> torch.Tensor:
-        crop = self._crop_mask(image, mask)
-        crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        crop = cv2.resize(
-            crop,
-            (IMAGE_SIZE, IMAGE_SIZE),
-            interpolation=cv2.INTER_AREA,
+        crop = gt_image[y1:y2, x1:x2]
+        crop_mask = binary[y1:y2, x1:x2].astype(np.float32)
+
+        tokens = self._patch_tokens(crop)
+        gh, gw = tokens.shape[:2]
+
+        coverage = cv2.resize(crop_mask, (gw, gh), interpolation=cv2.INTER_AREA)
+        selected = coverage >= GT_PATCH_COVERAGE
+        if not selected.any():
+            selected = coverage >= 0.5
+        if not selected.any():
+            raise ValueError("No GT patch lies inside the GT mask")
+
+        selected_t = torch.from_numpy(selected).to(tokens.device)
+        prototype = F.normalize(tokens[selected_t].mean(dim=0), dim=0)
+
+        print(f"[DINOv3] GT prototype from {int(selected.sum())} patch(es)")
+        return prototype
+
+    def similarity_map(self, crop_bgr: np.ndarray) -> np.ndarray:
+        """Per-pixel cosine similarity to the GT prototype, same size as crop_bgr."""
+        tokens = self._patch_tokens(crop_bgr)
+        sim = (tokens @ self.prototype).clamp(-1.0, 1.0)
+        sim = sim.float().cpu().numpy()
+
+        h, w = crop_bgr.shape[:2]
+        return cv2.resize(sim, (w, h), interpolation=cv2.INTER_LINEAR).astype(
+            np.float32
         )
-
-        tensor = (
-            torch.from_numpy(crop)
-            .permute(2, 0, 1)
-            .float()
-            .div(255.0)
-            .unsqueeze(0)
-            .to(self.device)
-        )
-
-        with torch.inference_mode():
-            features = self.dino.forward_features(tensor)["x_norm_patchtokens"][0]
-            feature = F.normalize(features.mean(dim=0), dim=0)
-
-        return feature
-
-    def similarity(
-        self,
-        image: np.ndarray,
-        mask: np.ndarray,
-    ) -> float:
-        feature = self._extract_feature(image, mask)
-        return float(torch.dot(feature, self.gt_feature).clamp(-1.0, 1.0).item())
 
 
 class AlignmentEstimator:
@@ -298,6 +336,9 @@ class AlignmentEstimator:
             self.device,
         )
         self.gt_height, self.gt_width = self.gt_image.shape[:2]
+
+        self._last_target_flip = "none"
+        self._last_debug: Dict[str, Any] = {}
 
         print(f"[Alignment] GT JSON: {self.gt_json}")
         print(f"[Alignment] GT image: {self.gt_image_path}")
@@ -435,11 +476,73 @@ class AlignmentEstimator:
         box = np.array([x1, y1, x2, y2], dtype=np.float32)
         return polygon.astype(np.int32), box
 
+    @staticmethod
+    def _clean_object_mask(mask: np.ndarray) -> Optional[np.ndarray]:
+        if mask is None:
+            return None
+
+        mask = np.asarray(mask)
+        if mask.ndim != 2:
+            raise ValueError("Mask must be single-channel")
+
+        binary = (mask > 0).astype(np.uint8)
+
+        if np.count_nonzero(binary) == 0:
+            return None
+
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+        if np.count_nonzero(binary) == 0:
+            return None
+
+        return (binary > 0).astype(np.uint8) * 255
+
+    @staticmethod
+    def _largest_component(binary: np.ndarray) -> Optional[np.ndarray]:
+        """Keep only the largest 8-connected component of a binary mask."""
+        binary = (np.asarray(binary) > 0).astype(np.uint8)
+        if np.count_nonzero(binary) == 0:
+            return None
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
+        if num_labels <= 1:
+            return None
+
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        best = int(np.argmax(areas)) + 1
+        return (labels == best).astype(np.uint8) * 255
+
+    def _roi_similarity(self, image: np.ndarray, box: np.ndarray) -> np.ndarray:
+        """Full-image similarity map; pixels outside the ROI are -1."""
+        h, w = image.shape[:2]
+        x1, y1, x2, y2 = [int(v) for v in np.round(box)]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+
+        sim_full = np.full((h, w), -1.0, dtype=np.float32)
+        if x2 - x1 < MIN_ROI_SIZE or y2 - y1 < MIN_ROI_SIZE:
+            return sim_full
+
+        crop = image[y1:y2, x1:x2]
+        sim_full[y1:y2, x1:x2] = self.dino.similarity_map(crop)
+        return sim_full
+
     def _predict_mask(
         self,
         image: np.ndarray,
         box: np.ndarray,
     ) -> Tuple[Optional[np.ndarray], float, float]:
+        """
+        1) SAM2 gives candidate masks from the ROI box (object + attached background).
+        2) DINO scores every patch of the ROI against the GT prototype -> similarity map.
+        3) Each candidate is intersected with (similarity >= threshold).
+        4) Only the largest connected component of the intersection is kept.
+        5) The candidate with the largest remaining component wins.
+        """
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         self.predictor.set_image(rgb)
 
@@ -465,24 +568,49 @@ class AlignmentEstimator:
             return None, 0.0, 0.0
 
         scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+
+        sim_map = self._roi_similarity(image, box)
+        dino_region = sim_map >= PATCH_SIM_THRESHOLD
+
+        self._last_debug = {
+            "sim_map": sim_map,
+            "sam_raw": None,
+        }
+
         candidates = []
 
         for i, candidate in enumerate(masks):
-            mask = (candidate > 0).astype(np.uint8) * 255
-            area = int(np.count_nonzero(mask))
-            if area < MIN_MASK_AREA:
-                continue
+            raw_mask = (candidate > 0).astype(np.uint8) * 255
 
             try:
-                similarity = self.dino.similarity(image, mask)
+                raw_mask = self._clean_object_mask(raw_mask)
             except ValueError:
                 continue
 
+            if raw_mask is None:
+                continue
+
+            overlap = ((raw_mask > 0) & dino_region).astype(np.uint8) * 255
+            overlap = self._clean_object_mask(overlap)
+            if overlap is None:
+                continue
+
+            final = self._largest_component(overlap)
+            if final is None:
+                continue
+
+            area = int(np.count_nonzero(final))
+            if area < MIN_MASK_AREA:
+                continue
+
+            mean_sim = float(sim_map[final > 0].mean())
+
             candidates.append(
                 {
-                    "mask": mask,
+                    "raw": raw_mask,
+                    "mask": final,
                     "sam_score": float(scores[i]),
-                    "dino_similarity": similarity,
+                    "dino_similarity": mean_sim,
                     "area": area,
                 }
             )
@@ -490,56 +618,18 @@ class AlignmentEstimator:
         if not candidates:
             return None, 0.0, 0.0
 
-        accepted = [
-            item for item in candidates if item["dino_similarity"] >= DINO_THRESHOLD
-        ]
-
-        if accepted:
-            best = max(
-                accepted,
-                key=lambda item: (
-                    item["sam_score"],
-                    item["dino_similarity"],
-                ),
-            )
-            return (
-                best["mask"],
-                best["sam_score"],
-                best["dino_similarity"],
-            )
-
         best = max(
             candidates,
-            key=lambda item: (
-                item["dino_similarity"],
-                item["sam_score"],
-            ),
+            key=lambda item: (item["area"], item["sam_score"]),
         )
-        return None, best["sam_score"], best["dino_similarity"]
 
-    @staticmethod
-    def _apply_axis_correction(pose: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert the pose from calculate_pose's axis convention to the
-        target's convention: R_pred = R_raw @ AXIS_CORRECTION.
+        self._last_debug["sam_raw"] = best["raw"]
 
-        rotation, orientation_debug and geometry_debug are updated together
-        so the pose, the debug axes and any TF built from it stay consistent.
-        plane (raw measured plane) is left untouched.
-        """
-        R = quaternion_to_matrix(pose["rotation"]) @ AXIS_CORRECTION
-        pose["rotation"] = rotation_matrix_to_quaternion(R)
-
-        debug = pose.get("orientation_debug")
-        if debug is not None:
-            debug = dict(debug)
-            debug["rotation_matrix"] = R.tolist()
-            debug["x_axis"] = R[:, 0].tolist()
-            debug["y_axis"] = R[:, 1].tolist()
-            debug["z_axis"] = R[:, 2].tolist()
-            pose["orientation_debug"] = debug
-            pose["geometry_debug"] = debug
-
-        return pose
+        return (
+            best["mask"],
+            best["sam_score"],
+            best["dino_similarity"],
+        )
 
     def _calculate_input_pose(
         self,
@@ -559,11 +649,27 @@ class AlignmentEstimator:
             }
 
         pose["geometry_debug"] = pose.get("orientation_debug")
-
-        if pose.get("rotation") is not None:
-            pose = self._apply_axis_correction(pose)
-
         return pose
+
+    def _resolve_target_rotation(
+        self,
+        R_target: np.ndarray,
+        R_input: np.ndarray,
+    ) -> Tuple[str, np.ndarray]:
+        if not RESOLVE_TARGET_SYMMETRY:
+            return "none", R_target
+
+        best_name = "none"
+        best_R = R_target
+        best_angle = rotation_angle_between(R_target, R_input)
+
+        for name, S in TARGET_FLIPS[1:]:
+            candidate = R_target @ S
+            angle = rotation_angle_between(candidate, R_input)
+            if angle < best_angle - 1e-9:
+                best_name, best_R, best_angle = name, candidate, angle
+
+        return best_name, best_R
 
     def _calculate_delta(
         self,
@@ -571,28 +677,23 @@ class AlignmentEstimator:
         target_rotation: np.ndarray,
         input_pose: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """T_delta = T_target @ inv(T_input), in the camera frame.
-
-        input_pose already uses the target's axis convention, so
-        T_delta @ T_input == T_target.
-        """
-        target_location = np.asarray(
-            target_location,
-            dtype=np.float64,
-        ).reshape(3)
+        target_location = np.asarray(target_location, dtype=np.float64).reshape(3)
         target_rotation = normalize_quaternion(target_rotation)
-        input_location = np.asarray(
-            input_pose["location"],
-            dtype=np.float64,
-        ).reshape(3)
+        input_location = np.asarray(input_pose["location"], dtype=np.float64).reshape(3)
         input_rotation = normalize_quaternion(input_pose["rotation"])
 
+        R_target_raw = quaternion_to_matrix(target_rotation)
+        R_input = quaternion_to_matrix(input_rotation)
+
+        flip_name, R_target = self._resolve_target_rotation(R_target_raw, R_input)
+        self._last_target_flip = flip_name
+
         T_target = np.eye(4, dtype=np.float64)
-        T_target[:3, :3] = quaternion_to_matrix(target_rotation)
+        T_target[:3, :3] = R_target
         T_target[:3, 3] = target_location
 
         T_input = np.eye(4, dtype=np.float64)
-        T_input[:3, :3] = quaternion_to_matrix(input_rotation)
+        T_input[:3, :3] = R_input
         T_input[:3, 3] = input_location
 
         T_delta = np.matmul(T_target, np.linalg.inv(T_input))
@@ -696,7 +797,6 @@ class AlignmentEstimator:
         image: np.ndarray,
         polygon: np.ndarray,
         box: np.ndarray,
-        mask: Optional[np.ndarray],
         result: Dict[str, Any],
         K: np.ndarray,
     ) -> np.ndarray:
@@ -719,39 +819,92 @@ class AlignmentEstimator:
             2,
         )
 
-        if mask is not None:
-            overlay = debug.copy()
-            overlay[mask > 0] = (0, 255, 0)
-            debug = cv2.addWeighted(debug, 0.7, overlay, 0.3, 0.0)
-
-            obb = result.get("input_obb")
-            if obb is not None:
-                rect = (
-                    obb["center"],
-                    (obb["width"], obb["height"]),
-                    obb["angle_deg"],
-                )
-                corners = cv2.boxPoints(rect).astype(np.int32)
-                cv2.polylines(
-                    debug,
-                    [corners],
-                    True,
-                    (0, 0, 255),
-                    2,
-                )
-
-        input_pose = result.get("input_pose")
-        if input_pose is not None:
-            self._draw_axes(
-                debug,
-                K,
-                np.asarray(input_pose["location"]),
-                np.asarray(input_pose["rotation"]),
+        # 1) Show raw SAM2 mask contour (before DINO filtering), magenta
+        sam_raw = self._last_debug.get("sam_raw")
+        if sam_raw is not None and sam_raw.shape[:2] == debug.shape[:2]:
+            contours, _ = cv2.findContours(
+                (sam_raw > 0).astype(np.uint8),
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE,
             )
+            cv2.drawContours(debug, contours, -1, (255, 0, 255), 1)
+
+        # 2) Show actual pose-computing mask: plane_mask
+        input_pose = result.get("input_pose")
+        plane = input_pose.get("plane") if input_pose is not None else None
+        plane_mask = plane.get("plane_mask") if plane is not None else None
+
+        if plane_mask is not None:
+            plane_mask = np.asarray(plane_mask, dtype=bool)
+            if plane_mask.shape[:2] == debug.shape[:2]:
+                overlay = debug.copy()
+                overlay[plane_mask] = (0, 255, 0)
+                debug = cv2.addWeighted(debug, 0.7, overlay, 0.3, 0.0)
+
+                cv2.putText(
+                    debug,
+                    f"Pose Plane Mask: {np.count_nonzero(plane_mask)} px",
+                    (15, 124),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+        # 3) fallback: if plane_mask missing, show final DINO-cleaned mask
+        if plane_mask is None:
+            dino_mask = result.get("dino_mask")
+            if dino_mask is not None:
+                dino_mask = np.asarray(dino_mask, dtype=bool)
+                if dino_mask.shape[:2] == debug.shape[:2]:
+                    overlay = debug.copy()
+                    overlay[dino_mask] = (0, 255, 0)
+                    debug = cv2.addWeighted(debug, 0.7, overlay, 0.3, 0.0)
+
+                    cv2.putText(
+                        debug,
+                        f"Final Mask: {np.count_nonzero(dino_mask)} px",
+                        (15, 124),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.58,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
+
+        obb = result.get("input_obb")
+        if obb is not None:
+            rect = (
+                obb["center"],
+                (obb["width"], obb["height"]),
+                obb["angle_deg"],
+            )
+            corners = cv2.boxPoints(rect).astype(np.int32)
+            cv2.polylines(
+                debug,
+                [corners],
+                True,
+                (0, 0, 255),
+                2,
+            )
+
+        if input_pose is not None:
+            location = input_pose.get("location")
+            rotation = input_pose.get("rotation")
+
+            if location is not None and rotation is not None:
+                self._draw_axes(
+                    debug,
+                    K,
+                    np.asarray(location),
+                    np.asarray(rotation),
+                )
 
         lines = [
             f"SAM2: {result.get('sam_score', 0.0):.3f}",
-            f"DINO similarity: {result.get('dino_similarity', 0.0):.3f}",
+            f"DINO patch sim (mean): {result.get('dino_similarity', 0.0):.3f} "
+            f"(thr {PATCH_SIM_THRESHOLD:.2f})",
             f"Present: {result.get('present', False)}",
         ]
 
@@ -768,6 +921,8 @@ class AlignmentEstimator:
                     f"Delta RPY: {e[0]:.2f}, {e[1]:.2f}, {e[2]:.2f}",
                 ]
             )
+            if self._last_target_flip != "none":
+                lines.append(f"Target axes flipped: {self._last_target_flip}")
 
         y = 28
         for line in lines:
@@ -812,6 +967,7 @@ class AlignmentEstimator:
         if not np.all(np.isfinite(location)):
             raise ValueError("location contains non-finite values")
 
+        # ROI is generated from target pose, then used as SAM2 prompt
         polygon, box = self._roi_from_target(
             image.shape,
             K,
@@ -819,14 +975,17 @@ class AlignmentEstimator:
             rotation,
         )
 
+        self._last_debug = {}
         mask, sam_score, dino_similarity = self._predict_mask(image, box)
+
+        dino_mask = mask.copy() if mask is not None else None
         input_obb = self._fit_obb(mask) if mask is not None else None
         input_pose = None
         delta = None
+        self._last_target_flip = "none"
 
         if mask is not None:
             input_pose = self._calculate_input_pose(mask, depth, K)
-
             if (
                 input_pose is not None
                 and input_pose.get("rotation") is not None
@@ -841,6 +1000,7 @@ class AlignmentEstimator:
         result = {
             "present": mask is not None and input_obb is not None,
             "mask": mask,
+            "dino_mask": dino_mask,
             "bbox": box,
             "roi_polygon": polygon,
             "sam_score": float(sam_score),
@@ -858,7 +1018,6 @@ class AlignmentEstimator:
             image,
             polygon,
             box,
-            mask,
             result,
             K,
         )

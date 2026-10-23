@@ -67,6 +67,7 @@ def make_json_safe(value, key=None):
     excluded = {
         "debug_image",
         "mask",
+        "dino_mask",
         "obb_mask",
         "plane_mask",
         "points",
@@ -361,7 +362,7 @@ def process_image(
     print(f"         SAM mask area={mask_area}")
     print("-" * 60)
 
-    print_pose("GT", result.get("gt_pose"))
+    print_pose("TARGET", result.get("target_pose"))
     print("-" * 60)
     print_pose("INPUT", input_pose)
     print_geometry_debug(input_pose)
