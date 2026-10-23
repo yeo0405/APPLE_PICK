@@ -30,17 +30,18 @@ DINO_WEIGHTS = MODEL_DIR / "dinov3_vits16_pretrain_lvd1689m-08c60483.pth"
 
 # ---- DINO patch-level filtering ----
 PATCH_SIZE = 16
-ROI_LONG_SIDE = (
-    448  # ROI / GT crop is resized so its long side is ~this (multiple of 16)
-)
-GT_CROP_MARGIN = 0.1  # margin around GT mask bbox, similar to the inference ROI
-GT_PATCH_COVERAGE = 0.9  # GT patches with >= this mask coverage build the prototype
-PATCH_SIM_THRESHOLD = 0.65  # cosine(patch token, GT prototype); tune on your data
+ROI_LONG_SIDE = 448
+GT_CROP_MARGIN = 0.1
+GT_PATCH_COVERAGE = 0.9
+PATCH_SIM_THRESHOLD = 0.8
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 MIN_MASK_AREA = 100
 MIN_ROI_SIZE = 4
+
+
+DEBUG_MASK_MODE = "dino"  # "none" | "sam_raw" | "dino" | "plane"
 
 RESOLVE_TARGET_SYMMETRY = True
 TARGET_FLIPS = (
@@ -165,12 +166,7 @@ def rotation_angle_between(Ra: np.ndarray, Rb: np.ndarray) -> float:
 
 
 class AlignmentDINO:
-    """Patch-level DINOv3 similarity against a GT object prototype.
-
-    The prototype is the mean patch token of the patches that lie inside the GT mask.
-    At inference, every patch of the ROI crop is compared with the prototype, giving a
-    per-pixel similarity map that is later intersected with the SAM2 mask.
-    """
+    """Patch-level DINOv3 similarity against a GT object prototype."""
 
     def __init__(
         self,
@@ -202,14 +198,12 @@ class AlignmentDINO:
 
     @staticmethod
     def _resized_shape(h: int, w: int) -> Tuple[int, int]:
-        """Keep aspect ratio, long side ~ROI_LONG_SIDE, both sides multiples of PATCH_SIZE."""
         scale = ROI_LONG_SIDE / float(max(h, w))
         new_h = max(PATCH_SIZE, int(round(h * scale / PATCH_SIZE)) * PATCH_SIZE)
         new_w = max(PATCH_SIZE, int(round(w * scale / PATCH_SIZE)) * PATCH_SIZE)
         return new_h, new_w
 
     def _patch_tokens(self, bgr: np.ndarray) -> torch.Tensor:
-        """Return L2-normalised patch tokens with shape [gh, gw, C]."""
         if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:
             raise ValueError("Image must have shape HxWx3")
 
@@ -275,7 +269,6 @@ class AlignmentDINO:
         return prototype
 
     def similarity_map(self, crop_bgr: np.ndarray) -> np.ndarray:
-        """Per-pixel cosine similarity to the GT prototype, same size as crop_bgr."""
         tokens = self._patch_tokens(crop_bgr)
         sim = (tokens @ self.prototype).clamp(-1.0, 1.0)
         sim = sim.float().cpu().numpy()
@@ -501,7 +494,6 @@ class AlignmentEstimator:
 
     @staticmethod
     def _largest_component(binary: np.ndarray) -> Optional[np.ndarray]:
-        """Keep only the largest 8-connected component of a binary mask."""
         binary = (np.asarray(binary) > 0).astype(np.uint8)
         if np.count_nonzero(binary) == 0:
             return None
@@ -517,7 +509,6 @@ class AlignmentEstimator:
         return (labels == best).astype(np.uint8) * 255
 
     def _roi_similarity(self, image: np.ndarray, box: np.ndarray) -> np.ndarray:
-        """Full-image similarity map; pixels outside the ROI are -1."""
         h, w = image.shape[:2]
         x1, y1, x2, y2 = [int(v) for v in np.round(box)]
         x1, y1 = max(0, x1), max(0, y1)
@@ -536,13 +527,6 @@ class AlignmentEstimator:
         image: np.ndarray,
         box: np.ndarray,
     ) -> Tuple[Optional[np.ndarray], float, float]:
-        """
-        1) SAM2 gives candidate masks from the ROI box (object + attached background).
-        2) DINO scores every patch of the ROI against the GT prototype -> similarity map.
-        3) Each candidate is intersected with (similarity >= threshold).
-        4) Only the largest connected component of the intersection is kept.
-        5) The candidate with the largest remaining component wins.
-        """
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         self.predictor.set_image(rgb)
 
@@ -792,6 +776,41 @@ class AlignmentEstimator:
             cv2.LINE_AA,
         )
 
+    def _get_display_mask(
+        self, result: Dict[str, Any]
+    ) -> Tuple[Optional[np.ndarray], str]:
+        """
+        Decide which mask to show in debug image.
+        If selected mode is invalid or mask missing, return (None, "")
+        """
+        mode = str(DEBUG_MASK_MODE).lower()
+
+        if mode == "none":
+            return None, ""
+
+        if mode == "sam_raw":
+            mask = self._last_debug.get("sam_raw")
+            return (
+                mask.astype(np.uint8) * 255 if mask is not None else None
+            ), "SAM Raw"
+
+        if mode == "dino":
+            mask = result.get("dino_mask")
+            return (mask.astype(np.uint8) if mask is not None else None), "DINO"
+
+        if mode == "plane":
+            input_pose = result.get("input_pose")
+            plane = input_pose.get("plane") if input_pose is not None else None
+            if plane is not None:
+                mask = plane.get("plane_mask")
+                if mask is not None:
+                    return (np.asarray(mask, dtype=np.uint8)), "Plane"
+            # fallback to dino when plane mask doesn't exist
+            mask = result.get("dino_mask")
+            return (mask.astype(np.uint8) if mask is not None else None), "DINO"
+
+        return None, ""
+
     def _draw_debug(
         self,
         image: np.ndarray,
@@ -819,7 +838,7 @@ class AlignmentEstimator:
             2,
         )
 
-        # 1) Show raw SAM2 mask contour (before DINO filtering), magenta
+        # Raw SAM2 mask contour (magenta) is always drawn if available
         sam_raw = self._last_debug.get("sam_raw")
         if sam_raw is not None and sam_raw.shape[:2] == debug.shape[:2]:
             contours, _ = cv2.findContours(
@@ -829,49 +848,15 @@ class AlignmentEstimator:
             )
             cv2.drawContours(debug, contours, -1, (255, 0, 255), 1)
 
-        # 2) Show actual pose-computing mask: plane_mask
-        input_pose = result.get("input_pose")
-        plane = input_pose.get("plane") if input_pose is not None else None
-        plane_mask = plane.get("plane_mask") if plane is not None else None
+        # Decide display mask according to DEBUG_MASK_MODE
+        display_mask, display_name = self._get_display_mask(result)
 
-        if plane_mask is not None:
-            plane_mask = np.asarray(plane_mask, dtype=bool)
-            if plane_mask.shape[:2] == debug.shape[:2]:
+        if display_mask is not None:
+            display_mask = np.asarray(display_mask, dtype=bool)
+            if display_mask.shape[:2] == debug.shape[:2]:
                 overlay = debug.copy()
-                overlay[plane_mask] = (0, 255, 0)
+                overlay[display_mask] = (0, 255, 0)
                 debug = cv2.addWeighted(debug, 0.7, overlay, 0.3, 0.0)
-
-                cv2.putText(
-                    debug,
-                    f"Pose Plane Mask: {np.count_nonzero(plane_mask)} px",
-                    (15, 124),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.58,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-        # 3) fallback: if plane_mask missing, show final DINO-cleaned mask
-        if plane_mask is None:
-            dino_mask = result.get("dino_mask")
-            if dino_mask is not None:
-                dino_mask = np.asarray(dino_mask, dtype=bool)
-                if dino_mask.shape[:2] == debug.shape[:2]:
-                    overlay = debug.copy()
-                    overlay[dino_mask] = (0, 255, 0)
-                    debug = cv2.addWeighted(debug, 0.7, overlay, 0.3, 0.0)
-
-                    cv2.putText(
-                        debug,
-                        f"Final Mask: {np.count_nonzero(dino_mask)} px",
-                        (15, 124),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.58,
-                        (0, 255, 0),
-                        2,
-                        cv2.LINE_AA,
-                    )
 
         obb = result.get("input_obb")
         if obb is not None:
@@ -889,6 +874,7 @@ class AlignmentEstimator:
                 2,
             )
 
+        input_pose = result.get("input_pose")
         if input_pose is not None:
             location = input_pose.get("location")
             rotation = input_pose.get("rotation")
@@ -932,7 +918,17 @@ class AlignmentEstimator:
                 (15, y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.58,
-                (0, 255, 255),
+                (0, 0, 0),
+                5,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                debug,
+                line,
+                (15, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.58,
+                (255, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
@@ -967,7 +963,6 @@ class AlignmentEstimator:
         if not np.all(np.isfinite(location)):
             raise ValueError("location contains non-finite values")
 
-        # ROI is generated from target pose, then used as SAM2 prompt
         polygon, box = self._roi_from_target(
             image.shape,
             K,
