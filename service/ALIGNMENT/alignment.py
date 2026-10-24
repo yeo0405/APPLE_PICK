@@ -618,10 +618,19 @@ class AlignmentEstimator:
     def _calculate_input_pose(
         self,
         mask: np.ndarray,
-        depth: np.ndarray,
         K: np.ndarray,
+        target_location: np.ndarray,
+        target_rotation: np.ndarray,
     ) -> Optional[Dict[str, Any]]:
-        pose = calculate_pose(mask, depth, K)
+        """
+        不使用深度图。目标 pose 定义物件所在平面：
+        过 target_location，法向量为目标旋转矩阵的第三列 (局部 Z 轴)。
+        mask 像素沿相机射线投影到该平面上，得到输入 pose。
+        """
+        R_target = quaternion_to_matrix(target_rotation)
+        plane_normal = R_target[:, 2]
+
+        pose = calculate_pose(mask, K, target_location, plane_normal)
         if pose is None:
             return None
 
@@ -939,20 +948,14 @@ class AlignmentEstimator:
     def predict(
         self,
         image: np.ndarray,
-        depth: np.ndarray,
+        depth: Optional[np.ndarray],
         K: np.ndarray,
         location: np.ndarray,
         rotation: np.ndarray,
     ) -> Dict[str, Any]:
+        # depth 仅为保持接口不变而保留，不再参与计算 (可传 None)。
         if image is None or image.ndim != 3 or image.shape[2] != 3:
             raise ValueError("image must have shape HxWx3")
-        if depth is None or depth.ndim != 2:
-            raise ValueError("depth must be a single-channel image")
-        if image.shape[:2] != depth.shape[:2]:
-            raise ValueError(
-                f"Input RGB/depth resolution mismatch: "
-                f"{image.shape[:2]} vs {depth.shape[:2]}"
-            )
 
         K = np.asarray(K, dtype=np.float64).reshape(3, 3)
         location = np.asarray(location, dtype=np.float64).reshape(3)
@@ -980,7 +983,12 @@ class AlignmentEstimator:
         self._last_target_flip = "none"
 
         if mask is not None:
-            input_pose = self._calculate_input_pose(mask, depth, K)
+            input_pose = self._calculate_input_pose(
+                mask,
+                K,
+                location,
+                rotation,
+            )
             if (
                 input_pose is not None
                 and input_pose.get("rotation") is not None
