@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import cv2
 import numpy as np
@@ -18,17 +18,21 @@ GT_PATH = PROJECT_ROOT / "service" / "RIPCORD_CHECK" / "GT" / "gt.json"
 TARGET_NAME = "ripcord"
 
 IMAGE_SIZE = 224
-PATCH_GRID = 14
+PATCH_SIZE = 16  # vits16
+PATCH_GRID = IMAGE_SIZE // PATCH_SIZE  # 14, 参考侧网格
 MASK_THRESHOLD = 0.25
 
 SIM_THRESHOLD = 0.8
 COVERAGE_THRESHOLD = 0.8
 
+SEARCH_MARGIN_RATIO = 0.3
+KEEP_SCALE = True
+MAX_SEARCH_GRID = 32
 PREPROCESS_MODE = "retinex"  # none | clahe | retinex | chroma
 RETINEX_SIGMA_RATIO = 0.08
 IMAGENET_NORM = False
 
-USE_GT_MASK = True  # True: 用 gt.json 里的 SAM2 mask;False: 用 polygon
+USE_GT_MASK = True
 MASK_ERODE_PX = 0
 
 PRESENT_LABEL = "PRESENT"
@@ -37,6 +41,7 @@ ABSENT_LABEL = "ABSENT"
 PRESENT_COLOR = (0, 255, 0)
 ABSENT_COLOR = (0, 0, 255)
 PATCH_COLOR = (255, 255, 0)
+SEARCH_COLOR = (255, 128, 0)
 
 MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -95,17 +100,19 @@ class DINOv3Estimator:
             patch_index = torch.from_numpy(np.flatnonzero(patch_mask.reshape(-1))).to(
                 self.device
             )
+            ref_feat, _ = self._extract_features(gt_roi)
             self.reference[name] = {
                 "polygon": polygon.tolist(),
                 "bbox": bbox,
                 "roi_mask": roi_mask,
                 "patch_index": patch_index,
-                "feature": self._extract_features(gt_roi)[patch_index],
+                "feature": ref_feat[patch_index],
             }
 
         if TARGET_NAME not in self.reference:
             raise KeyError(f"GT object '{TARGET_NAME}' not found in: {GT_PATH}")
 
+    # ------------------------------------------------------------------ mask
     def _load_roi_mask(
         self, obj: Dict[str, Any], polygon: np.ndarray, bbox, roi_shape
     ) -> np.ndarray:
@@ -135,6 +142,7 @@ class DINOv3Estimator:
             raise ValueError(f"Empty GT mask for: {obj['side']}")
         return mask
 
+    # ------------------------------------------------------------ preprocess
     def _preprocess(self, bgr: np.ndarray) -> np.ndarray:
         if PREPROCESS_MODE == "none":
             return bgr
@@ -155,6 +163,7 @@ class DINOv3Estimator:
             raise ValueError(f"Unknown PREPROCESS_MODE: {PREPROCESS_MODE}")
         return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
+    # ------------------------------------------------------------------ bbox
     def _polygon_to_bbox(self, polygon: np.ndarray, image_shape):
         h, w = image_shape[:2]
         x1 = int(np.floor(polygon[:, 0].min()))
@@ -166,6 +175,17 @@ class DINOv3Estimator:
         if x2 <= x1 or y2 <= y1:
             raise ValueError(f"Invalid polygon bbox: {polygon.tolist()}")
         return [x1, y1, x2, y2]
+
+    def _expand_bbox(self, bbox, shape, ratio: float):
+        h, w = shape[:2]
+        x1, y1, x2, y2 = bbox
+        dx, dy = (x2 - x1) * ratio, (y2 - y1) * ratio
+        return [
+            max(0, int(np.floor(x1 - dx))),
+            max(0, int(np.floor(y1 - dy))),
+            min(w, int(np.ceil(x2 + dx))),
+            min(h, int(np.ceil(y2 + dy))),
+        ]
 
     def _crop_bbox(self, image: np.ndarray, bbox):
         h, w = image.shape[:2]
@@ -181,10 +201,28 @@ class DINOv3Estimator:
         cv2.fillPoly(mask, [np.round(polygon).astype(np.int32)], 255)
         return mask
 
-    def _extract_features(self, image: np.ndarray) -> torch.Tensor:
+    # --------------------------------------------------------------- feature
+    def _search_grid(self, search_bbox, ref_bbox) -> Tuple[int, int]:
+        """返回搜索框的 patch 网格 (gh, gw)。"""
+        if not KEEP_SCALE:
+            return PATCH_GRID, PATCH_GRID
+        sx1, sy1, sx2, sy2 = search_bbox
+        bx1, by1, bx2, by2 = ref_bbox
+        bw, bh = max(1, bx2 - bx1), max(1, by2 - by1)
+        # 参考:bw 像素 -> PATCH_GRID 个 patch;搜索框按同一比例换算
+        gw = int(round((sx2 - sx1) / bw * PATCH_GRID))
+        gh = int(round((sy2 - sy1) / bh * PATCH_GRID))
+        gw = int(np.clip(gw, 1, MAX_SEARCH_GRID))
+        gh = int(np.clip(gh, 1, MAX_SEARCH_GRID))
+        return gh, gw
+
+    def _extract_features(
+        self, image: np.ndarray, grid: Tuple[int, int] | None = None
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        gh, gw = grid if grid is not None else (PATCH_GRID, PATCH_GRID)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image = cv2.resize(
-            image, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA
+            image, (gw * PATCH_SIZE, gh * PATCH_SIZE), interpolation=cv2.INTER_AREA
         )
         x = torch.from_numpy(image).permute(2, 0, 1).float().div(255.0)
         if IMAGENET_NORM:
@@ -192,7 +230,7 @@ class DINOv3Estimator:
         x = x.unsqueeze(0).to(self.device)
         with torch.inference_mode():
             feat = self.model.forward_features(x)["x_norm_patchtokens"][0]
-        return F.normalize(feat, dim=-1)
+        return F.normalize(feat, dim=-1), (gh, gw)
 
     def _get_patch_mask(self, mask: np.ndarray) -> np.ndarray:
         small = cv2.resize(
@@ -202,18 +240,26 @@ class DINOv3Estimator:
         )
         return small >= int(MASK_THRESHOLD * 255)
 
+    # -------------------------------------------------------------- evaluate
     def _evaluate(
-        self, ref_feat: torch.Tensor, ref_index: torch.Tensor, input_feat: torch.Tensor
+        self,
+        ref_feat: torch.Tensor,
+        ref_index: torch.Tensor,
+        input_feat: torch.Tensor,
+        input_grid: Tuple[int, int],
     ):
+        gh, gw = input_grid
         best, best_idx = (ref_feat @ input_feat.T).max(dim=1)
         passed = best >= self.sim_threshold
         coverage = float(passed.float().mean())
         is_present = coverage >= self.coverage_threshold
 
-        n_patch = PATCH_GRID * PATCH_GRID
-        pass_mask = torch.zeros(n_patch, dtype=torch.bool, device=self.device)
+        # pass_mask: 搜索框网格 (gh, gw)
+        pass_mask = torch.zeros(gh * gw, dtype=torch.bool, device=self.device)
         pass_mask[best_idx[passed]] = True
-        similarity = torch.zeros(n_patch, device=self.device)
+
+        # similarity_map: 参考网格 (14, 14),与参考 patch 位置对应
+        similarity = torch.zeros(PATCH_GRID * PATCH_GRID, device=self.device)
         similarity[ref_index] = best
         scores_np = best.detach().cpu().numpy()
 
@@ -230,10 +276,12 @@ class DINOv3Estimator:
             "coverage_threshold": self.coverage_threshold,
             "patch_count": int(len(scores_np)),
             "pass_patch_count": int(passed.sum().item()),
-            "pass_mask": pass_mask.reshape(PATCH_GRID, PATCH_GRID).cpu().numpy(),
+            "search_grid": [gh, gw],
+            "pass_mask": pass_mask.reshape(gh, gw).cpu().numpy(),
             "similarity_map": similarity.reshape(PATCH_GRID, PATCH_GRID).cpu().numpy(),
         }
 
+    # ----------------------------------------------------------------- debug
     def _draw_debug(
         self,
         image: np.ndarray,
@@ -242,25 +290,26 @@ class DINOv3Estimator:
         bbox,
         roi_mask,
         evaluation: Dict[str, Any],
+        search_bbox,
     ):
         polygon = np.asarray(polygon, dtype=np.int32)
         x1, y1, x2, y2 = map(int, bbox)
+        sx1, sy1, sx2, sy2 = map(int, search_bbox)
         color = PRESENT_COLOR if evaluation["present"] else ABSENT_COLOR
-        roi_w, roi_h = max(1, x2 - x1), max(1, y2 - y1)
+
+        pass_mask = evaluation["pass_mask"]
+        gh, gw = pass_mask.shape
+        sw, sh = max(1, sx2 - sx1), max(1, sy2 - sy1)
 
         overlay = image.copy()
-        for row, col in zip(*np.where(evaluation["pass_mask"])):
-            p1 = (
-                x1 + int(col * roi_w / PATCH_GRID),
-                y1 + int(row * roi_h / PATCH_GRID),
-            )
-            p2 = (
-                x1 + int((col + 1) * roi_w / PATCH_GRID),
-                y1 + int((row + 1) * roi_h / PATCH_GRID),
-            )
+        for row, col in zip(*np.where(pass_mask)):
+            p1 = (sx1 + int(col * sw / gw), sy1 + int(row * sh / gh))
+            p2 = (sx1 + int((col + 1) * sw / gw), sy1 + int((row + 1) * sh / gh))
             cv2.rectangle(overlay, p1, p2, PATCH_COLOR, -1)
         debug = cv2.addWeighted(overlay, 0.28, image, 0.72, 0)
 
+        # 搜索框 + GT 位置
+        cv2.rectangle(debug, (sx1, sy1), (sx2, sy2), SEARCH_COLOR, 1)
         contours, _ = cv2.findContours(
             roi_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
@@ -288,6 +337,7 @@ class DINOv3Estimator:
         )
         return debug
 
+    # --------------------------------------------------------------- predict
     def predict(self, rgb: np.ndarray) -> Dict[str, Any]:
         if rgb is None or not isinstance(rgb, np.ndarray):
             raise ValueError("rgb must be a numpy.ndarray")
@@ -297,10 +347,17 @@ class DINOv3Estimator:
             )
 
         ref = self.reference[TARGET_NAME]
-        input_feat = self._extract_features(
-            self._crop_bbox(self._preprocess(rgb), ref["bbox"])
+        proc = self._preprocess(rgb)
+
+        search_bbox = self._expand_bbox(ref["bbox"], proc.shape, SEARCH_MARGIN_RATIO)
+        grid = self._search_grid(search_bbox, ref["bbox"])
+        input_feat, grid = self._extract_features(
+            self._crop_bbox(proc, search_bbox), grid
         )
-        evaluation = self._evaluate(ref["feature"], ref["patch_index"], input_feat)
+
+        evaluation = self._evaluate(
+            ref["feature"], ref["patch_index"], input_feat, grid
+        )
         debug_image = self._draw_debug(
             rgb.copy(),
             TARGET_NAME,
@@ -308,11 +365,13 @@ class DINOv3Estimator:
             ref["bbox"],
             ref["roi_mask"],
             evaluation,
+            search_bbox,
         )
 
         return {
             TARGET_NAME: bool(evaluation["absent"]),
             f"{TARGET_NAME}_evaluation": evaluation,
+            "search_bbox": search_bbox,
             "debug_image": debug_image,
         }
 
@@ -335,6 +394,7 @@ if __name__ == "__main__":
     print(f"Device: {estimator.device}")
     print(f"PREPROCESS_MODE: {PREPROCESS_MODE}")
     print(f"USE_GT_MASK: {USE_GT_MASK}")
+    print(f"SEARCH_MARGIN_RATIO: {SEARCH_MARGIN_RATIO}  KEEP_SCALE: {KEEP_SCALE}")
     print(f"SIM_THRESHOLD: {estimator.sim_threshold}")
     print(f"COVERAGE_THRESHOLD: {estimator.coverage_threshold}")
 
@@ -342,7 +402,8 @@ if __name__ == "__main__":
     print(
         f"{TARGET_NAME}: {item['label']} | absent={result[TARGET_NAME]} | "
         f"coverage={item['coverage_percent']:.1f}% | "
-        f"mean={item['mean_similarity']:.4f} | p10={item['p10_similarity']:.4f}"
+        f"mean={item['mean_similarity']:.4f} | p10={item['p10_similarity']:.4f} | "
+        f"search_grid={item['search_grid']}"
     )
 
     debug_path = PROJECT_ROOT / "dino_test" / "debug_result.png"

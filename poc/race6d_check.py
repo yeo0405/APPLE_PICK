@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import argparse
 import math
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import rclpy
-from geometry_msgs.msg import PoseArray
 from rclpy.node import Node
 from std_srvs.srv import Trigger
-
+from vision_msgs.msg import Detection3DArray
 
 TRIGGER_SERVICES = [
     "/pose6dof/predict",
@@ -23,14 +22,14 @@ LABEL_NAMES = {
     1: "brown_box",
     2: "flap",
     3: "iphone14_pro_max",
-    4: "iphone14_plus_yellow"
+    4: "iphone14_plus_yellow",
 }
 
 DEFAULT_RATE_HZ = 1.0
 
 
 class ContinuousTrigger(Node):
-    """Continuously trigger Pose6D prediction and print PoseArray results."""
+    """Continuously trigger Pose6D prediction and print Detection3DArray results."""
 
     def __init__(
         self,
@@ -45,6 +44,7 @@ class ContinuousTrigger(Node):
         self.rate_hz = rate_hz
         self.period = 1.0 / rate_hz
         self.label_names = dict(sorted(label_names.items()))
+        self.name_to_label = {name: label for label, name in self.label_names.items()}
 
         self.trigger_clients = {}
 
@@ -55,27 +55,17 @@ class ContinuousTrigger(Node):
             )
 
         self.pose_subscription = self.create_subscription(
-            PoseArray,
+            Detection3DArray,
             POSE_TOPIC,
             self.pose_callback,
             10,
         )
 
-        self.get_logger().info(
-            f"Trigger services: {TRIGGER_SERVICES}"
-        )
-        self.get_logger().info(
-            f"Pose topic: {POSE_TOPIC}"
-        )
-        self.get_logger().info(
-            f"Labels: {self.label_names}"
-        )
-        self.get_logger().info(
-            f"Rate: {self.rate_hz:.3f} Hz"
-        )
-        self.get_logger().info(
-            f"Period: {self.period:.3f} s"
-        )
+        self.get_logger().info(f"Trigger services: {TRIGGER_SERVICES}")
+        self.get_logger().info(f"Pose topic: {POSE_TOPIC} [Detection3DArray]")
+        self.get_logger().info(f"Labels: {self.label_names}")
+        self.get_logger().info(f"Rate: {self.rate_hz:.3f} Hz")
+        self.get_logger().info(f"Period: {self.period:.3f} s")
 
         self.wait_for_services()
 
@@ -84,50 +74,35 @@ class ContinuousTrigger(Node):
             self.publish_triggers,
         )
 
-        self.get_logger().info(
-            "Continuous trigger started."
-        )
-        self.get_logger().info(
-            "Press Ctrl+C to stop."
-        )
+        self.get_logger().info("Continuous trigger started.")
+        self.get_logger().info("Press Ctrl+C to stop.")
 
     def wait_for_services(self) -> None:
         """Wait until all configured Trigger services are available."""
 
         for service_name, client in self.trigger_clients.items():
-            self.get_logger().info(
-                f"Waiting for {service_name} ..."
-            )
+            self.get_logger().info(f"Waiting for {service_name} ...")
 
             while rclpy.ok():
                 if client.wait_for_service(timeout_sec=1.0):
                     break
 
-                self.get_logger().warning(
-                    f"{service_name} not available..."
-                )
+                self.get_logger().warning(f"{service_name} not available...")
 
             if rclpy.ok():
-                self.get_logger().info(
-                    f"Connected to {service_name}"
-                )
+                self.get_logger().info(f"Connected to {service_name}")
 
     def publish_triggers(self) -> None:
         """Send one Trigger request to every configured service."""
 
         for service_name, client in self.trigger_clients.items():
             if not client.service_is_ready():
-                self.get_logger().warning(
-                    f"Service unavailable: {service_name}"
-                )
+                self.get_logger().warning(f"Service unavailable: {service_name}")
                 continue
 
-            request = Trigger.Request()
-            client.call_async(request)
+            client.call_async(Trigger.Request())
 
-            self.get_logger().info(
-                f"Triggered: {service_name}"
-            )
+            self.get_logger().info(f"Triggered: {service_name}")
 
     @staticmethod
     def _valid_pose(pose) -> bool:
@@ -157,54 +132,94 @@ class ContinuousTrigger(Node):
             f"{pose.orientation.w:.6f})"
         )
 
-    def pose_callback(self, msg: PoseArray) -> None:
-        """Process the combined PoseArray result."""
+    def _resolve_label(self, class_id: str) -> Optional[int]:
+        """Resolve a detection class ID to the configured numeric label."""
 
+        class_id = str(class_id).strip()
+
+        if class_id in self.name_to_label:
+            return self.name_to_label[class_id]
+
+        try:
+            label = int(class_id)
+        except (TypeError, ValueError):
+            return None
+
+        if label in self.label_names:
+            return label
+
+        return None
+
+    def pose_callback(self, msg: Detection3DArray) -> None:
+        """Process Detection3DArray results and match them by class ID."""
+
+        self.get_logger().info("========================================")
         self.get_logger().info(
-            "========================================"
+            f"Received {len(msg.detections)} detections " f"from {POSE_TOPIC}"
         )
 
-        self.get_logger().info(
-            f"Received {len(msg.poses)} poses "
-            f"from {POSE_TOPIC}"
-        )
+        detected: Dict[int, Tuple[float, Any]] = {}
+
+        for detection in msg.detections:
+            if not detection.results:
+                self.get_logger().warning(
+                    f"Detection id={detection.id!r} has no pose results."
+                )
+                continue
+
+            matched_label = None
+            matched_result = None
+
+            for result in detection.results:
+                class_id = result.hypothesis.class_id
+                label = self._resolve_label(class_id)
+
+                if label is not None:
+                    matched_label = label
+                    matched_result = result
+                    break
+
+            if matched_label is None:
+                self.get_logger().warning(
+                    f"Unknown detection: id={detection.id!r}, "
+                    f"class_ids={[r.hypothesis.class_id for r in detection.results]}"
+                )
+                continue
+
+            pose = matched_result.pose.pose
+            score = float(matched_result.hypothesis.score)
+
+            previous = detected.get(matched_label)
+
+            if previous is None or score > previous[0]:
+                detected[matched_label] = (score, pose)
 
         expected_count = len(self.label_names)
 
-        if len(msg.poses) != expected_count:
+        if len(detected) != expected_count:
             self.get_logger().warning(
-                f"Expected {expected_count} poses, "
-                f"but received {len(msg.poses)}."
+                f"Expected {expected_count} configured objects, "
+                f"but received {len(detected)} unique recognized objects."
             )
 
-        for index, label in enumerate(self.label_names):
-            name = self.label_names[label]
-
-            if index >= len(msg.poses):
-                self.get_logger().warning(
-                    f"[{index}] label={label} "
-                    f"name={name}: MISSING"
-                )
+        for label, name in self.label_names.items():
+            if label not in detected:
+                self.get_logger().warning(f"[{label}] name={name}: NOT DETECTED")
                 continue
 
-            pose = msg.poses[index]
+            score, pose = detected[label]
 
             if not self._valid_pose(pose):
-                self.get_logger().warning(
-                    f"[{index}] label={label} "
-                    f"name={name}: NOT DETECTED"
-                )
+                self.get_logger().warning(f"[{label}] name={name}: INVALID POSE")
                 continue
 
             self.get_logger().info(
-                f"[{index}] label={label} "
-                f"name={name}: "
+                f"[{label}] name={name} "
+                f"score={score:.4f}: "
                 f"{self._format_pose(pose)}"
             )
 
-        self.get_logger().info(
-            "========================================"
-        )
+        self.get_logger().info("========================================")
 
 
 def parse_labels(value: str) -> Dict[int, str]:
@@ -223,8 +238,7 @@ def parse_labels(value: str) -> Dict[int, str]:
 
         if ":" not in item:
             raise ValueError(
-                f"Invalid label format: '{item}'. "
-                "Expected 'label:name'."
+                f"Invalid label format: '{item}'. " "Expected 'label:name'."
             )
 
         label_text, name = item.split(":", 1)
@@ -233,14 +247,10 @@ def parse_labels(value: str) -> Dict[int, str]:
         name = name.strip()
 
         if not name:
-            raise ValueError(
-                f"Empty name for label {label}."
-            )
+            raise ValueError(f"Empty name for label {label}.")
 
         if label in result:
-            raise ValueError(
-                f"Duplicate label: {label}."
-            )
+            raise ValueError(f"Duplicate label: {label}.")
 
         result[label] = name
 
@@ -250,9 +260,7 @@ def parse_labels(value: str) -> Dict[int, str]:
     names = list(result.values())
 
     if len(names) != len(set(names)):
-        raise ValueError(
-            "LABEL_NAMES contains duplicate object names."
-        )
+        raise ValueError("LABEL_NAMES contains duplicate object names.")
 
     return dict(sorted(result.items()))
 
@@ -261,7 +269,7 @@ def main(args: Any = None) -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Continuously trigger ROS 2 Pose6D prediction "
-            "and print PoseArray results."
+            "and print Detection3DArray results."
         )
     )
 
@@ -269,31 +277,20 @@ def main(args: Any = None) -> None:
         "--rate",
         type=float,
         default=DEFAULT_RATE_HZ,
-        help=(
-            "Trigger rate in Hz. "
-            f"Default: {DEFAULT_RATE_HZ}"
-        ),
+        help=f"Trigger rate in Hz. Default: {DEFAULT_RATE_HZ}",
     )
 
     parser.add_argument(
         "--labels",
         type=str,
-        default=",".join(
-            f"{label}:{name}"
-            for label, name in LABEL_NAMES.items()
-        ),
-        help=(
-            "Pose label mapping. "
-            "Example: 0:iphone,1:box"
-        ),
+        default=",".join(f"{label}:{name}" for label, name in LABEL_NAMES.items()),
+        help="Object label mapping. Example: 0:iphone,1:box",
     )
 
-    parsed_args = parser.parse_args()
+    parsed_args = parser.parse_args(args=args)
 
     try:
-        label_names = parse_labels(
-            parsed_args.labels
-        )
+        label_names = parse_labels(parsed_args.labels)
     except (TypeError, ValueError) as error:
         parser.error(str(error))
         return
@@ -307,14 +304,10 @@ def main(args: Any = None) -> None:
             rate_hz=parsed_args.rate,
             label_names=label_names,
         )
-
         rclpy.spin(node)
 
     except KeyboardInterrupt:
-        print(
-            "\nStopping...",
-            flush=True,
-        )
+        print("\nStopping...", flush=True)
 
     finally:
         if node is not None:
