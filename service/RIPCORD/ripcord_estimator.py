@@ -31,13 +31,26 @@ SAM2_CHECKPOINT = MODEL_DIR / "sam2.1_hiera_small.pt"
 IMAGE_SIZE = 224
 PATCH_GRID = 14
 
+# ---- 开关：是否使用 DINO 作为附加判定 ----
+USE_DINO = False
+
+# ---- DINO（仅 USE_DINO=True 时生效）----
 DINO_SIM_THRESHOLD = 0.85
+
+# ---- SAM ----
 MIN_SAM_SCORE = 0.30
 MIN_MASK_AREA = 20
 
+# ---- Mask 重叠判定（按实测正负样本间隙设定）----
+MIN_OVERLAP_SCORE = 0.75  # coverage - EXCESS_PENALTY * excess
+MIN_COVERAGE = 0.80  # SAM mask 覆盖 GT 的比例
+MIN_IOU = 0.75  # 与 GT 的 IoU
+MAX_AREA_RATIO = 1.8  # SAM 面积 / GT 面积 上限
+EXCESS_PENALTY = 1.0  # 超出 GT 部分的扣分权重
+GT_DILATE_PX = 3  # GT 容忍的位置偏差（像素），0 表示不膨胀
+
 PRESENT_LABEL = "PRESENT"
 ABSENT_LABEL = "ABSENT"
-
 
 PRESENT_COLOR = (0, 255, 0)
 ABSENT_COLOR = (0, 0, 255)
@@ -52,10 +65,12 @@ class RipcordEstimator:
         dino_sim_threshold: float = DINO_SIM_THRESHOLD,
         min_sam_score: float = MIN_SAM_SCORE,
         min_mask_area: int = MIN_MASK_AREA,
+        use_dino: bool = USE_DINO,
     ):
         self.dino_sim_threshold = float(dino_sim_threshold)
         self.min_sam_score = float(min_sam_score)
         self.min_mask_area = int(min_mask_area)
+        self.use_dino = bool(use_dino)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.gt_data = self._load_gt()
@@ -63,9 +78,18 @@ class RipcordEstimator:
         self.ripcords = self._load_gt_masks()
 
         self.sam2 = self._load_sam2()
-        self.dino = self._load_dino()
-        self.reference_features = self._build_reference_features()
 
+        self.dino = None
+        self.reference_features = None
+        if self.use_dino:
+            self.dino = self._load_dino()
+            self.reference_features = self._build_reference_features()
+        else:
+            print("[DINOv3] Disabled (USE_DINO=False)")
+
+    # ------------------------------------------------------------------
+    # GT
+    # ------------------------------------------------------------------
     def _load_gt(self) -> Dict[str, Any]:
         if not GT_PATH.is_file():
             raise FileNotFoundError(f"GT JSON not found: {GT_PATH}")
@@ -81,13 +105,11 @@ class RipcordEstimator:
 
         for ripcord in data["ripcords"]:
             if "mask" not in ripcord:
-                raise RuntimeError(
-                    f"Ripcord {ripcord.get('index', '?')} " "has no mask"
-                )
+                raise RuntimeError(f"Ripcord {ripcord.get('index', '?')} has no mask")
 
             if "file" not in ripcord["mask"]:
                 raise RuntimeError(
-                    f"Ripcord {ripcord.get('index', '?')} " "has no mask.file"
+                    f"Ripcord {ripcord.get('index', '?')} has no mask.file"
                 )
 
         return data
@@ -114,10 +136,7 @@ class RipcordEstimator:
             if not mask_path.is_file():
                 raise FileNotFoundError(f"GT mask not found: {mask_path}")
 
-            mask = cv2.imread(
-                str(mask_path),
-                cv2.IMREAD_GRAYSCALE,
-            )
+            mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
 
             if mask is None:
                 raise RuntimeError(f"Cannot read GT mask: {mask_path}")
@@ -136,20 +155,31 @@ class RipcordEstimator:
             if area < self.min_mask_area:
                 raise RuntimeError(f"GT mask {index} is too small: {area}")
 
+            # 预先计算膨胀后的 GT（容忍位置偏差）
+            if GT_DILATE_PX > 0:
+                k = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE,
+                    (2 * GT_DILATE_PX + 1, 2 * GT_DILATE_PX + 1),
+                )
+                mask_tol = cv2.dilate(mask.astype(np.uint8), k).astype(bool)
+            else:
+                mask_tol = mask
+
             results.append(
                 {
                     "index": index,
-                    "center": (
-                        int(center[0]),
-                        int(center[1]),
-                    ),
+                    "center": (int(center[0]), int(center[1])),
                     "mask": mask,
+                    "mask_tol": mask_tol,
                     "area": area,
                 }
             )
 
         return results
 
+    # ------------------------------------------------------------------
+    # Models
+    # ------------------------------------------------------------------
     def _load_sam2(self) -> SAM2ImagePredictor:
         if not SAM2_CONFIG.is_file():
             raise FileNotFoundError(f"SAM2 config not found: {SAM2_CONFIG}")
@@ -173,15 +203,9 @@ class RipcordEstimator:
                 ],
             )
             OmegaConf.resolve(cfg)
-            model = instantiate(
-                cfg.model,
-                _recursive_=True,
-            )
+            model = instantiate(cfg.model, _recursive_=True)
 
-        _load_checkpoint(
-            model,
-            str(SAM2_CHECKPOINT),
-        )
+        _load_checkpoint(model, str(SAM2_CHECKPOINT))
 
         model = model.to(self.device).eval()
 
@@ -209,11 +233,15 @@ class RipcordEstimator:
 
         return model
 
+    # ------------------------------------------------------------------
+    # DINO features (only used when use_dino=True)
+    # ------------------------------------------------------------------
     def _dino_features(
         self,
         image: np.ndarray,
         mask: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
+        # image 为 BGR（cv2.imread 的结果）
         if mask is not None:
             mask = np.asarray(mask, dtype=bool)
 
@@ -240,10 +268,7 @@ class RipcordEstimator:
             background[mask] = image[mask]
             image = background
 
-        image = cv2.cvtColor(
-            image,
-            cv2.COLOR_BGR2RGB,
-        )
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         image = cv2.resize(
             image,
@@ -263,10 +288,7 @@ class RipcordEstimator:
         with torch.inference_mode():
             features = self.dino.forward_features(tensor)["x_norm_patchtokens"][0]
 
-        return F.normalize(
-            features,
-            dim=-1,
-        )
+        return F.normalize(features, dim=-1)
 
     def _build_reference_features(self) -> torch.Tensor:
         gt_image_path = PROJECT_ROOT / self.gt_data["image"]
@@ -285,31 +307,25 @@ class RipcordEstimator:
                 ],
                 ripcord["mask"],
             )
-
             features.append(feature)
 
         return torch.stack(features, dim=0)
 
-    def _predict_mask(
+    # ------------------------------------------------------------------
+    # SAM
+    # ------------------------------------------------------------------
+    def _predict_masks(
         self,
         point: Tuple[int, int],
-    ) -> Tuple[Optional[np.ndarray], float]:
-        point_coords = np.array(
-            [[point[0], point[1]]],
-            dtype=np.float32,
-        )
-        point_labels = np.array(
-            [1],
-            dtype=np.int32,
-        )
+    ) -> List[Tuple[np.ndarray, float]]:
+        """返回 SAM 的全部候选 (mask, score)。"""
+        point_coords = np.array([[point[0], point[1]]], dtype=np.float32)
+        point_labels = np.array([1], dtype=np.int32)
 
         try:
             with torch.inference_mode():
                 if self.device == "cuda":
-                    with torch.autocast(
-                        device_type="cuda",
-                        dtype=torch.bfloat16,
-                    ):
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                         masks, scores, _ = self.sam2.predict(
                             point_coords=point_coords,
                             point_labels=point_labels,
@@ -329,7 +345,7 @@ class RipcordEstimator:
                     )
         except Exception as e:
             print(f"[ERROR] SAM2 prediction failed: {e}")
-            return None, 0.0
+            return []
 
         masks = np.asarray(masks)
         scores = np.asarray(scores)
@@ -340,73 +356,141 @@ class RipcordEstimator:
         if scores.ndim > 1:
             scores = scores[0]
 
-        if len(masks) == 0:
-            return None, 0.0
+        return [(masks[i].astype(bool), float(scores[i])) for i in range(len(masks))]
 
-        best_idx = int(np.argmax(scores))
+    def _select_best_mask(
+        self,
+        candidates: List[Tuple[np.ndarray, float]],
+        ripcord: Dict[str, Any],
+    ) -> Tuple[Optional[np.ndarray], float]:
+        """在 SAM 的候选里选与 GT IoU 最高的 mask（而不是 SAM 自评分最高的）。"""
+        best_mask: Optional[np.ndarray] = None
+        best_score = 0.0
+        best_iou = -1.0
 
-        return (
-            masks[best_idx].astype(bool),
-            float(scores[best_idx]),
-        )
+        for mask, score in candidates:
+            if int(np.count_nonzero(mask)) < self.min_mask_area:
+                continue
 
+            iou = self._mask_overlap(
+                mask,
+                ripcord["mask"],
+                ripcord["mask_tol"],
+            )["iou"]
+
+            if iou > best_iou:
+                best_mask, best_score, best_iou = mask, score, iou
+
+        return best_mask, best_score
+
+    # ------------------------------------------------------------------
+    # Mask overlap
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _mask_overlap(
+        mask: np.ndarray,
+        gt_mask: np.ndarray,
+        gt_mask_tol: np.ndarray,
+    ) -> Dict[str, float]:
+        gt_area = max(int(np.count_nonzero(gt_mask)), 1)
+        mask_area = int(np.count_nonzero(mask))
+
+        inter = int(np.count_nonzero(mask & gt_mask))
+        outside = int(np.count_nonzero(mask & ~gt_mask_tol))
+        union = max(gt_area + mask_area - inter, 1)
+
+        coverage = inter / gt_area
+        excess = outside / gt_area
+        area_ratio = mask_area / gt_area
+        iou = inter / union
+
+        overlap_score = coverage - EXCESS_PENALTY * excess
+
+        return {
+            "coverage": float(coverage),
+            "excess": float(excess),
+            "area_ratio": float(area_ratio),
+            "iou": float(iou),
+            "overlap_score": float(overlap_score),
+        }
+
+    # ------------------------------------------------------------------
+    # Classification
+    # ------------------------------------------------------------------
     def _classify_mask(
         self,
         roi_image: np.ndarray,
         mask: Optional[np.ndarray],
         sam_score: float,
+        ripcord: Dict[str, Any],
+        ref_idx: int,
     ) -> Dict[str, Any]:
-        if mask is None:
-            return {
-                "label": ABSENT_LABEL,
-                "present": False,
-                "sam_score": float(sam_score),
-                "dino_similarity": 0.0,
-                "dino_reference_index": None,
-                "mask_area": 0,
-            }
-
-        area = int(np.count_nonzero(mask))
-
-        if area < self.min_mask_area:
-            return {
-                "label": ABSENT_LABEL,
-                "present": False,
-                "sam_score": float(sam_score),
-                "dino_similarity": 0.0,
-                "dino_reference_index": None,
-                "mask_area": area,
-            }
-
-        candidate_feature = self._dino_features(
-            roi_image,
-            mask,
-        )
-
-        similarities = torch.einsum(
-            "rd,nrd->nr",
-            candidate_feature,
-            self.reference_features,
-        )[0]
-
-        best_index = int(torch.argmax(similarities).item())
-
-        best_similarity = float(similarities[best_index].item())
-
-        present = best_similarity >= self.dino_sim_threshold
-
-        return {
-            "label": (PRESENT_LABEL if present else ABSENT_LABEL),
-            "present": present,
+        result: Dict[str, Any] = {
+            "label": ABSENT_LABEL,
+            "present": False,
             "sam_score": float(sam_score),
-            "dino_similarity": best_similarity,
-            "dino_reference_index": best_index,
-            "dino_similarities": [
-                float(v) for v in similarities.detach().cpu().numpy()
-            ],
-            "mask_area": area,
+            "mask_area": 0,
+            "coverage": 0.0,
+            "excess": 0.0,
+            "area_ratio": 0.0,
+            "iou": 0.0,
+            "overlap_score": 0.0,
+            "overlap_ok": False,
+            # DINO 关闭时 dino_similarity 恒为 0.0（保持 float，避免下游格式化报错），
+            # 用 dino_enabled 区分"未启用"和"相似度为 0"
+            "dino_enabled": self.use_dino,
+            "dino_similarity": 0.0,
+            "dino_ok": False,
         }
 
+        if mask is None:
+            return result
+
+        area = int(np.count_nonzero(mask))
+        result["mask_area"] = area
+
+        if area < self.min_mask_area:
+            return result
+
+        # ---- Mask 重叠判定 ----
+        overlap = self._mask_overlap(
+            mask,
+            ripcord["mask"],
+            ripcord["mask_tol"],
+        )
+        result.update(overlap)
+
+        overlap_ok = (
+            overlap["overlap_score"] >= MIN_OVERLAP_SCORE
+            and overlap["coverage"] >= MIN_COVERAGE
+            and overlap["iou"] >= MIN_IOU
+            and overlap["area_ratio"] <= MAX_AREA_RATIO
+            and sam_score >= self.min_sam_score
+        )
+        result["overlap_ok"] = overlap_ok
+
+        present = overlap_ok
+
+        # ---- DINO 附加判定（可选）----
+        if self.use_dino:
+            candidate_feature = self._dino_features(roi_image, mask)  # [196, C]
+            ref = self.reference_features[ref_idx]  # [196, C]
+            dino_sim = float((candidate_feature * ref).sum(dim=-1).mean().item())
+            dino_ok = dino_sim >= self.dino_sim_threshold
+
+            result["dino_similarity"] = dino_sim
+            result["dino_ok"] = dino_ok
+
+            present = present and dino_ok
+
+        result["present"] = present
+        result["label"] = PRESENT_LABEL if present else ABSENT_LABEL
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Debug drawing
+    # ------------------------------------------------------------------
     def _draw_debug(
         self,
         image: np.ndarray,
@@ -457,10 +541,18 @@ class RipcordEstimator:
                 cv2.LINE_AA,
             )
 
+            line2 = (
+                f"COV={evaluation['coverage']:.2f} "
+                f"OV={evaluation['overlap_score']:.2f} "
+                f"IoU={evaluation['iou']:.2f} "
+                f"AR={evaluation['area_ratio']:.1f}"
+            )
+            if evaluation["dino_enabled"]:
+                line2 += f" DINO={evaluation['dino_similarity']:.2f}"
+
             cv2.putText(
                 debug,
-                f"SAM={evaluation['sam_score']:.2f} "
-                f"DINO={evaluation['dino_similarity']:.2f}",
+                line2,
                 (tx, ty + 27),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -469,10 +561,11 @@ class RipcordEstimator:
                 cv2.LINE_AA,
             )
 
+        title = "SAM2 + DINOv3 RIPCORD" if self.use_dino else "SAM2 MASK RIPCORD"
         cv2.rectangle(debug, (10, 10), (500, 70), (0, 0, 0), -1)
         cv2.putText(
             debug,
-            "SAM2 + DINOv3 RIPCORD",
+            title,
             (25, 50),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.9,
@@ -483,10 +576,11 @@ class RipcordEstimator:
 
         return debug
 
-    def predict(
-        self,
-        rgb: np.ndarray,
-    ) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Predict
+    # ------------------------------------------------------------------
+    def predict(self, rgb: np.ndarray) -> Dict[str, Any]:
+        # 注意：参数名为 rgb，但实际按 cv2.imread 的 BGR 图像处理
         if rgb is None or not isinstance(rgb, np.ndarray):
             raise ValueError("rgb must be a numpy.ndarray")
 
@@ -497,31 +591,25 @@ class RipcordEstimator:
         h, w = rgb.shape[:2]
 
         if x1 < 0 or y1 < 0 or x2 > w or y2 > h:
-            raise ValueError(f"ROI {self.roi} is outside " f"input image size {w}x{h}")
+            raise ValueError(f"ROI {self.roi} is outside input image size {w}x{h}")
 
         roi_image = rgb[y1:y2, x1:x2]
 
         if roi_image.size == 0:
             raise RuntimeError("Input ROI is empty")
 
-        roi_rgb = cv2.cvtColor(
-            roi_image,
-            cv2.COLOR_BGR2RGB,
-        )
+        roi_rgb = cv2.cvtColor(roi_image, cv2.COLOR_BGR2RGB)
 
         with torch.inference_mode():
             if self.device == "cuda":
-                with torch.autocast(
-                    device_type="cuda",
-                    dtype=torch.bfloat16,
-                ):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     self.sam2.set_image(roi_rgb)
             else:
                 self.sam2.set_image(roi_rgb)
 
         results = []
 
-        for ripcord in self.ripcords:
+        for i, ripcord in enumerate(self.ripcords):
             index = ripcord["index"]
             gx, gy = ripcord["center"]
 
@@ -532,12 +620,15 @@ class RipcordEstimator:
                 mask = None
                 sam_score = 0.0
             else:
-                mask, sam_score = self._predict_mask((rx, ry))
+                candidates = self._predict_masks((rx, ry))
+                mask, sam_score = self._select_best_mask(candidates, ripcord)
 
             evaluation = self._classify_mask(
                 roi_image,
                 mask,
                 sam_score,
+                ripcord=ripcord,
+                ref_idx=i,
             )
 
             results.append(
@@ -549,32 +640,24 @@ class RipcordEstimator:
                 }
             )
 
-        debug_image = self._draw_debug(
-            rgb,
-            results,
-        )
+        debug_image = self._draw_debug(rgb, results)
 
-        detected_index = None
+        present_indices = [r["index"] for r in results if r["evaluation"]["present"]]
+        absent_indices = [r["index"] for r in results if not r["evaluation"]["present"]]
 
-        for result in results:
-            if result["evaluation"]["present"]:
-                detected_index = result["index"]
-                break
+        detected_index = present_indices[0] if present_indices else None
 
         output = {
             "index": detected_index,
             "detected_index": detected_index,
+            "present_indices": present_indices,
+            "absent_indices": absent_indices,
             "ripcords": {},
             "debug_image": debug_image,
         }
 
         for result in results:
-            index = result["index"]
-            evaluation = result["evaluation"]
-
-            output["ripcords"][index] = {
-                key: value for key, value in evaluation.items() if key != "mask"
-            }
+            output["ripcords"][result["index"]] = dict(result["evaluation"])
 
         return output
 
@@ -597,25 +680,31 @@ if __name__ == "__main__":
     result = estimator.predict(image)
 
     print(f"Device: {estimator.device}")
-    print(f"DINO threshold: " f"{estimator.dino_sim_threshold}")
+    print(f"Use DINO: {estimator.use_dino}")
+    if estimator.use_dino:
+        print(f"DINO threshold: {estimator.dino_sim_threshold}")
 
-    for index in range(4):
+    for index in sorted(result["ripcords"].keys()):
         item = result["ripcords"][index]
 
-        print(
-            f"Ripcord {index}: "
-            f"{item['label']} | "
+        line = (
+            f"Ripcord {index}: {item['label']} | "
             f"SAM={item['sam_score']:.4f} | "
-            f"DINO={item['dino_similarity']:.4f}"
+            f"cov={item['coverage']:.3f} | "
+            f"excess={item['excess']:.3f} | "
+            f"AR={item['area_ratio']:.2f} | "
+            f"IoU={item['iou']:.3f} | "
+            f"OV={item['overlap_score']:.3f}"
         )
+        if item["dino_enabled"]:
+            line += f" | DINO={item['dino_similarity']:.4f}"
+        print(line)
 
-    print(f"FINAL INDEX: " f"{result['detected_index']}")
+    print(f"PRESENT: {result['present_indices']}")
+    print(f"ABSENT:  {result['absent_indices']}")
+    print(f"FINAL INDEX: {result['detected_index']}")
 
     output_path = PROJECT_ROOT / "dino_test" / "ripcord_debug.png"
-
-    cv2.imwrite(
-        str(output_path),
-        result["debug_image"],
-    )
+    cv2.imwrite(str(output_path), result["debug_image"])
 
     print(f"Debug image: {output_path}")
