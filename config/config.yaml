@@ -2,7 +2,7 @@
 # CAMERA
 # ==========================================================
 CAMERA:
-  IP: "192.168.0.238"
+  IP: "192.168.0.238" # "192.168.0.238"
   PORT: 9876
 
 # ==========================================================
@@ -18,9 +18,9 @@ USB_CAMERA:
 # MODEL_CONFIG is relative to the APPLE_PICK project root.
 # ==========================================================
 RACE_6D:
-  MODEL_PATH: "model/race6d_1006.pth"
+  MODEL_PATH: "model/race6d_1027.pth" # 1006
   MODEL_CONFIG: "service/RACE_6D/config/race6d_r50vd_pose_rgbd.yml"
-  SCORE_THRESHOLD: 0.8
+  SCORE_THRESHOLD: 0.25
   MAX_PER_CLASS: 1
   MAX_DETECTIONS: null
   CLASS_ID: null
@@ -32,10 +32,15 @@ RACE_6D:
     1: brown_box
     2: flap
     3: iphone14_pro_max
-    4: iphone14_plus_yellow
+    4: ipad11_inch
+    5: ipad13_inch
+    6: watch_hermes
+    7: watch
+    8: watch_gray
+    9: watch_white
 
-# ==========================================================
-# BOX CHECK
+# =======================================================
+# BOX CH
 # ==========================================================
 BOX_CHECK:
   ENABLED: true
@@ -61,5 +66,5 @@ ALIGNMENT:
 # ==========================================================
 RIPCORD_CHECK:
   ENABLED: true
-  SIM_THRESHOLD: 0.8
-  COVERAGE_THRESHOLD: 0.8
+  SIM_THRESHOLD: 0.75
+  COVERAGE_THRESHOLD: 0.4

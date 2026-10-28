@@ -25,18 +25,30 @@ OUTPUT_PATH = GT_DIR / "gt.json"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
-MAX_POLYGONS = 2
+NUM_GTS = 2  # GT 图片数量
+BOXES_PER_GT = 2  # 每张图的 BBox 数量（left / right）
+MIN_BOX_SIZE = 5
+SIDES = ("left", "right")
+WINDOW_NAME = "GT Annotation"
 
-image = None
+# ---- 全局状态 ----
+image = None  # 当前显示的图像
 display = None
 status_message = ""
 
-gt_image_path = None
+gt_image_paths = []  # [Path, Path]
+gt_images = []  # [ndarray, ndarray]
+all_boxes = [[] for _ in range(NUM_GTS)]
+gt_entries = [
+    None
+] * NUM_GTS  # 每张图保存后: {"entry": json 用 dict, "results": SAM2 结果}
+current_idx = 0
 
-polygons = []
-current_polygon = []
+sam_predictor = None  # SAM2 只加载一次
 
-drawing_polygon = False
+drawing_box = False
+start_point = None
+current_box = None
 
 
 def relative_to_project(path):
@@ -47,22 +59,21 @@ def relative_to_project(path):
         return os.path.relpath(path, PROJECT_ROOT).replace(os.sep, "/")
 
 
-def find_gt_image():
+def find_gt_images():
     images = sorted(
-        p for p in GT_DIR.iterdir()
+        p
+        for p in GT_DIR.iterdir()
         if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS
     )
 
-    if not images:
-        raise FileNotFoundError(f"No GT image found in: {GT_DIR}")
-
-    if len(images) > 1:
-        names = "\n".join(f"  - {p.name}" for p in images)
+    if len(images) != NUM_GTS:
+        names = "\n".join(f"  - {p.name}" for p in images) or "  (none)"
         raise RuntimeError(
-            f"GT directory must contain exactly one image, but found {len(images)}:\n{names}"
+            f"GT directory must contain exactly {NUM_GTS} images, "
+            f"but found {len(images)}:\n{names}"
         )
 
-    return images[0]
+    return images
 
 
 def load_sam2():
@@ -103,28 +114,42 @@ def load_sam2():
     print(f"[SAM2] Config: {SAM2_CONFIG}")
     print(f"[SAM2] Checkpoint: {SAM2_CHECKPOINT}")
 
-    return predictor, device
+    return predictor
 
 
-def polygon_to_bbox(polygon):
-    points = np.asarray(polygon, dtype=np.float32)
-
-    if len(points) < 3:
-        raise ValueError("Polygon must contain at least 3 points")
-
-    x_min = int(np.floor(points[:, 0].min()))
-    y_min = int(np.floor(points[:, 1].min()))
-    x_max = int(np.ceil(points[:, 0].max()))
-    y_max = int(np.ceil(points[:, 1].max()))
-
+def normalize_bbox(x1, y1, x2, y2):
     h, w = image.shape[:2]
 
-    x_min = max(0, min(x_min, w - 1))
-    y_min = max(0, min(y_min, h - 1))
-    x_max = max(0, min(x_max, w - 1))
-    y_max = max(0, min(y_max, h - 1))
+    x1, x2 = sorted((int(x1), int(x2)))
+    y1, y2 = sorted((int(y1), int(y2)))
 
-    return [x_min, y_min, x_max, y_max]
+    x1 = max(0, min(x1, w - 1))
+    y1 = max(0, min(y1, h - 1))
+    x2 = max(0, min(x2, w - 1))
+    y2 = max(0, min(y2, h - 1))
+
+    return [x1, y1, x2, y2]
+
+
+def bbox_is_valid(bbox):
+    x1, y1, x2, y2 = bbox
+
+    return x2 - x1 >= MIN_BOX_SIZE and y2 - y1 >= MIN_BOX_SIZE
+
+
+def current_saved():
+    return gt_entries[current_idx] is not None
+
+
+def switch_image(new_idx):
+    """切换当前显示的 GT 图。"""
+    global current_idx, image, drawing_box, start_point, current_box
+
+    current_idx = new_idx
+    image = gt_images[current_idx]
+    drawing_box = False
+    start_point = None
+    current_box = None
 
 
 def predict_bbox(predictor, bbox):
@@ -149,6 +174,10 @@ def predict_bbox(predictor, bbox):
     if masks.ndim == 2:
         masks = masks[None, ...]
 
+    if len(scores) != len(masks):
+        print("[ERROR] SAM2 mask and score counts do not match")
+        return None
+
     best_idx = int(np.argmax(scores))
     best_mask = masks[best_idx]
     best_score = float(scores[best_idx])
@@ -163,60 +192,61 @@ def predict_bbox(predictor, bbox):
     }
 
 
-def generate_sam_masks(predictor):
-    global image, polygons
+def generate_sam_masks(predictor, gt_idx):
+    """对第 gt_idx 张图的所有 BBox 运行 SAM2。"""
+    gt_image = gt_images[gt_idx]
+    boxes = all_boxes[gt_idx]
 
-    if len(polygons) != MAX_POLYGONS:
+    if len(boxes) != BOXES_PER_GT:
         return None
 
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image_rgb = cv2.cvtColor(gt_image, cv2.COLOR_BGR2RGB)
 
     try:
         predictor.set_image(image_rgb)
     except Exception as e:
-        print(f"[ERROR] SAM2 set_image failed: {e}")
+        print(f"[ERROR] SAM2 set_image failed (GT {gt_idx}): {e}")
         return None
 
     results = []
 
-    for index, polygon in enumerate(polygons):
-        bbox = polygon_to_bbox(polygon)
-
+    for index, bbox in enumerate(boxes):
         result = predict_bbox(predictor, bbox)
 
         if result is None:
             return None
 
-        side = "left" if index == 0 else "right"
+        side = SIDES[index]
 
-        results.append({
-            "index": index,
-            "side": side,
-            "polygon": polygon,
-            "bbox": bbox,
-            "mask": result["mask"],
-            "score": result["score"],
-            "area": result["area"],
-            "selected_index": result["selected_index"],
-            "num_masks": result["num_masks"],
-            "all_scores": result["all_scores"],
-        })
+        results.append(
+            {
+                "gt_id": gt_idx,
+                "index": index,
+                "side": side,
+                "bbox": bbox.copy(),
+                "mask": result["mask"],
+                "score": result["score"],
+                "area": result["area"],
+                "selected_index": result["selected_index"],
+                "num_masks": result["num_masks"],
+                "all_scores": result["all_scores"],
+            }
+        )
 
         print(
-            f"[SAM2] {side.upper()}: "
+            f"[SAM2] GT{gt_idx} {side.upper()}: "
             f"bbox={bbox}, "
             f"mask={result['selected_index']}/"
             f"{result['num_masks'] - 1}, "
             f"score={result['score']:.4f}, "
             f"area={result['area']}"
         )
-
         print(f"       scores={result['all_scores']}")
 
     return results
 
 
-def save_sam_masks(results, output_path):
+def save_sam_masks(results, gt_idx, output_path):
     output_path = Path(output_path)
 
     mask_dir = output_path.parent / f"{output_path.stem}_masks"
@@ -226,46 +256,91 @@ def save_sam_masks(results, output_path):
 
     for result in results:
         index = result["index"]
-        mask_path = mask_dir / f"ear_{index}.png"
+        side = result["side"]
+        mask_path = mask_dir / f"gt{gt_idx}_{side}.png"
 
         mask = result["mask"].astype(np.uint8) * 255
 
         if not cv2.imwrite(str(mask_path), mask):
             raise RuntimeError(f"Failed to save mask: {mask_path}")
 
-        mask_infos.append({
-            "index": index,
-            "side": result["side"],
-            "file": relative_to_project(mask_path),
-            "score": result["score"],
-            "area": result["area"],
-        })
+        mask_infos.append(
+            {
+                "index": index,
+                "side": side,
+                "file": relative_to_project(mask_path),
+                "score": result["score"],
+                "area": result["area"],
+            }
+        )
 
     return mask_infos
 
 
-def draw_polygon(image, polygon, color, thickness=3, closed=True):
-    points = np.asarray(polygon, dtype=np.int32).reshape(-1, 1, 2)
+def write_json():
+    """把已完成的 GT 写入 gt.json（按 id 排序）。"""
+    gts = [e["entry"] for e in gt_entries if e is not None]
+    gts.sort(key=lambda g: g["id"])
 
-    if len(points) >= 2:
-        cv2.polylines(
-            image,
-            [points],
-            closed,
-            color,
-            thickness,
+    data = {
+        "gt_count": len(gts),
+        "expected_gt_count": NUM_GTS,
+        "gts": gts,
+        "sam2": {
+            "checkpoint": relative_to_project(SAM2_CHECKPOINT),
+            "config": relative_to_project(SAM2_CONFIG),
+            "prompt_type": "bbox",
+            "selection": "highest_score",
+            "multimask_output": True,
+            "dynamic_multimask_via_stability": True,
+            "dynamic_multimask_stability_delta": 0.05,
+            "dynamic_multimask_stability_thresh": 0.98,
+        },
+    }
+
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        json.dump(
+            data,
+            f,
+            indent=4,
+            ensure_ascii=False,
         )
 
-    for x, y in np.asarray(polygon, dtype=np.int32):
-        cv2.circle(image, (int(x), int(y)), 5, color, -1)
+
+def draw_bbox(
+    canvas,
+    bbox,
+    color,
+    thickness=2,
+    label=None,
+):
+    x1, y1, x2, y2 = bbox
+
+    cv2.rectangle(
+        canvas,
+        (x1, y1),
+        (x2, y2),
+        color,
+        thickness,
+    )
+
+    if label:
+        cv2.putText(
+            canvas,
+            label,
+            (x1, max(25, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            color,
+            2,
+        )
 
 
-def draw_sam_result(results):
-    result_image = image.copy()
+def draw_sam_result(base_image, results):
+    result_image = base_image.copy()
 
     for result in results:
         side = result["side"]
-        polygon = result["polygon"]
         bbox = result["bbox"]
         mask = result["mask"]
         score = result["score"]
@@ -286,39 +361,22 @@ def draw_sam_result(results):
             3,
         )
 
-        draw_polygon(
+        draw_bbox(
             result_image,
-            polygon,
+            bbox,
             (255, 0, 0),
-            3,
+            2,
+            f"{side} S={score:.2f}",
         )
 
         x1, y1, x2, y2 = bbox
-
-        cv2.rectangle(
-            result_image,
-            (x1, y1),
-            (x2, y2),
-            (255, 255, 0),
-            1,
-        )
-
-        cv2.putText(
-            result_image,
-            f"{side} S={score:.2f}",
-            (x1, max(30, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 255, 255),
-            2,
-        )
 
         cv2.putText(
             result_image,
             f"Area={result['area']}",
             (
                 x1,
-                min(result_image.shape[0] - 10, y2 + 30),
+                min(result_image.shape[0] - 10, y2 + 25),
             ),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -329,160 +387,195 @@ def draw_sam_result(results):
     return result_image
 
 
+def put_text(canvas, text, y, scale=0.8, color=(0, 255, 0)):
+    cv2.putText(
+        canvas,
+        text,
+        (20, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        2,
+    )
+
+
 def redraw():
     global display
 
     if image is None:
         return
 
+    title = f"[GT {current_idx + 1}/{NUM_GTS}] {gt_image_paths[current_idx].name}"
+    boxes = all_boxes[current_idx]
+    last = NUM_GTS - 1
+
+    # 当前这张已保存：显示 SAM2 结果
+    if current_saved():
+        display = draw_sam_result(image, gt_entries[current_idx]["results"])
+        put_text(display, title, 40)
+
+        if all(e is not None for e in gt_entries):
+            hint = "ALL GT SAVED - B: review, R: redo this image, ESC: exit"
+        elif current_idx < last:
+            hint = "SAVED - press N for next image, R: redo this image"
+        else:
+            hint = "SAVED - B: previous image, R: redo this image"
+
+        put_text(display, hint, 80, 0.7)
+
+        if status_message:
+            put_text(display, status_message, 120, 0.7)
+        return
+
+    # 未保存：显示 BBox 标注界面
     display = image.copy()
 
-    for index, polygon in enumerate(polygons):
+    for index, bbox in enumerate(boxes):
         label = "Left" if index == 0 else "Right"
 
-        draw_polygon(
+        draw_bbox(
             display,
-            polygon,
+            bbox,
             (255, 0, 0),
-            3,
-        )
-
-        x, y = polygon[0]
-
-        cv2.putText(
-            display,
+            2,
             label,
-            (x, max(30, y - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (255, 0, 0),
-            2,
         )
 
-    if current_polygon:
-        draw_polygon(
+    if drawing_box and start_point is not None and current_box is not None:
+        draw_bbox(
             display,
-            current_polygon,
+            current_box,
             (0, 255, 255),
             2,
-            closed=False,
+            "Selecting",
         )
 
-    if current_polygon and len(current_polygon) >= 2:
-        pts = np.asarray(current_polygon, dtype=np.int32).reshape(-1, 1, 2)
-        cv2.polylines(
-            display,
-            [pts],
-            False,
-            (0, 255, 255),
-            2,
-        )
-
-    if len(polygons) == 0:
-        text = "LEFT: click points, ENTER to finish"
-    elif len(polygons) == 1:
-        text = "RIGHT: click points, ENTER to finish"
+    if len(boxes) == 0:
+        text = "LEFT: drag mouse to draw BBox"
+    elif len(boxes) == 1:
+        text = "RIGHT: drag mouse to draw BBox"
     else:
-        text = "2 polygons selected - press S"
+        text = f"2 BBoxes ready - press S to run SAM2 and save GT {current_idx}"
 
-    cv2.putText(
-        display,
-        text,
-        (20, 40),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (0, 255, 0),
-        2,
-    )
+    put_text(display, title, 40)
+    put_text(display, text, 80)
 
     if status_message:
-        cv2.putText(
-            display,
-            status_message,
-            (20, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.75,
-            (0, 255, 0),
-            2,
-        )
-
-
-def finish_polygon():
-    global current_polygon
-    global polygons
-    global status_message
-
-    if len(current_polygon) < 3:
-        status_message = "Polygon needs at least 3 points"
-        redraw()
-        return
-
-    if len(polygons) >= MAX_POLYGONS:
-        status_message = "Maximum polygons reached"
-        redraw()
-        return
-
-    polygons.append(current_polygon.copy())
-    current_polygon = []
-
-    status_message = (
-        "LEFT polygon saved"
-        if len(polygons) == 1
-        else "RIGHT polygon saved"
-    )
-
-    redraw()
+        put_text(display, status_message, 120, 0.7)
 
 
 def mouse_callback(event, x, y, flags, param):
-    global current_polygon
+    global drawing_box
+    global start_point
+    global current_box
     global status_message
+
+    if current_saved():
+        if event == cv2.EVENT_LBUTTONDOWN:
+            status_message = "This GT is saved - press R to redo it"
+            redraw()
+        return
+
+    boxes = all_boxes[current_idx]
+
+    h, w = image.shape[:2]
+    x = max(0, min(x, w - 1))
+    y = max(0, min(y, h - 1))
 
     if event == cv2.EVENT_LBUTTONDOWN:
-        if len(polygons) >= MAX_POLYGONS:
+        if len(boxes) >= BOXES_PER_GT:
+            status_message = "Maximum BBoxes reached - press S to save or R to reset"
+            redraw()
             return
 
-        current_polygon.append((x, y))
-        status_message = f"Points: {len(current_polygon)}"
+        drawing_box = True
+        start_point = (x, y)
+        current_box = [x, y, x, y]
+        status_message = "Drag to select BBox"
         redraw()
 
-    elif event == cv2.EVENT_RBUTTONDOWN:
-        if current_polygon:
-            current_polygon.pop()
-            status_message = f"Points: {len(current_polygon)}"
+    elif event == cv2.EVENT_MOUSEMOVE and drawing_box:
+        current_box = normalize_bbox(
+            start_point[0],
+            start_point[1],
+            x,
+            y,
+        )
+        redraw()
+
+    elif event == cv2.EVENT_LBUTTONUP and drawing_box:
+        drawing_box = False
+
+        if start_point is None:
+            current_box = None
             redraw()
+            return
+
+        bbox = normalize_bbox(
+            start_point[0],
+            start_point[1],
+            x,
+            y,
+        )
+
+        if not bbox_is_valid(bbox):
+            status_message = f"BBox too small: minimum {MIN_BOX_SIZE}px"
+        else:
+            boxes.append(bbox)
+
+            status_message = (
+                "LEFT BBox saved" if len(boxes) == 1 else "RIGHT BBox saved"
+            )
+
+        start_point = None
+        current_box = None
+        redraw()
 
 
-def save_gt():
+def save_current_gt():
+    """对当前这张图运行 SAM2，保存 mask，并更新 gt.json。"""
     global status_message
-    global display
+    global sam_predictor
 
-    if len(polygons) != MAX_POLYGONS:
-        status_message = "ERROR: select LEFT and RIGHT polygon"
+    if current_saved():
+        status_message = "This GT is already saved - press R to redo it"
         redraw()
         return False
 
-    if current_polygon:
-        status_message = "Finish current polygon first"
+    if drawing_box:
+        status_message = "Finish drawing BBox first"
         redraw()
         return False
 
-    status_message = "Loading SAM2..."
-    redraw()
+    boxes = all_boxes[current_idx]
 
-    try:
-        predictor, device = load_sam2()
-    except Exception as e:
-        status_message = f"SAM2 load failed: {e}"
+    if len(boxes) != BOXES_PER_GT:
+        status_message = f"ERROR: need {BOXES_PER_GT} BBoxes ({len(boxes)} drawn)"
         redraw()
         return False
+
+    if sam_predictor is None:
+        status_message = "Loading SAM2..."
+        redraw()
+        cv2.imshow(WINDOW_NAME, display)
+        cv2.waitKey(1)
+
+        try:
+            sam_predictor = load_sam2()
+        except Exception as e:
+            status_message = f"SAM2 load failed: {e}"
+            redraw()
+            print(f"[ERROR] SAM2 load failed: {e}")
+            return False
 
     status_message = "Running SAM2..."
     redraw()
+    cv2.imshow(WINDOW_NAME, display)
+    cv2.waitKey(1)
 
-    results = generate_sam_masks(predictor)
+    results = generate_sam_masks(sam_predictor, current_idx)
 
-    if results is None or len(results) != MAX_POLYGONS:
+    if results is None or len(results) != BOXES_PER_GT:
         status_message = "SAM2 failed"
         redraw()
         return False
@@ -490,77 +583,68 @@ def save_gt():
     try:
         mask_infos = save_sam_masks(
             results,
+            current_idx,
             OUTPUT_PATH,
         )
     except Exception as e:
         status_message = f"Mask save failed: {e}"
         redraw()
+        print(f"[ERROR] Mask save failed: {e}")
         return False
 
+    gt_image = gt_images[current_idx]
+
     objects = []
-
     for result in results:
-        objects.append({
-            "index": result["index"],
-            "side": result["side"],
-            "polygon": [
-                [int(x), int(y)]
-                for x, y in result["polygon"]
-            ],
-            "bbox": result["bbox"],
-            "mask": mask_infos[result["index"]],
-        })
+        objects.append(
+            {
+                "index": result["index"],
+                "side": result["side"],
+                "bbox": [int(v) for v in result["bbox"]],
+                "mask": mask_infos[result["index"]],
+            }
+        )
 
-    data = {
-        "image": relative_to_project(gt_image_path),
+    entry = {
+        "id": current_idx,
+        "image": relative_to_project(gt_image_paths[current_idx]),
         "image_size": [
-            int(image.shape[1]),
-            int(image.shape[0]),
+            int(gt_image.shape[1]),
+            int(gt_image.shape[0]),
         ],
-        "object_count": MAX_POLYGONS,
+        "object_count": BOXES_PER_GT,
         "objects": objects,
-        "sam2": {
-            "checkpoint": relative_to_project(SAM2_CHECKPOINT),
-            "config": relative_to_project(SAM2_CONFIG),
-            "prompt_type": "polygon_to_bbox",
-            "selection": "highest_score",
-            "multimask_output": True,
-            "dynamic_multimask_via_stability": True,
-            "dynamic_multimask_stability_delta": 0.05,
-            "dynamic_multimask_stability_thresh": 0.98,
-        },
+    }
+
+    gt_entries[current_idx] = {
+        "entry": entry,
+        "results": results,
     }
 
     try:
-        with open(
-            OUTPUT_PATH,
-            "w",
-            encoding="utf-8",
-        ) as f:
-            json.dump(
-                data,
-                f,
-                indent=4,
-                ensure_ascii=False,
-            )
+        write_json()
     except Exception as e:
+        gt_entries[current_idx] = None
         status_message = f"JSON save failed: {e}"
         redraw()
+        print(f"[ERROR] JSON save failed: {e}")
         return False
 
-    display = draw_sam_result(results)
-    status_message = "GT SAVED!"
+    done = sum(e is not None for e in gt_entries)
 
-    cv2.imshow("GT Annotation", display)
-    cv2.waitKey(1)
+    if done == NUM_GTS:
+        status_message = "ALL GT SAVED!"
+    elif current_idx < NUM_GTS - 1:
+        status_message = f"GT {current_idx} SAVED - press N for next image"
+    else:
+        status_message = f"GT {current_idx} SAVED - go back (B) to finish the others"
+
+    redraw()
 
     print("===================================")
-    print(f"Image : {gt_image_path}")
-    print(f"JSON  : {OUTPUT_PATH}")
-    print(
-        f"Masks : "
-        f"{OUTPUT_PATH.with_suffix('')}_masks"
-    )
+    print(f"GT{current_idx} image: {gt_image_paths[current_idx]}")
+    print(f"JSON  : {OUTPUT_PATH} ({done}/{NUM_GTS} GT saved)")
+    print(f"Masks : {OUTPUT_PATH.with_suffix('')}_masks")
     print("===================================")
 
     return True
@@ -569,49 +653,50 @@ def save_gt():
 def main():
     global image
     global display
-    global polygons
-    global current_polygon
+    global all_boxes
     global status_message
-    global gt_image_path
+    global gt_image_paths
+    global gt_images
 
-    gt_image_path = find_gt_image()
+    gt_image_paths = find_gt_images()
 
-    image = cv2.imread(str(gt_image_path))
+    gt_images = []
+    for path in gt_image_paths:
+        img = cv2.imread(str(path))
 
-    if image is None:
-        raise RuntimeError(f"Cannot load GT image: {gt_image_path}")
+        if img is None:
+            raise RuntimeError(f"Cannot load GT image: {path}")
 
-    window_name = "GT Annotation"
+        gt_images.append(img)
+
+    switch_image(0)
 
     cv2.namedWindow(
-        window_name,
+        WINDOW_NAME,
         cv2.WINDOW_NORMAL,
     )
 
     cv2.setMouseCallback(
-        window_name,
+        WINDOW_NAME,
         mouse_callback,
     )
 
     redraw()
 
     print("===================================")
-    print("GT Polygon Annotation")
-    print(f"Image: {gt_image_path}")
+    print(f"GT BBox Annotation ({NUM_GTS} GT images, one at a time)")
+    for i, path in enumerate(gt_image_paths):
+        print(f"  GT{i}: {path}")
     print("===================================")
-    print("LEFT: click polygon points first.")
-    print("Press ENTER or SPACE to finish LEFT.")
-    print("RIGHT: click polygon points second.")
-    print("Press ENTER or SPACE to finish RIGHT.")
-    print("Right click: remove last point.")
-    print("Press S to run SAM2 and save.")
-    print("Press R to reset.")
-    print("Press ESC to exit.")
+    print("1. Drag LEFT BBox, then RIGHT BBox on the current image.")
+    print("2. Press S to run SAM2 and save this GT.")
+    print("3. Press N to move on to the next image (only after saving).")
+    print("Press B to go back, R to redo the current image, ESC to exit.")
     print("===================================")
 
     while True:
         cv2.imshow(
-            window_name,
+            WINDOW_NAME,
             display,
         )
 
@@ -620,16 +705,32 @@ def main():
         if key != -1:
             key &= 0xFF
 
-        if key in (13, 32):
-            finish_polygon()
+        if key in (ord("s"), ord("S")):
+            save_current_gt()
 
-        elif key in (ord("s"), ord("S")):
-            save_gt()
+        elif key in (ord("n"), ord("N")):
+            if current_idx >= NUM_GTS - 1:
+                status_message = "Already the last image"
+            elif not current_saved():
+                status_message = "Press S to save this GT first"
+            else:
+                switch_image(current_idx + 1)
+                status_message = ""
+            redraw()
+
+        elif key in (ord("b"), ord("B")):
+            if current_idx > 0:
+                switch_image(current_idx - 1)
+                status_message = ""
+            else:
+                status_message = "Already the first image"
+            redraw()
 
         elif key in (ord("r"), ord("R")):
-            polygons = []
-            current_polygon = []
-            status_message = ""
+            all_boxes[current_idx] = []
+            gt_entries[current_idx] = None
+            switch_image(current_idx)
+            status_message = "Reset - redraw BBoxes, then press S to save"
             redraw()
 
         elif key == 27:

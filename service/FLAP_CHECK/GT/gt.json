@@ -1,86 +1,102 @@
 {
-    "image": "service/FLAP_CHECK/GT/GT.png",
-    "image_size": [
-        1920,
-        1080
-    ],
-    "object_count": 2,
-    "objects": [
+    "gt_count": 2,
+    "expected_gt_count": 2,
+    "gts": [
         {
-            "index": 0,
-            "side": "left",
-            "polygon": [
-                [
-                    642,
-                    318
-                ],
-                [
-                    679,
-                    335
-                ],
-                [
-                    662,
-                    384
-                ],
-                [
-                    618,
-                    369
-                ]
+            "id": 0,
+            "image": "service/FLAP_CHECK/GT/GT0.png",
+            "image_size": [
+                1920,
+                1080
             ],
-            "bbox": [
-                618,
-                318,
-                679,
-                384
-            ],
-            "mask": {
-                "index": 0,
-                "side": "left",
-                "file": "service/FLAP_CHECK/GT/gt_masks/ear_0.png",
-                "score": 0.8121922016143799,
-                "area": 1707
-            }
+            "object_count": 2,
+            "objects": [
+                {
+                    "index": 0,
+                    "side": "left",
+                    "bbox": [
+                        633,
+                        327,
+                        678,
+                        382
+                    ],
+                    "mask": {
+                        "index": 0,
+                        "side": "left",
+                        "file": "service/FLAP_CHECK/GT/gt_masks/gt0_left.png",
+                        "score": 0.8421341776847839,
+                        "area": 1518
+                    }
+                },
+                {
+                    "index": 1,
+                    "side": "right",
+                    "bbox": [
+                        1274,
+                        317,
+                        1320,
+                        375
+                    ],
+                    "mask": {
+                        "index": 1,
+                        "side": "right",
+                        "file": "service/FLAP_CHECK/GT/gt_masks/gt0_right.png",
+                        "score": 0.7749872207641602,
+                        "area": 1294
+                    }
+                }
+            ]
         },
         {
-            "index": 1,
-            "side": "right",
-            "polygon": [
-                [
-                    1256,
-                    334
-                ],
-                [
-                    1289,
-                    306
-                ],
-                [
-                    1325,
-                    352
-                ],
-                [
-                    1292,
-                    384
-                ]
+            "id": 1,
+            "image": "service/FLAP_CHECK/GT/GT1.png",
+            "image_size": [
+                1920,
+                1080
             ],
-            "bbox": [
-                1256,
-                306,
-                1325,
-                384
-            ],
-            "mask": {
-                "index": 1,
-                "side": "right",
-                "file": "service/FLAP_CHECK/GT/gt_masks/ear_1.png",
-                "score": 0.7878279685974121,
-                "area": 1812
-            }
+            "object_count": 2,
+            "objects": [
+                {
+                    "index": 0,
+                    "side": "left",
+                    "bbox": [
+                        591,
+                        318,
+                        668,
+                        351
+                    ],
+                    "mask": {
+                        "index": 0,
+                        "side": "left",
+                        "file": "service/FLAP_CHECK/GT/gt_masks/gt1_left.png",
+                        "score": 0.8807743787765503,
+                        "area": 1592
+                    }
+                },
+                {
+                    "index": 1,
+                    "side": "right",
+                    "bbox": [
+                        1269,
+                        301,
+                        1339,
+                        341
+                    ],
+                    "mask": {
+                        "index": 1,
+                        "side": "right",
+                        "file": "service/FLAP_CHECK/GT/gt_masks/gt1_right.png",
+                        "score": 0.7195737361907959,
+                        "area": 1654
+                    }
+                }
+            ]
         }
     ],
     "sam2": {
         "checkpoint": "model/sam2.1_hiera_small.pt",
         "config": "model/sam2.1_hiera_s.yaml",
-        "prompt_type": "polygon_to_bbox",
+        "prompt_type": "bbox",
         "selection": "highest_score",
         "multimask_output": true,
         "dynamic_multimask_via_stability": true,

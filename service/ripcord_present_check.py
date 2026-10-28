@@ -19,7 +19,7 @@ DEFAULT_OUTPUT_DIR = APP_DIR / "output_ripcord_check"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 SIM_THRESHOLD = 0.75
-COVERAGE_THRESHOLD = 0.5
+COVERAGE_THRESHOLD = 0.4
 
 
 def load_image(path: Path):
