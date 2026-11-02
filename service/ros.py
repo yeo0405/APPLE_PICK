@@ -82,6 +82,9 @@ class PoseNode(Node):
         self.get_logger().info(f"Labels       : {self.label_names}")
         self.get_logger().info("==============================")
 
+        # RGB_REFINE section of config.yaml (None if missing -> refine disabled)
+        refine_cfg = cfg.get("RGB_REFINE")
+
         self.pose_estimator = PoseEstimator(
             model_path=str(model_path),
             config_path=str(model_config),
@@ -92,7 +95,9 @@ class PoseNode(Node):
             depth_z_max_mm=race_cfg.get("DEPTH_Z_MAX_MM"),
             invalid_depth_value=int(race_cfg.get("INVALID_DEPTH_VALUE", 65535)),
             class_id=None,
+            refine_config=refine_cfg,
         )
+
         self.get_logger().info("RACE-6D PoseEstimator initialized.")
 
         box_cfg = cfg.get("BOX_CHECK", {})

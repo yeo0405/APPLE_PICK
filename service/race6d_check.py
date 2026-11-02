@@ -1,8 +1,31 @@
 #!/usr/bin/env python3
+"""RACE-6D image check (with RGB_REFINE diagnostics).
+
+Usage
+    python race6d_check.py --input ../assets/race_6d/
+    python race6d_check.py --input ../assets/race_6d/ --no-refine     # baseline
+    python race6d_check.py --input ../assets/race_6d/xxx_color.png    # single image
+    python race6d_check.py --input ../assets/race_6d/ --csv           # also write a CSV
+
+Input folder: pairs of  <name>_color.png  and  <name>_depth.png  (16-bit depth, mm).
+
+Output (in --out-dir, default ./race6d_check_out)
+    <name>_race6d_{refine|raw}.png : ONE debug image per input (cropped x=240..1680, full resolution)
+
+Overlay legend
+    yellow polygon : RACE top-face projection (before refine)
+    green dots     : detected top-face corners
+    cyan polygon   : refined top face (only when refine accepted)
+    yellow ring    : RACE origin,  cyan ring : final origin
+    RGB arrows     : final pose axes (X red, Y green, Z blue)
+"""
+
 from __future__ import annotations
 
 import argparse
-import subprocess
+import csv
+import time
+from collections import Counter
 from pathlib import Path
 
 import cv2
@@ -12,17 +35,20 @@ import yaml
 
 from RACE_6D.core import PoseEstimator
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
+DEFAULT_INPUT = PROJECT_ROOT / "assets" / "race_6d"
 
 INPUT_WIDTH = 1920
 INPUT_HEIGHT = 1080
 CROP_X = 240
 CROP_WIDTH = 1440
-MODEL_WIDTH = 640
-MODEL_HEIGHT = 480
 AXIS_LENGTH_MM = 50.0
+
+COLOR_SUFFIX = "_color.png"
+DEPTH_SUFFIX = "_depth.png"
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 DEFAULT_K = np.array(
     [
@@ -33,13 +59,64 @@ DEFAULT_K = np.array(
     dtype=np.float32,
 )
 
+CSV_FIELDS = [
+    "image",
+    "label",
+    "name",
+    "confidence",
+    "refined",
+    "reason",
+    "tx_raw",
+    "ty_raw",
+    "tz_raw",
+    "tx",
+    "ty",
+    "tz",
+    "dt_mm",
+    "dang_deg",
+    "edge_shift_0",
+    "edge_shift_1",
+    "edge_shift_2",
+    "edge_shift_3",
+    "corner_shift_px",
+    "reproj_px",
+    "area_ratio",
+    "depth_med_mm",
+    "z_err_raw_mm",
+    "z_err_ref_mm",
+]
 
+
+# ----------------------------------------------------------------------
+# args / config
+# ----------------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="RACE-6D RGB-D video inference."
+        description="RACE-6D image check (with RGB_REFINE diagnostics)."
     )
-    parser.add_argument("rgb", help="Path to RGB MP4.")
-    parser.add_argument("depth", help="Path to depth MKV.")
+    parser.add_argument(
+        "--input",
+        default=str(DEFAULT_INPUT),
+        help="Folder with <name>_color.png / <name>_depth.png pairs, "
+        "or a single *_color.png file.",
+    )
+    parser.add_argument(
+        "--no-refine",
+        action="store_true",
+        help="Disable RGB_REFINE (baseline run for comparison).",
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for the output image (default 1.0).",
+    )
+    parser.add_argument(
+        "--out-dir", default="", help="Output directory (default: ./race6d_check_out)."
+    )
+    parser.add_argument(
+        "--csv", action="store_true", help="Also write a per-detection CSV."
+    )
     return parser.parse_args()
 
 
@@ -66,83 +143,105 @@ def load_race6d_config():
     race_config = config.get("RACE_6D")
 
     if not isinstance(race_config, dict):
-        raise ValueError(
-            f"RACE_6D section is missing in {CONFIG_PATH}"
-        )
+        raise ValueError(f"RACE_6D section is missing in {CONFIG_PATH}")
 
     label_names = race_config.get("LABEL_NAMES", {})
 
     if not isinstance(label_names, dict):
-        raise ValueError(
-            "RACE_6D.LABEL_NAMES must be a mapping."
-        )
+        raise ValueError("RACE_6D.LABEL_NAMES must be a mapping.")
 
     return {
-        "model_path": resolve_project_path(
-            race_config["MODEL_PATH"]
-        ),
-        "model_config": resolve_project_path(
-            race_config["MODEL_CONFIG"]
-        ),
-        "score_threshold": float(
-            race_config.get("SCORE_THRESHOLD", 0.25)
-        ),
-        "max_per_class": int(
-            race_config.get("MAX_PER_CLASS", 1)
-        ),
+        "model_path": resolve_project_path(race_config["MODEL_PATH"]),
+        "model_config": resolve_project_path(race_config["MODEL_CONFIG"]),
+        "score_threshold": float(race_config.get("SCORE_THRESHOLD", 0.25)),
+        "max_per_class": int(race_config.get("MAX_PER_CLASS", 1)),
         "max_detections": race_config.get("MAX_DETECTIONS"),
         "class_id": race_config.get("CLASS_ID"),
-        "depth_z_max_mm": float(
-            race_config.get("DEPTH_Z_MAX_MM", 2000.0)
-        ),
-        "invalid_depth_value": int(
-            race_config.get("INVALID_DEPTH_VALUE", 65535)
-        ),
-        "label_names": {
-            int(k): str(v)
-            for k, v in label_names.items()
-        },
+        "depth_z_max_mm": float(race_config.get("DEPTH_Z_MAX_MM", 2000.0)),
+        "invalid_depth_value": int(race_config.get("INVALID_DEPTH_VALUE", 65535)),
+        "label_names": {int(k): str(v) for k, v in label_names.items()},
+        # RGB_REFINE is a top-level section (None if missing)
+        "refine_config": config.get("RGB_REFINE"),
     }
 
 
-def preprocess_debug_image(image: np.ndarray) -> np.ndarray:
-    if image is None:
-        raise ValueError("Cannot preprocess empty image.")
+# ----------------------------------------------------------------------
+# input pairing / io
+# ----------------------------------------------------------------------
+def collect_pairs(input_value: str):
+    path = Path(input_value).expanduser().resolve()
 
-    cropped = image[
-        :INPUT_HEIGHT,
-        CROP_X:CROP_X + CROP_WIDTH,
-    ]
+    if path.is_file():
+        colors = [path]
+    elif path.is_dir():
+        colors = sorted(path.glob(f"*{COLOR_SUFFIX}"))
+    else:
+        raise FileNotFoundError(f"Input not found: {path}")
 
-    return cv2.resize(
-        cropped,
-        (MODEL_WIDTH, MODEL_HEIGHT),
-        interpolation=cv2.INTER_LINEAR,
-    )
+    pairs = []
+
+    for color in colors:
+        if not color.name.endswith(COLOR_SUFFIX):
+            print(f"[WARN] Skip (not a *{COLOR_SUFFIX} file): {color.name}")
+            continue
+
+        stem = color.name[: -len(COLOR_SUFFIX)]
+        depth = color.with_name(stem + DEPTH_SUFFIX)
+
+        if not depth.is_file():
+            print(f"[WARN] Skip {color.name}: missing {depth.name}")
+            continue
+
+        pairs.append((stem, color, depth))
+
+    return pairs
 
 
-def get_model_intrinsic(K: np.ndarray) -> np.ndarray:
-    model_K = K.astype(np.float32).copy()
-    model_K[0, 2] -= CROP_X
+def read_color(path: Path) -> np.ndarray:
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
 
-    sx = MODEL_WIDTH / CROP_WIDTH
-    sy = MODEL_HEIGHT / INPUT_HEIGHT
+    if img is None:
+        raise RuntimeError(f"Cannot read color image: {path}")
 
-    model_K[0, 0] *= sx
-    model_K[0, 2] *= sx
-    model_K[1, 1] *= sy
-    model_K[1, 2] *= sy
+    if img.shape[:2] != (INPUT_HEIGHT, INPUT_WIDTH):
+        raise RuntimeError(
+            f"Color image must be {INPUT_WIDTH}x{INPUT_HEIGHT}, "
+            f"got {img.shape[1]}x{img.shape[0]}: {path.name}"
+        )
 
-    return model_K
+    return img
 
 
+def read_depth(path: Path, color_shape) -> np.ndarray:
+    depth = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+
+    if depth is None:
+        raise RuntimeError(f"Cannot read depth image: {path}")
+
+    if depth.ndim == 3:
+        depth = depth[:, :, 0]
+
+    if depth.dtype != np.uint16:
+        print(f"[WARN] {path.name}: depth dtype is {depth.dtype}, expected uint16 (mm)")
+
+    if depth.shape != tuple(color_shape[:2]):
+        raise RuntimeError(
+            f"RGB/depth size mismatch: RGB={tuple(color_shape[:2])}, "
+            f"Depth={depth.shape} ({path.name})"
+        )
+
+    return depth
+
+
+# ----------------------------------------------------------------------
+# geometry helpers
+# ----------------------------------------------------------------------
 def quaternion_to_rotation_matrix(q) -> np.ndarray:
     q = np.asarray(q, dtype=np.float64).reshape(-1)
 
     if q.size != 4:
         raise ValueError(f"Invalid quaternion: {q}")
 
-    qw, qx, qy, qz = q
     norm = np.linalg.norm(q)
 
     if norm < 1e-12:
@@ -172,10 +271,7 @@ def quaternion_to_rotation_matrix(q) -> np.ndarray:
     )
 
 
-def project_point(
-    point: np.ndarray,
-    K: np.ndarray,
-):
+def project_point(point: np.ndarray, K: np.ndarray):
     x, y, z = point
 
     if not np.isfinite(z) or z <= 1e-6:
@@ -190,17 +286,21 @@ def project_point(
     return int(round(u)), int(round(v))
 
 
-def draw_axis(
-    image: np.ndarray,
-    translation_mm,
-    quaternion,
-    K: np.ndarray,
-    axis_length_mm: float,
-) -> bool:
-    t = np.asarray(
-        translation_mm,
-        dtype=np.float64,
-    ).reshape(-1)
+def rotation_angle_deg(Ra: np.ndarray, Rb: np.ndarray) -> float:
+    c = (np.trace(Ra @ Rb.T) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+
+
+# ----------------------------------------------------------------------
+# drawing
+# ----------------------------------------------------------------------
+def put_text(img, text, org, color=(255, 255, 255), scale=0.7, thick=2):
+    cv2.putText(img, text, org, FONT, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
+    cv2.putText(img, text, org, FONT, scale, color, thick, cv2.LINE_AA)
+
+
+def draw_axis(image, translation_mm, quaternion, K, axis_length_mm) -> bool:
+    t = np.asarray(translation_mm, dtype=np.float64).reshape(-1)
 
     if t.size != 3 or not np.all(np.isfinite(t)):
         return False
@@ -219,11 +319,7 @@ def draw_axis(
         ],
         dtype=np.float64,
     )
-
-    projected = [
-        project_point(point, K)
-        for point in points
-    ]
+    projected = [project_point(p, K) for p in points]
 
     if projected[0] is None:
         return False
@@ -234,21 +330,8 @@ def draw_axis(
     def valid(point):
         if point is None:
             return False
-
         x, y = point
-        return (
-            -w <= x <= 2 * w
-            and -h <= y <= 2 * h
-        )
-
-    cv2.circle(
-        image,
-        origin,
-        5,
-        (255, 255, 255),
-        -1,
-        cv2.LINE_AA,
-    )
+        return -w <= x <= 2 * w and -h <= y <= 2 * h
 
     for name, endpoint, color in (
         ("X", projected[1], (0, 0, 255)),
@@ -258,21 +341,12 @@ def draw_axis(
         if not valid(endpoint):
             continue
 
-        cv2.arrowedLine(
-            image,
-            origin,
-            endpoint,
-            color,
-            3,
-            cv2.LINE_AA,
-            tipLength=0.15,
-        )
-
+        cv2.arrowedLine(image, origin, endpoint, color, 3, cv2.LINE_AA, tipLength=0.15)
         cv2.putText(
             image,
             name,
             (endpoint[0] + 8, endpoint[1]),
-            cv2.FONT_HERSHEY_SIMPLEX,
+            FONT,
             0.7,
             color,
             2,
@@ -282,201 +356,239 @@ def draw_axis(
     return True
 
 
-def draw_detection(
-    image: np.ndarray,
-    detection: dict,
-    label_names: dict[int, str],
-    K: np.ndarray,
-    axis_length_mm: float,
-) -> bool:
-    translation_mm = detection.get("translation_mm")
-    quaternion = detection.get("quat")
+def draw_origins(image, det, K) -> None:
+    """Yellow ring = RACE origin, cyan ring = final origin."""
+    t_raw = det.get("translation_mm_raw")
+    t = det.get("translation_mm")
 
-    if translation_mm is None or quaternion is None:
-        return False
-
-    label = int(detection.get("label", -1))
-    name = label_names.get(label, f"class_{label}")
-
-    if not draw_axis(
-        image,
-        translation_mm,
-        quaternion,
-        K,
-        axis_length_mm,
-    ):
-        return False
-
-    t = np.asarray(
-        translation_mm,
-        dtype=np.float64,
-    ).reshape(-1)
-
-    confidence = detection.get("confidence")
-
-    if confidence is None:
-        text = (
-            f"{name} "
-            f"T=({t[0]:.0f}, "
-            f"{t[1]:.0f}, "
-            f"{t[2]:.0f})mm"
-        )
-    else:
-        text = (
-            f"{name} "
-            f"{float(confidence):.2f} "
-            f"T=({t[0]:.0f}, "
-            f"{t[1]:.0f}, "
-            f"{t[2]:.0f})mm"
-        )
-
-    y = min(
-        35 + label * 30,
-        image.shape[0] - 15,
-    )
-
-    cv2.putText(
-        image,
-        text,
-        (20, y),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (255, 255, 255),
-        2,
-        cv2.LINE_AA,
-    )
-
-    return True
+    for tt, color, radius in ((t_raw, (0, 255, 255), 9), (t, (255, 255, 0), 5)):
+        if tt is None:
+            continue
+        p = project_point(np.asarray(tt, dtype=np.float64), K)
+        if p is not None:
+            cv2.circle(image, p, radius, color, 2, cv2.LINE_AA)
 
 
-def open_depth_pipe(path: Path):
-    command = [
-        "ffmpeg",
-        "-v",
-        "error",
-        "-i",
-        str(path),
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "gray16le",
-        "pipe:1",
-    ]
+# ----------------------------------------------------------------------
+# per-detection analysis
+# ----------------------------------------------------------------------
+def depth_median_mm(depth, bbox, invalid, z_max, ratio=0.2):
+    x0, y0, x1, y1 = bbox
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    hw, hh = (x1 - x0) * ratio, (y1 - y0) * ratio
 
-    return subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1024 * 1024,
-    )
+    patch = depth[
+        max(0, int(cy - hh)) : int(cy + hh),
+        max(0, int(cx - hw)) : int(cx + hw),
+    ].astype(np.float32)
+
+    patch = patch[(patch > 0) & (patch != invalid) & (patch <= z_max)]
+
+    return float(np.median(patch)) if patch.size >= 50 else None
 
 
-def read_depth_frame(
-    process,
-    width: int,
-    height: int,
-):
-    frame_bytes = width * height * 2
-    raw = process.stdout.read(frame_bytes)
-
-    if len(raw) != frame_bytes:
+def half_thickness_mm(refine_cfg, label):
+    try:
+        return float(refine_cfg["LABELS"][int(label)]["SIZE_M"]["Z"]) * 500.0
+    except Exception:
         return None
 
-    return np.frombuffer(
-        raw,
-        dtype="<u2",
-    ).reshape(
-        height,
-        width,
+
+def analyse_detection(det, image_name, depth, cfg, label_names):
+    label = int(det.get("label", -1))
+    name = label_names.get(label, f"class_{label}")
+
+    t = np.asarray(det["translation_mm"], dtype=np.float64)
+    t_raw = np.asarray(det.get("translation_mm_raw", t), dtype=np.float64)
+    R = np.asarray(det["rotation"], dtype=np.float64)
+    R_raw = np.asarray(det.get("rotation_raw", R), dtype=np.float64)
+
+    info = det.get("refine_info") or {}
+    refined = bool(det.get("refined", False))
+    reason = info.get("reason", "n/a")
+    shifts = list(info.get("edge_shift_px") or [])
+    shifts = shifts + [np.nan] * (4 - len(shifts))
+
+    dep = depth_median_mm(
+        depth, det["bbox_xyxy"], cfg["invalid_depth_value"], cfg["depth_z_max_mm"]
     )
+    half = half_thickness_mm(cfg["refine_config"], label)
+
+    # ideal: z_center - depth_surface == half thickness -> err == 0 (rough for tilted boxes)
+    z_err_raw = z_err_ref = np.nan
+    if dep is not None and half is not None:
+        z_err_raw = float(t_raw[2] - dep - half)
+        z_err_ref = float(t[2] - dep - half)
+
+    row = {
+        "image": image_name,
+        "label": label,
+        "name": name,
+        "confidence": float(det.get("confidence", np.nan)),
+        "refined": int(refined),
+        "reason": reason,
+        "tx_raw": t_raw[0],
+        "ty_raw": t_raw[1],
+        "tz_raw": t_raw[2],
+        "tx": t[0],
+        "ty": t[1],
+        "tz": t[2],
+        "dt_mm": float(np.linalg.norm(t - t_raw)),
+        "dang_deg": rotation_angle_deg(R, R_raw),
+        "edge_shift_0": shifts[0],
+        "edge_shift_1": shifts[1],
+        "edge_shift_2": shifts[2],
+        "edge_shift_3": shifts[3],
+        "corner_shift_px": info.get("corner_shift_px", np.nan),
+        "reproj_px": info.get("reproj_px", np.nan),
+        "area_ratio": info.get("area_ratio", np.nan),
+        "depth_med_mm": dep if dep is not None else np.nan,
+        "z_err_raw_mm": z_err_raw,
+        "z_err_ref_mm": z_err_ref,
+    }
+
+    def f(v, nd=1):
+        return "nan" if v is None or not np.isfinite(v) else f"{v:.{nd}f}"
+
+    tag = "REFINED" if refined else "RAW"
+    lines = [
+        f"{name} {row['confidence']:.2f}  [{tag}] {reason}",
+        f"T raw=({t_raw[0]:.0f},{t_raw[1]:.0f},{t_raw[2]:.0f})  "
+        f"ref=({t[0]:.0f},{t[1]:.0f},{t[2]:.0f})  dt={f(row['dt_mm'])}mm  dR={f(row['dang_deg'])}deg",
+        "edge_shift(px)=[" + ", ".join(f(v) for v in shifts) + "]  "
+        f"corner_shift={f(row['corner_shift_px'])}  reproj={f(row['reproj_px'], 2)}",
+        f"depth={f(row['depth_med_mm'], 0)}mm  z_err raw={f(z_err_raw)}  ref={f(z_err_ref)}",
+    ]
+
+    return row, lines
 
 
+# ----------------------------------------------------------------------
+# summary
+# ----------------------------------------------------------------------
+def print_summary(rows, timings, use_refine, n_images):
+    print("=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Images         : {n_images}")
+
+    if timings:
+        arr = np.asarray(timings) * 1000.0
+        print(
+            f"predict() time : mean={arr.mean():.1f} ms  "
+            f"median={np.median(arr):.1f} ms  max={arr.max():.1f} ms"
+        )
+
+    if not rows:
+        print("No detections.")
+        return
+
+    print(f"Detections     : {len(rows)}")
+
+    zr = np.array([r["z_err_raw_mm"] for r in rows], dtype=float)
+    zf = np.array([r["z_err_ref_mm"] for r in rows], dtype=float)
+
+    if not use_refine:
+        z = zr[np.isfinite(zr)]
+        if z.size:
+            print(
+                f"z_err (raw)    : median={np.median(z):+.1f} mm  mean|.|={np.abs(z).mean():.1f} mm"
+            )
+        return
+
+    reasons = Counter(r["reason"] for r in rows)
+    ok_rows = [r for r in rows if r["refined"]]
+    print(
+        f"Refined        : {len(ok_rows)}/{len(rows)} ({100.0 * len(ok_rows) / len(rows):.1f}%)"
+    )
+    print("Reasons        : " + ", ".join(f"{k}={v}" for k, v in reasons.most_common()))
+
+    # edge shifts exist even for rejected detections -> use all rows
+    sh = np.array([[r[f"edge_shift_{i}"] for i in range(4)] for r in rows], dtype=float)
+    if np.isfinite(sh).any():
+        med = np.nanmedian(sh, axis=0)
+        print(
+            "edge_shift med : [" + ", ".join(f"{v:+.1f}" for v in med) + "] px "
+            "(+ = real edge outside prediction -> RACE face too small)"
+        )
+
+    if ok_rows:
+
+        def med(key):
+            return float(np.nanmedian([r[key] for r in ok_rows]))
+
+        print(f"dt_mm          : median={med('dt_mm'):.1f}")
+        print(f"dang_deg       : median={med('dang_deg'):.1f}")
+        print(f"reproj_px      : median={med('reproj_px'):.2f}")
+        print(f"corner_shift   : median={med('corner_shift_px'):.1f} px")
+
+    m = np.isfinite(zr) & np.isfinite(zf)
+    if m.any():
+        print(
+            f"z_err raw      : median={np.median(zr[m]):+.1f} mm  mean|.|={np.abs(zr[m]).mean():.1f} mm"
+        )
+        print(
+            f"z_err refined  : median={np.median(zf[m]):+.1f} mm  mean|.|={np.abs(zf[m]).mean():.1f} mm"
+        )
+        print(
+            "(z_err = z_center - depth_median - half_thickness; ideal ~ 0; rough when the box is tilted)"
+        )
+
+
+# ----------------------------------------------------------------------
 def main():
     args = parse_args()
 
-    rgb_path = Path(args.rgb).resolve()
-    depth_path = Path(args.depth).resolve()
+    pairs = collect_pairs(args.input)
 
-    if not rgb_path.is_file():
-        raise FileNotFoundError(rgb_path)
+    if not pairs:
+        raise SystemExit(
+            f"No *{COLOR_SUFFIX} / *{DEPTH_SUFFIX} pairs found in: {args.input}"
+        )
 
-    if not depth_path.is_file():
-        raise FileNotFoundError(depth_path)
-
-    race_config = load_race6d_config()
-
-    model_path = race_config["model_path"]
-    model_config = race_config["model_config"]
-    label_names = race_config["label_names"]
+    cfg = load_race6d_config()
+    model_path = cfg["model_path"]
+    model_config = cfg["model_config"]
+    label_names = cfg["label_names"]
 
     if not model_path.is_file():
-        raise FileNotFoundError(
-            f"RACE-6D model not found: {model_path}"
-        )
+        raise FileNotFoundError(f"RACE-6D model not found: {model_path}")
 
     if not model_config.is_file():
-        raise FileNotFoundError(
-            f"RACE-6D config not found: {model_config}"
-        )
+        raise FileNotFoundError(f"RACE-6D config not found: {model_config}")
 
-    output_path = (
-        Path.cwd()
-        / f"{rgb_path.stem}_race6d.mp4"
+    refine_cfg = None if args.no_refine else cfg["refine_config"]
+    use_refine = bool(refine_cfg and refine_cfg.get("ENABLED", False))
+    mode = "refine" if use_refine else "raw"
+
+    out_dir = (
+        Path(args.out_dir).resolve()
+        if args.out_dir
+        else Path.cwd() / "race6d_check_out"
     )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"race6d_check_{mode}.csv"
 
     camera_matrix = DEFAULT_K.copy()
-    model_intrinsic = get_model_intrinsic(camera_matrix)
 
-    cap = cv2.VideoCapture(str(rgb_path))
-
-    if not cap.isOpened():
-        raise RuntimeError(
-            f"Cannot open RGB video: {rgb_path}"
-        )
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-
-    if not np.isfinite(fps) or fps <= 0:
-        fps = 30.0
-
-    width = int(
-        cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    )
-    height = int(
-        cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    )
-    frame_count = int(
-        cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    )
-
-    if width != INPUT_WIDTH or height != INPUT_HEIGHT:
-        cap.release()
-        raise RuntimeError(
-            f"RGB video must be "
-            f"{INPUT_WIDTH}x{INPUT_HEIGHT}, "
-            f"got {width}x{height}"
-        )
+    out_w = int(round(CROP_WIDTH * args.scale))
+    out_h = int(round(INPUT_HEIGHT * args.scale))
 
     print("=" * 70)
-    print("RACE-6D RGB-D VIDEO INFERENCE")
+    print("RACE-6D IMAGE CHECK (RGB_REFINE test)")
     print("=" * 70)
-    print(f"Project   : {PROJECT_ROOT}")
-    print(f"Config    : {CONFIG_PATH}")
-    print(f"RGB       : {rgb_path}")
-    print(f"Depth     : {depth_path}")
-    print(f"Output    : {output_path}")
-    print(f"Model     : {model_path}")
-    print(f"Model cfg : {model_config}")
-    print(f"Input     : {width} x {height}")
-    print(f"Crop      : x={CROP_X}, width={CROP_WIDTH}")
-    print(f"Output    : {MODEL_WIDTH} x {MODEL_HEIGHT}")
-    print(f"FPS       : {fps:.3f}")
-    print(f"Frames    : {frame_count}")
-    print(f"Score     : {race_config['score_threshold']}")
-    print(f"Max/class : {race_config['max_per_class']}")
-    print(f"Axis      : {AXIS_LENGTH_MM:.1f} mm")
-    print(f"Original K:\n{camera_matrix}")
-    print(f"Model K:\n{model_intrinsic}")
+    print(f"Input      : {Path(args.input).resolve()}  ({len(pairs)} pairs)")
+    print(f"Output dir : {out_dir}")
+    print(f"Model      : {model_path}")
+    print(
+        f"Mode       : {mode.upper()}"
+        + ("" if use_refine else "  (RGB_REFINE disabled or missing)")
+    )
+    if use_refine:
+        print(
+            f"Refine lbl : {sorted(int(k) for k in (refine_cfg.get('LABELS') or {}))}"
+        )
+        print(f"Refine prm : {refine_cfg.get('PARAMS')}")
     print("=" * 70)
 
     print("[INFO] Initializing RACE-6D...")
@@ -484,217 +596,127 @@ def main():
     estimator = PoseEstimator(
         model_path=str(model_path),
         config_path=str(model_config),
-        device=(
-            "cuda"
-            if torch.cuda.is_available()
-            else "cpu"
-        ),
-        score_threshold=race_config["score_threshold"],
-        max_per_class=race_config["max_per_class"],
-        max_detections=race_config["max_detections"],
-        depth_z_max_mm=race_config["depth_z_max_mm"],
-        invalid_depth_value=race_config["invalid_depth_value"],
-        class_id=race_config["class_id"],
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        score_threshold=cfg["score_threshold"],
+        max_per_class=cfg["max_per_class"],
+        max_detections=cfg["max_detections"],
+        depth_z_max_mm=cfg["depth_z_max_mm"],
+        invalid_depth_value=cfg["invalid_depth_value"],
+        class_id=cfg["class_id"],
+        refine_config=refine_cfg if use_refine else None,
     )
 
     print("[INFO] RACE-6D ready.")
 
-    # 本脚本是离线推理工具，不连接 ROS。
-    # 输入：RGB MP4 + Depth MKV
-    # 推理：PoseEstimator.predict()
-    # 输出：detections + debug_image
-    # 最终：写入 race6d MP4，不发布/订阅任何 ROS topic。
+    rows: list[dict] = []
+    timings: list[float] = []
+    warmed_up = False
+    n_done = 0
 
-    depth_process = open_depth_pipe(depth_path)
-
-    writer = cv2.VideoWriter(
-        str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (MODEL_WIDTH, MODEL_HEIGHT),
-    )
-
-    if not writer.isOpened():
-        depth_process.kill()
-        cap.release()
-        raise RuntimeError(
-            f"Cannot create output video: {output_path}"
-        )
-
-    frame_index = 0
-    success_frames = 0
-    total_detections = 0
-
-    try:
-        while True:
-            ok, rgb = cap.read()
-
-            if not ok:
-                break
-
-            depth = read_depth_frame(
-                depth_process,
-                width,
-                height,
-            )
-
-            if depth is None:
-                print(
-                    f"\n[INFO] Depth ended at "
-                    f"frame {frame_index}."
-                )
-                break
-
-            if depth.shape != (height, width):
-                raise RuntimeError(
-                    "RGB/depth resolution mismatch: "
-                    f"RGB={rgb.shape[:2]}, "
-                    f"Depth={depth.shape}"
-                )
-
-            try:
-                # 离线推理：这里直接调用模型，不经过 ROS topic。
-                result = estimator.predict(
-                    rgb=rgb,
-                    depth=depth,
-                    intrinsic=camera_matrix,
-                )
-
-                detections = result.get(
-                    "detections",
-                    [],
-                )
-
-                if not isinstance(detections, list):
-                    detections = []
-
-                debug = result.get("debug_image")
-
-                if debug is None:
-                    debug = preprocess_debug_image(rgb)
-                else:
-                    debug = debug.copy()
-
-                if debug.shape[:2] != (
-                    MODEL_HEIGHT,
-                    MODEL_WIDTH,
-                ):
-                    debug = cv2.resize(
-                        debug,
-                        (MODEL_WIDTH, MODEL_HEIGHT),
-                        interpolation=cv2.INTER_LINEAR,
-                    )
-
-                valid_detections = 0
-
-                for detection in detections:
-                    if not isinstance(detection, dict):
-                        continue
-
-                    if draw_detection(
-                        debug,
-                        detection,
-                        label_names,
-                        model_intrinsic,
-                        AXIS_LENGTH_MM,
-                    ):
-                        valid_detections += 1
-
-                if valid_detections:
-                    success_frames += 1
-
-                total_detections += valid_detections
-
-                debug_height, debug_width = debug.shape[:2]
-
-                cv2.putText(
-                    debug,
-                    f"Frame: {frame_index}",
-                    (20, debug_height - 45),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-                cv2.putText(
-                    debug,
-                    f"Detections: {valid_detections}",
-                    (20, debug_height - 15),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-            except Exception as error:
-                print(
-                    f"\n[ERROR] Frame "
-                    f"{frame_index}: "
-                    f"{type(error).__name__}: "
-                    f"{error}"
-                )
-
-                debug = preprocess_debug_image(rgb)
-
-                cv2.putText(
-                    debug,
-                    "RACE-6D ERROR",
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-            if (
-                debug.shape[1] != MODEL_WIDTH
-                or debug.shape[0] != MODEL_HEIGHT
-            ):
-                debug = cv2.resize(
-                    debug,
-                    (MODEL_WIDTH, MODEL_HEIGHT),
-                    interpolation=cv2.INTER_LINEAR,
-                )
-
-            writer.write(debug)
-
-            frame_index += 1
-
-            if frame_index % 10 == 0:
-                print(
-                    f"\rFrame: {frame_index} | "
-                    f"Pose frames: {success_frames} | "
-                    f"Detections: {total_detections}",
-                    end="",
-                    flush=True,
-                )
-
-    finally:
-        cap.release()
-        writer.release()
-
-        if depth_process.poll() is None:
-            depth_process.terminate()
+    for stem, color_path, depth_path in pairs:
+        print(f"\n--- {stem} ---")
 
         try:
-            depth_process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            depth_process.kill()
+            rgb = read_color(color_path)
+            depth = read_depth(depth_path, rgb.shape)
+
+            if not warmed_up:  # CUDA warm-up, excluded from timing
+                estimator.predict(rgb=rgb, depth=depth, intrinsic=camera_matrix)
+                warmed_up = True
+
+            t0 = time.perf_counter()
+            result = estimator.predict(rgb=rgb, depth=depth, intrinsic=camera_matrix)
+            timings.append(time.perf_counter() - t0)
+
+            detections = result.get("detections", [])
+            if not isinstance(detections, list):
+                detections = []
+
+            # predict() returns the FULL-resolution debug image
+            debug_full = result.get("debug_image")
+            debug_full = rgb.copy() if debug_full is None else debug_full.copy()
+
+            text_blocks: list[list[str]] = []
+            n_kept = 0
+
+            for det in detections:
+                if not isinstance(det, dict):
+                    continue
+
+                if not draw_axis(
+                    debug_full,
+                    det.get("translation_mm"),
+                    det.get("quat"),
+                    camera_matrix,
+                    AXIS_LENGTH_MM,
+                ):
+                    continue
+
+                draw_origins(debug_full, det, camera_matrix)
+
+                row, lines = analyse_detection(det, stem, depth, cfg, label_names)
+                rows.append(row)
+                text_blocks.append(lines)
+                n_kept += 1
+
+                print("\n".join(lines))
+
+            if not n_kept:
+                print("No detection.")
+                text_blocks = [["No detection"]]
+
+            # ---- the single debug image (cropped, full resolution) ----
+            view = debug_full[:, CROP_X : CROP_X + CROP_WIDTH].copy()
+
+            y = 32
+            for lines in text_blocks:
+                for i, line in enumerate(lines):
+                    put_text(
+                        view,
+                        line,
+                        (15, y),
+                        scale=0.65 if i else 0.75,
+                        color=(255, 255, 255) if i else (0, 255, 255),
+                    )
+                    y += 28
+                y += 10
+
+            put_text(view, f"{stem}  [{mode}]", (15, view.shape[0] - 15), scale=0.7)
+            put_text(
+                view,
+                "yellow=RACE face  green=corners  cyan=refined",
+                (15, view.shape[0] - 45),
+                scale=0.55,
+                color=(200, 200, 200),
+                thick=1,
+            )
+
+            if (out_w, out_h) != (view.shape[1], view.shape[0]):
+                view = cv2.resize(view, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
+            cv2.imwrite(str(out_dir / f"{stem}_race6d_{mode}.png"), view)
+            n_done += 1
+
+        except Exception as error:
+            print(f"[ERROR] {stem}: {type(error).__name__}: {error}")
+
+    if args.csv and rows:
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+            w.writeheader()
+            for r in rows:
+                w.writerow({k: r.get(k, "") for k in CSV_FIELDS})
 
     print()
     print("=" * 70)
     print("DONE")
     print("=" * 70)
-    print(f"Frames      : {frame_index}")
-    print(f"Pose frames : {success_frames}")
-    print(f"Detections  : {total_detections}")
-    print(f"Output      : {output_path}")
-    print(f"Output size : {MODEL_WIDTH} x {MODEL_HEIGHT}")
-    print("=" * 70)
+    print(f"Images      : {n_done}/{len(pairs)}")
+    print(f"Detections  : {len(rows)}")
+    print(f"Output dir  : {out_dir}")
+    if args.csv:
+        print(f"CSV         : {csv_path if rows else '(no detections, not written)'}")
+    print_summary(rows, timings, use_refine, n_done)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 """Reusable in-process RACE-6D pose estimator for ROS."""
+
 from __future__ import annotations
 
 import sys
@@ -9,7 +10,6 @@ import cv2
 import numpy as np
 import torch
 
-
 RACE_ROOT = Path(__file__).resolve().parent
 
 if str(RACE_ROOT) not in sys.path:
@@ -17,6 +17,12 @@ if str(RACE_ROOT) not in sys.path:
 
 import src.zoo  # noqa: F401,E402
 from src.core import YAMLConfig  # noqa: E402
+
+# [REFINE] RGB top-face PnP post-processing (pose_refine.py sits next to this file)
+try:
+    from .pose_refine import PoseRefiner  # noqa: E402
+except ImportError:
+    from pose_refine import PoseRefiner  # noqa: E402
 
 
 def _load_checkpoint(model: torch.nn.Module, path: str) -> None:
@@ -55,9 +61,7 @@ def _matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
             (m[1, 0] - m[0, 1]) / s,
         ]
     elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
-        s = 2 * np.sqrt(
-            1.0 + m[0, 0] - m[1, 1] - m[2, 2]
-        )
+        s = 2 * np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2])
         q = [
             (m[2, 1] - m[1, 2]) / s,
             0.25 * s,
@@ -65,9 +69,7 @@ def _matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
             (m[0, 2] + m[2, 0]) / s,
         ]
     elif m[1, 1] > m[2, 2]:
-        s = 2 * np.sqrt(
-            1.0 + m[1, 1] - m[0, 0] - m[2, 2]
-        )
+        s = 2 * np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2])
         q = [
             (m[0, 2] - m[2, 0]) / s,
             (m[0, 1] + m[1, 0]) / s,
@@ -75,9 +77,7 @@ def _matrix_to_quat_wxyz(matrix: np.ndarray) -> np.ndarray:
             (m[1, 2] + m[2, 1]) / s,
         ]
     else:
-        s = 2 * np.sqrt(
-            1.0 + m[2, 2] - m[0, 0] - m[1, 1]
-        )
+        s = 2 * np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1])
         q = [
             (m[1, 0] - m[0, 1]) / s,
             (m[0, 2] + m[2, 0]) / s,
@@ -112,6 +112,7 @@ class PoseEstimator:
         crop_y: int = 0,
         crop_width: Optional[int] = 1440,
         crop_height: Optional[int] = 1080,
+        refine_config: Optional[dict] = None,  # [REFINE] config.yaml -> RGB_REFINE
     ) -> None:
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -126,12 +127,8 @@ class PoseEstimator:
 
         self.crop_x = int(crop_x)
         self.crop_y = int(crop_y)
-        self.crop_width = (
-            None if crop_width is None else int(crop_width)
-        )
-        self.crop_height = (
-            None if crop_height is None else int(crop_height)
-        )
+        self.crop_width = None if crop_width is None else int(crop_width)
+        self.crop_height = None if crop_height is None else int(crop_height)
 
         if not 0 <= self.score_threshold <= 1:
             raise ValueError("score_threshold must be 0..1")
@@ -164,6 +161,9 @@ class PoseEstimator:
         self.criterion.set_pose_source(self.model.decoder)
 
         _load_checkpoint(self.model, model_path)
+
+        # [REFINE] None when RGB_REFINE is missing or ENABLED is false
+        self.refiner = PoseRefiner.from_config(refine_config)
 
     def _crop(
         self,
@@ -251,9 +251,7 @@ class PoseEstimator:
             .div_(255)
         )
 
-        channels = (
-            self.model.backbone.conv1[0].conv.in_channels
-        )
+        channels = self.model.backbone.conv1[0].conv.in_channels
 
         if channels == 4:
             d = cv2.resize(
@@ -274,10 +272,7 @@ class PoseEstimator:
             if cap <= 0:
                 raise ValueError("depth_z_max_mm must be positive")
 
-            depth_tensor = (
-                torch.from_numpy(np.clip(d, 0, cap) / cap)
-                .unsqueeze(0)
-            )
+            depth_tensor = torch.from_numpy(np.clip(d, 0, cap) / cap).unsqueeze(0)
 
             image = torch.cat((rgb_tensor, depth_tensor), dim=0)
 
@@ -285,9 +280,7 @@ class PoseEstimator:
             image = rgb_tensor
 
         else:
-            raise RuntimeError(
-                f"Unsupported RACE backbone input channels: {channels}"
-            )
+            raise RuntimeError(f"Unsupported RACE backbone input channels: {channels}")
 
         return image.unsqueeze(0).to(self.device), height, width
 
@@ -300,9 +293,7 @@ class PoseEstimator:
         camera = np.asarray(intrinsic, dtype=np.float32)
 
         if camera.shape != (3, 3):
-            raise ValueError(
-                f"Expected 3x3 camera matrix, got {camera.shape}"
-            )
+            raise ValueError(f"Expected 3x3 camera matrix, got {camera.shape}")
 
         original_height, original_width = rgb.shape[:2]
 
@@ -347,9 +338,7 @@ class PoseEstimator:
                 "debug_image": rgb.copy(),
             }
 
-        ordered = keep[
-            torch.argsort(scores[keep], descending=True)
-        ]
+        ordered = keep[torch.argsort(scores[keep], descending=True)]
 
         selected = []
         counts = {}
@@ -366,10 +355,7 @@ class PoseEstimator:
             selected.append(index)
             counts[label] = counts.get(label, 0) + 1
 
-            if (
-                self.max_detections is not None
-                and len(selected) >= self.max_detections
-            ):
+            if self.max_detections is not None and len(selected) >= self.max_detections:
                 break
 
         if not selected:
@@ -414,37 +400,48 @@ class PoseEstimator:
                 .numpy()
             )
 
-            rotation = (
-                result["rotations"][index]
-                .detach()
-                .cpu()
-                .numpy()
-            )
+            rotation = result["rotations"][index].detach().cpu().numpy()
+
+            label = int(result["labels"][index])  # [REFINE] moved up
+
+            # [REFINE] ---- RGB top-face PnP post-processing --------------
+            # Only runs for labels listed in RGB_REFINE.LABELS. The pose is
+            # in the camera frame, so the full image + original intrinsics
+            # are used (no crop offset needed). On any failure the raw RACE
+            # pose is kept.
+            translation_raw_mm = translation_mm.copy()
+            rotation_raw = rotation.copy()
+            refine_info = None
+            refined = False
+
+            if self.refiner is not None and label in self.refiner.boxes:
+                try:
+                    res = self.refiner.refine(
+                        rgb, camera, label, rotation, translation_mm
+                    )
+                    refine_info = res.info
+                    self.refiner.draw(debug, res)
+
+                    if res.ok:
+                        rotation = np.asarray(res.R, dtype=np.float64)
+                        translation_mm = np.asarray(res.t_mm, dtype=np.float64)
+                        refined = True
+                except Exception as exc:  # never break inference
+                    refine_info = {"ok": False, "reason": f"exception: {exc}"}
+            # ------------------------------------------------------------
 
             quat = _matrix_to_quat_wxyz(rotation)
 
-            score = float(
-                result["scores"][index]
-                .detach()
-                .cpu()
-            )
+            score = float(result["scores"][index].detach().cpu())
 
-            label = int(result["labels"][index])
-
-            bbox_crop = (
-                box.detach()
-                .cpu()
-                .numpy()
-            )
+            bbox_crop = box.detach().cpu().numpy()
 
             bbox_xyxy = bbox_crop.copy()
             bbox_xyxy[0::2] += x_offset
             bbox_xyxy[1::2] += y_offset
             bbox_xyxy = bbox_xyxy.tolist()
 
-            x0, y0, x1, y1 = np.rint(
-                np.asarray(bbox_xyxy)
-            ).astype(int)
+            x0, y0, x1, y1 = np.rint(np.asarray(bbox_xyxy)).astype(int)
 
             cv2.rectangle(
                 debug,
@@ -455,9 +452,10 @@ class PoseEstimator:
                 cv2.LINE_AA,
             )
 
+            tag = " +refined" if refined else ""
             cv2.putText(
                 debug,
-                f"RACE label={label} score={score:.3f}",
+                f"RACE label={label} score={score:.3f}{tag}",
                 (x0, max(18, y0 - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
@@ -470,13 +468,16 @@ class PoseEstimator:
                 {
                     "label": label,
                     "confidence": score,
-                    "translation": (
-                        translation_mm / 1000.0
-                    ).tolist(),
+                    "translation": (translation_mm / 1000.0).tolist(),
                     "translation_mm": translation_mm.tolist(),
                     "quat": quat.tolist(),
                     "rotation": rotation.tolist(),
                     "bbox_xyxy": bbox_xyxy,
+                    # [REFINE] raw RACE pose + refine status for comparison
+                    "refined": refined,
+                    "refine_info": refine_info,
+                    "translation_mm_raw": translation_raw_mm.tolist(),
+                    "rotation_raw": rotation_raw.tolist(),
                 }
             )
 
@@ -484,10 +485,7 @@ class PoseEstimator:
             "success": len(detections) > 0,
             "detections": detections,
             "num_detections": len(detections),
-            "class_counts": {
-                str(label): count
-                for label, count in counts.items()
-            },
+            "class_counts": {str(label): count for label, count in counts.items()},
             "debug_image": debug,
             "input_debug": {
                 "original_size": [original_width, original_height],
