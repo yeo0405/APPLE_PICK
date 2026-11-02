@@ -5,63 +5,63 @@
         1080
     ],
     "roi": [
-        1020,
-        184,
-        1588,
-        660
+        1000,
+        204,
+        1604,
+        702
     ],
     "ripcord_count": 4,
     "ripcords": [
         {
             "index": 0,
             "center": [
-                1217,
-                324
+                1219,
+                321
             ],
             "mask": {
                 "index": 0,
                 "file": "service/RIPCORD/GT/gt_masks/ripcord_0.png",
-                "score": 0.7734375,
-                "area": 19255
+                "score": 0.76953125,
+                "area": 19340
             }
         },
         {
             "index": 1,
             "center": [
-                1259,
-                393
+                1250,
+                385
             ],
             "mask": {
                 "index": 1,
                 "file": "service/RIPCORD/GT/gt_masks/ripcord_1.png",
-                "score": 0.76171875,
-                "area": 21228
+                "score": 0.74609375,
+                "area": 21154
             }
         },
         {
             "index": 2,
             "center": [
-                1298,
-                465
+                1301,
+                463
             ],
             "mask": {
                 "index": 2,
                 "file": "service/RIPCORD/GT/gt_masks/ripcord_2.png",
-                "score": 0.828125,
-                "area": 22431
+                "score": 0.72265625,
+                "area": 22460
             }
         },
         {
             "index": 3,
             "center": [
                 1340,
-                540
+                545
             ],
             "mask": {
                 "index": 3,
                 "file": "service/RIPCORD/GT/gt_masks/ripcord_3.png",
-                "score": 0.9453125,
-                "area": 24333
+                "score": 0.94921875,
+                "area": 24518
             }
         }
     ],
