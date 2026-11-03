@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""RACE-6D image check (with RGB_REFINE diagnostics).
+"""RACE-6D offline comparison: independent EDGE-only and TEXTURE-only refinement.
 
 Usage
     python race6d_check.py --input ../assets/race_6d/
-    python race6d_check.py --input ../assets/race_6d/ --no-refine     # baseline
-    python race6d_check.py --input ../assets/race_6d/xxx_color.png    # single image
-    python race6d_check.py --input ../assets/race_6d/ --csv           # also write a CSV
+    python race6d_check.py --input ../assets/race_6d/xxx_color.png        # single image
+The script runs two independent estimators on every input:
+- EDGE: texture fallback disabled.
+- TEXTURE: MIN_VALID_EDGES=5 forces the edge stage to fail, then texture refines
+  directly from the original RACE-6D pose.
 
 Input folder: pairs of  <name>_color.png  and  <name>_depth.png  (16-bit depth, mm).
 
-Output (in --out-dir, default ./race6d_check_out)
-    <name>_race6d_{refine|raw}.png : ONE debug image per input (cropped x=240..1680, full resolution)
+Output (in --out-dir, default ./race6d_compare_out)
+    edge/<name>_race6d_edge.png and texture/<name>_race6d_texture.png
+    <name>_comparison.json     : both result records and per-detection differences
+    race6d_refine_comparison.csv : tabular comparison
 
 Overlay legend
     yellow polygon : RACE top-face projection (before refine)
-    green dots     : detected top-face corners
-    cyan polygon   : refined top face (only when refine accepted)
+    edge method    : orange = RACE bottom face, white dots / magenta lines = detected edges,
+                     green dots = line intersections
+    texture method : green dots = inlier matches, red dots = rejected matches
+    cyan polygon   : refined top face (only when a refine method was accepted)
     yellow ring    : RACE origin,  cyan ring : final origin
     RGB arrows     : final pose axes (X red, Y green, Z blue)
 """
@@ -23,7 +29,10 @@ Overlay legend
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
+import json
+import logging
 import time
 from collections import Counter
 from pathlib import Path
@@ -49,6 +58,7 @@ COLOR_SUFFIX = "_color.png"
 DEPTH_SUFFIX = "_depth.png"
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+NAN = float("nan")
 
 DEFAULT_K = np.array(
     [
@@ -65,7 +75,10 @@ CSV_FIELDS = [
     "name",
     "confidence",
     "refined",
+    "method",
+    "fallback",
     "reason",
+    "edge_reason",
     "tx_raw",
     "ty_raw",
     "tz_raw",
@@ -79,8 +92,19 @@ CSV_FIELDS = [
     "edge_shift_2",
     "edge_shift_3",
     "corner_shift_px",
-    "reproj_px",
     "area_ratio",
+    "n_ref_kp",
+    "n_patch_kp",
+    "n_matches",
+    "n_gated",
+    "n_h_inliers",
+    "n_inliers",
+    "shift_dx_mm",
+    "shift_dy_mm",
+    "h_scale",
+    "h_rot_deg",
+    "coverage",
+    "reproj_px",
     "depth_med_mm",
     "z_err_raw_mm",
     "z_err_ref_mm",
@@ -92,18 +116,13 @@ CSV_FIELDS = [
 # ----------------------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="RACE-6D image check (with RGB_REFINE diagnostics)."
+        description="Compare independent EDGE-only and TEXTURE-only RACE-6D refinement."
     )
     parser.add_argument(
         "--input",
         default=str(DEFAULT_INPUT),
         help="Folder with <name>_color.png / <name>_depth.png pairs, "
         "or a single *_color.png file.",
-    )
-    parser.add_argument(
-        "--no-refine",
-        action="store_true",
-        help="Disable RGB_REFINE (baseline run for comparison).",
     )
     parser.add_argument(
         "--scale",
@@ -113,9 +132,6 @@ def parse_args():
     )
     parser.add_argument(
         "--out-dir", default="", help="Output directory (default: ./race6d_check_out)."
-    )
-    parser.add_argument(
-        "--csv", action="store_true", help="Also write a per-detection CSV."
     )
     return parser.parse_args()
 
@@ -162,6 +178,106 @@ def load_race6d_config():
         "label_names": {int(k): str(v) for k, v in label_names.items()},
         # RGB_REFINE is a top-level section (None if missing)
         "refine_config": config.get("RGB_REFINE"),
+    }
+
+
+# ----------------------------------------------------------------------
+# json
+# ----------------------------------------------------------------------
+def json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return json_safe(value.tolist())
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def write_json(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(json_safe(data), f, ensure_ascii=False, indent=2)
+
+
+def build_detection_json(det, label_names, use_refine):
+    label = int(det.get("label", -1))
+    name = label_names.get(label, f"class_{label}")
+    info = det.get("refine_info") or {}
+    depth_info = info.get("depth") or det.get("depth_refine_info") or {}
+    rgb_ok = bool(info.get("ok", det.get("refined", False)))
+    depth_ok = bool(depth_info.get("ok", False))
+    depth_applied = bool(info.get("depth_applied", det.get("depth_refined", False)))
+
+    t_raw = det.get("translation_mm_raw", det.get("translation_mm"))
+    t_rgb = det.get("translation_mm_rgb", det.get("translation_mm"))
+    t_final = det.get("translation_mm")
+    r_raw = det.get("rotation_raw", det.get("rotation"))
+    r_final = det.get("rotation")
+
+    if depth_ok and depth_applied:
+        final_source = "depth_refined"
+    elif rgb_ok:
+        final_source = "rgb_refined"
+    else:
+        final_source = "race6d_raw"
+
+    return {
+        "label": label,
+        "name": name,
+        "confidence": det.get("confidence"),
+        "bbox_xyxy": det.get("bbox_xyxy"),
+        "refined": bool(det.get("refined", rgb_ok)),
+        "pose": {
+            "raw": {
+                "translation_mm": t_raw,
+                "rotation": r_raw,
+                "quaternion": det.get("quat_raw"),
+            },
+            "rgb_refined": {
+                "translation_mm": t_rgb,
+                "rotation": det.get("rotation_rgb"),
+            },
+            "final": {
+                "translation_mm": t_final,
+                "rotation": r_final,
+                "quaternion": det.get("quat"),
+            },
+        },
+        "refinement": {
+            "rgb": {
+                "enabled": bool(use_refine),
+                "ok": rgb_ok if use_refine else False,
+                "method": info.get("method"),  # edge | texture | none
+                "fallback": bool(info.get("fallback", False)),
+                "edge_reason": info.get("edge_reason"),
+                "reason": info.get(
+                    "reason", "refine_info_missing" if use_refine else "disabled"
+                ),
+                "details": info,
+            },
+            "depth": {
+                "enabled": bool(use_refine),
+                "ok": depth_ok,
+                "applied": depth_applied,
+                "reason": depth_info.get(
+                    "reason", "depth_info_missing" if use_refine else "disabled"
+                ),
+                "details": depth_info,
+            },
+            "final_source": final_source,
+        },
+        "raw_detection": det,
     }
 
 
@@ -372,6 +488,14 @@ def draw_origins(image, det, K) -> None:
 # ----------------------------------------------------------------------
 # per-detection analysis
 # ----------------------------------------------------------------------
+def num(v) -> float:
+    try:
+        v = float(v)
+        return v if np.isfinite(v) else NAN
+    except (TypeError, ValueError):
+        return NAN
+
+
 def depth_median_mm(depth, bbox, invalid, z_max, ratio=0.2):
     x0, y0, x1, y1 = bbox
     cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
@@ -405,9 +529,20 @@ def analyse_detection(det, image_name, depth, cfg, label_names):
 
     info = det.get("refine_info") or {}
     refined = bool(det.get("refined", False))
+    method = info.get("method", "-")
     reason = info.get("reason", "n/a")
-    shifts = list(info.get("edge_shift_px") or [])
-    shifts = shifts + [np.nan] * (4 - len(shifts))
+    fallback = bool(info.get("fallback", False))
+    edge_reason = info.get("edge_reason", "") or ""
+
+    # edge-refiner info: nested when the texture fallback ran, otherwise the top level
+    einfo = info.get("edge") or info
+    # texture-refiner info: top level only when the fallback ran
+    tinfo = info if fallback else {}
+
+    shifts = [num(v) for v in (einfo.get("edge_shift_px") or [])]
+    shifts = shifts + [NAN] * (4 - len(shifts))
+    shift = tinfo.get("shift_mm") or [NAN, NAN]
+    orient = tinfo.get("orient") or {}
 
     dep = depth_median_mm(
         depth, det["bbox_xyxy"], cfg["invalid_depth_value"], cfg["depth_z_max_mm"]
@@ -415,7 +550,7 @@ def analyse_detection(det, image_name, depth, cfg, label_names):
     half = half_thickness_mm(cfg["refine_config"], label)
 
     # ideal: z_center - depth_surface == half thickness -> err == 0 (rough for tilted boxes)
-    z_err_raw = z_err_ref = np.nan
+    z_err_raw = z_err_ref = NAN
     if dep is not None and half is not None:
         z_err_raw = float(t_raw[2] - dep - half)
         z_err_ref = float(t[2] - dep - half)
@@ -424,9 +559,12 @@ def analyse_detection(det, image_name, depth, cfg, label_names):
         "image": image_name,
         "label": label,
         "name": name,
-        "confidence": float(det.get("confidence", np.nan)),
+        "confidence": float(det.get("confidence", NAN)),
         "refined": int(refined),
+        "method": method,
+        "fallback": int(fallback),
         "reason": reason,
+        "edge_reason": edge_reason,
         "tx_raw": t_raw[0],
         "ty_raw": t_raw[1],
         "tz_raw": t_raw[2],
@@ -439,10 +577,21 @@ def analyse_detection(det, image_name, depth, cfg, label_names):
         "edge_shift_1": shifts[1],
         "edge_shift_2": shifts[2],
         "edge_shift_3": shifts[3],
-        "corner_shift_px": info.get("corner_shift_px", np.nan),
-        "reproj_px": info.get("reproj_px", np.nan),
-        "area_ratio": info.get("area_ratio", np.nan),
-        "depth_med_mm": dep if dep is not None else np.nan,
+        "corner_shift_px": num(einfo.get("corner_shift_px")),
+        "area_ratio": num(einfo.get("area_ratio")),
+        "n_ref_kp": num(tinfo.get("n_ref_kp")),
+        "n_patch_kp": num(tinfo.get("n_patch_kp")),
+        "n_matches": num(tinfo.get("n_matches")),
+        "n_gated": num(tinfo.get("n_gated")),
+        "n_h_inliers": num(tinfo.get("n_h_inliers")),
+        "n_inliers": num(tinfo.get("n_inliers")),
+        "shift_dx_mm": num(shift[0]),
+        "shift_dy_mm": num(shift[1]),
+        "h_scale": num(tinfo.get("h_scale")),
+        "h_rot_deg": num(tinfo.get("h_rot_deg")),
+        "coverage": num(tinfo.get("coverage")),
+        "reproj_px": num(info.get("reproj_px")),
+        "depth_med_mm": dep if dep is not None else NAN,
         "z_err_raw_mm": z_err_raw,
         "z_err_ref_mm": z_err_ref,
     }
@@ -452,13 +601,43 @@ def analyse_detection(det, image_name, depth, cfg, label_names):
 
     tag = "REFINED" if refined else "RAW"
     lines = [
-        f"{name} {row['confidence']:.2f}  [{tag}] {reason}",
+        f"{name} {row['confidence']:.2f}  [{tag}/{method}] {reason}",
         f"T raw=({t_raw[0]:.0f},{t_raw[1]:.0f},{t_raw[2]:.0f})  "
         f"ref=({t[0]:.0f},{t[1]:.0f},{t[2]:.0f})  dt={f(row['dt_mm'])}mm  dR={f(row['dang_deg'])}deg",
-        "edge_shift(px)=[" + ", ".join(f(v) for v in shifts) + "]  "
-        f"corner_shift={f(row['corner_shift_px'])}  reproj={f(row['reproj_px'], 2)}",
-        f"depth={f(row['depth_med_mm'], 0)}mm  z_err raw={f(z_err_raw)}  ref={f(z_err_ref)}",
     ]
+
+    shift_txt = "[" + ", ".join(f(v) for v in shifts) + "]"
+    if fallback:
+        e = f"edge failed: {edge_reason}"
+        if np.isfinite(shifts).any():
+            e += f"  shift(px)={shift_txt}"
+        lines.append(e)
+        lines.append(
+            f"tex kp ref/patch={f(row['n_ref_kp'], 0)}/{f(row['n_patch_kp'], 0)}  "
+            f"match all/gate/H/pnp={f(row['n_matches'], 0)}/{f(row['n_gated'], 0)}/"
+            f"{f(row['n_h_inliers'], 0)}/{f(row['n_inliers'], 0)}"
+        )
+        lines.append(
+            f"tex shift=({f(row['shift_dx_mm'])},{f(row['shift_dy_mm'])})mm  "
+            f"h_scale={f(row['h_scale'], 3)}  h_rot={f(row['h_rot_deg'])}deg  "
+            f"cov={f(row['coverage'], 2)}  reproj={f(row['reproj_px'], 2)}"
+        )
+        if orient:
+            parts = " ".join(
+                f"{k}={v.get('h_inliers', 0)}"
+                for k, v in orient.items()
+                if k != "_best"
+            )
+            lines.append(f"tex orient best={orient.get('_best')}  H-inliers: {parts}")
+    elif method == "edge" or np.isfinite(shifts).any():
+        lines.append(
+            f"edge shift(px)={shift_txt}  corner_shift={f(row['corner_shift_px'])}  "
+            f"area_ratio={f(row['area_ratio'], 2)}  reproj={f(row['reproj_px'], 2)}"
+        )
+
+    lines.append(
+        f"depth={f(row['depth_med_mm'], 0)}mm  z_err raw={f(z_err_raw)}  ref={f(z_err_ref)}"
+    )
 
     return row, lines
 
@@ -466,7 +645,13 @@ def analyse_detection(det, image_name, depth, cfg, label_names):
 # ----------------------------------------------------------------------
 # summary
 # ----------------------------------------------------------------------
-def print_summary(rows, timings, use_refine, n_images):
+def _med(rows, key):
+    a = np.array([r[key] for r in rows], dtype=float)
+    a = a[np.isfinite(a)]
+    return float(np.median(a)) if a.size else None
+
+
+def print_summary(rows, timings, use_refine, n_images, eligible):
     print("=" * 70)
     print("SUMMARY")
     print("=" * 70)
@@ -485,26 +670,59 @@ def print_summary(rows, timings, use_refine, n_images):
 
     print(f"Detections     : {len(rows)}")
 
-    zr = np.array([r["z_err_raw_mm"] for r in rows], dtype=float)
-    zf = np.array([r["z_err_ref_mm"] for r in rows], dtype=float)
-
-    if not use_refine:
-        z = zr[np.isfinite(zr)]
+    def z_line(label, rs, key):
+        z = np.array([r[key] for r in rs], dtype=float)
+        z = z[np.isfinite(z)]
         if z.size:
             print(
-                f"z_err (raw)    : median={np.median(z):+.1f} mm  mean|.|={np.abs(z).mean():.1f} mm"
+                f"{label:<15}: median={np.median(z):+.1f} mm  mean|.|={np.abs(z).mean():.1f} mm"
             )
+
+    if not use_refine:
+        z_line("z_err (raw)", rows, "z_err_raw_mm")
         return
 
-    reasons = Counter(r["reason"] for r in rows)
-    ok_rows = [r for r in rows if r["refined"]]
+    elig = [r for r in rows if r["label"] in eligible]
     print(
-        f"Refined        : {len(ok_rows)}/{len(rows)} ({100.0 * len(ok_rows) / len(rows):.1f}%)"
+        f"Refine labels  : {sorted(eligible)}  "
+        f"(detections: {len(elig)}, other labels: {len(rows) - len(elig)})"
     )
-    print("Reasons        : " + ", ".join(f"{k}={v}" for k, v in reasons.most_common()))
+    if not elig:
+        print("No detection of a refine-enabled label.")
+        return
 
-    # edge shifts exist even for rejected detections -> use all rows
-    sh = np.array([[r[f"edge_shift_{i}"] for i in range(4)] for r in rows], dtype=float)
+    ok_rows = [r for r in elig if r["refined"]]
+    print(
+        f"Refined        : {len(ok_rows)}/{len(elig)} ({100.0 * len(ok_rows) / len(elig):.1f}%)"
+    )
+    print(
+        "Methods        : "
+        + ", ".join(
+            f"{k}={v}" for k, v in Counter(r["method"] for r in elig).most_common()
+        )
+    )
+
+    fb = [r for r in elig if r["fallback"]]
+    if fb:
+        fb_ok = [r for r in fb if r["refined"]]
+        print(f"Texture tried  : {len(fb)}  succeeded: {len(fb_ok)}")
+        print(
+            "Edge reasons   : "
+            + ", ".join(
+                f"{k}={v}"
+                for k, v in Counter(r["edge_reason"] for r in fb).most_common()
+            )
+        )
+
+    print(
+        "Reasons        : "
+        + ", ".join(
+            f"{k}={v}" for k, v in Counter(r["reason"] for r in elig).most_common()
+        )
+    )
+
+    # edge shifts exist even for failed edge attempts
+    sh = np.array([[r[f"edge_shift_{i}"] for i in range(4)] for r in elig], dtype=float)
     if np.isfinite(sh).any():
         med = np.nanmedian(sh, axis=0)
         print(
@@ -512,90 +730,48 @@ def print_summary(rows, timings, use_refine, n_images):
             "(+ = real edge outside prediction -> RACE face too small)"
         )
 
-    if ok_rows:
+    if fb:
+        for key, label in (
+            ("n_ref_kp", "ref keypoints"),
+            ("n_patch_kp", "patch keypoints"),
+            ("n_matches", "matches"),
+            ("n_gated", "after gate"),
+            ("n_h_inliers", "H inliers"),
+        ):
+            v = _med(fb, key)
+            if v is not None:
+                print(f"tex {label:<11}: median={v:.0f}")
+        for key, label, nd in (
+            ("h_scale", "h_scale", 3),
+            ("shift_dx_mm", "shift dx mm", 1),
+            ("shift_dy_mm", "shift dy mm", 1),
+            ("h_rot_deg", "h_rot deg", 1),
+        ):
+            v = _med(fb, key)
+            if v is not None:
+                print(f"tex {label:<11}: median={v:+.{nd}f}")
 
-        def med(key):
-            return float(np.nanmedian([r[key] for r in ok_rows]))
+    for method in ("edge", "texture"):
+        rs = [r for r in ok_rows if r["method"] == method]
+        if not rs:
+            continue
+        print(
+            f"[{method}] n={len(rs)}  dt_mm med={_med(rs, 'dt_mm'):.1f}  "
+            f"dang_deg med={_med(rs, 'dang_deg'):.1f}  reproj_px med={_med(rs, 'reproj_px'):.2f}"
+        )
+        z_line(f"  z_err raw", rs, "z_err_raw_mm")
+        z_line(f"  z_err refined", rs, "z_err_ref_mm")
 
-        print(f"dt_mm          : median={med('dt_mm'):.1f}")
-        print(f"dang_deg       : median={med('dang_deg'):.1f}")
-        print(f"reproj_px      : median={med('reproj_px'):.2f}")
-        print(f"corner_shift   : median={med('corner_shift_px'):.1f} px")
-
-    m = np.isfinite(zr) & np.isfinite(zf)
-    if m.any():
-        print(
-            f"z_err raw      : median={np.median(zr[m]):+.1f} mm  mean|.|={np.abs(zr[m]).mean():.1f} mm"
-        )
-        print(
-            f"z_err refined  : median={np.median(zf[m]):+.1f} mm  mean|.|={np.abs(zf[m]).mean():.1f} mm"
-        )
-        print(
-            "(z_err = z_center - depth_median - half_thickness; ideal ~ 0; rough when the box is tilted)"
-        )
+    print(
+        "(z_err = z_center - depth_median - half_thickness; ideal ~ 0; rough when the box is tilted)"
+    )
 
 
 # ----------------------------------------------------------------------
-def main():
-    args = parse_args()
-
-    pairs = collect_pairs(args.input)
-
-    if not pairs:
-        raise SystemExit(
-            f"No *{COLOR_SUFFIX} / *{DEPTH_SUFFIX} pairs found in: {args.input}"
-        )
-
-    cfg = load_race6d_config()
-    model_path = cfg["model_path"]
-    model_config = cfg["model_config"]
-    label_names = cfg["label_names"]
-
-    if not model_path.is_file():
-        raise FileNotFoundError(f"RACE-6D model not found: {model_path}")
-
-    if not model_config.is_file():
-        raise FileNotFoundError(f"RACE-6D config not found: {model_config}")
-
-    refine_cfg = None if args.no_refine else cfg["refine_config"]
-    use_refine = bool(refine_cfg and refine_cfg.get("ENABLED", False))
-    mode = "refine" if use_refine else "raw"
-
-    out_dir = (
-        Path(args.out_dir).resolve()
-        if args.out_dir
-        else Path.cwd() / "race6d_check_out"
-    )
-    out_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = out_dir / f"race6d_check_{mode}.csv"
-
-    camera_matrix = DEFAULT_K.copy()
-
-    out_w = int(round(CROP_WIDTH * args.scale))
-    out_h = int(round(INPUT_HEIGHT * args.scale))
-
-    print("=" * 70)
-    print("RACE-6D IMAGE CHECK (RGB_REFINE test)")
-    print("=" * 70)
-    print(f"Input      : {Path(args.input).resolve()}  ({len(pairs)} pairs)")
-    print(f"Output dir : {out_dir}")
-    print(f"Model      : {model_path}")
-    print(
-        f"Mode       : {mode.upper()}"
-        + ("" if use_refine else "  (RGB_REFINE disabled or missing)")
-    )
-    if use_refine:
-        print(
-            f"Refine lbl : {sorted(int(k) for k in (refine_cfg.get('LABELS') or {}))}"
-        )
-        print(f"Refine prm : {refine_cfg.get('PARAMS')}")
-    print("=" * 70)
-
-    print("[INFO] Initializing RACE-6D...")
-
+def make_estimator(cfg, refine_cfg, mode):
     estimator = PoseEstimator(
-        model_path=str(model_path),
-        config_path=str(model_config),
+        model_path=str(cfg["model_path"]),
+        config_path=str(cfg["model_config"]),
         device="cuda" if torch.cuda.is_available() else "cpu",
         score_threshold=cfg["score_threshold"],
         max_per_class=cfg["max_per_class"],
@@ -603,120 +779,427 @@ def main():
         depth_z_max_mm=cfg["depth_z_max_mm"],
         invalid_depth_value=cfg["invalid_depth_value"],
         class_id=cfg["class_id"],
-        refine_config=refine_cfg if use_refine else None,
+        refine_config=refine_cfg,
     )
+    if estimator.refiner is None:
+        raise RuntimeError(f"{mode}: RGB_REFINE failed to initialize")
+    eligible = {int(k) for k in estimator.refiner.boxes}
+    if mode == "texture" and getattr(estimator.refiner, "texture", None) is None:
+        raise RuntimeError(
+            "Texture refiner failed to initialize; check RGB_REFINE.TEXTURE, "
+            "REF_IMAGE paths and reference features."
+        )
+    return estimator, eligible
 
-    print("[INFO] RACE-6D ready.")
 
-    rows: list[dict] = []
-    timings: list[float] = []
-    warmed_up = False
-    n_done = 0
+def process_result(
+    stem,
+    color_path,
+    depth_path,
+    rgb,
+    depth,
+    result,
+    estimator,
+    cfg,
+    label_names,
+    mode,
+    out_dir,
+    scale,
+):
+    image_record = {
+        "schema_version": 3,
+        "image": stem,
+        "mode": mode,
+        "inputs": {"color": str(color_path), "depth": str(depth_path)},
+        "success": False,
+        "detection_count": 0,
+        "detections": [],
+        "summary": {},
+        "error": None,
+    }
+    rows = []
+    try:
+        m_img = getattr(estimator.refiner, "last_match_image", None)
+        if m_img is not None:
+            m_img = cv2.resize(
+                m_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_NEAREST
+            )
+            cv2.imwrite(str(out_dir / f"{stem}_{mode}_matches.png"), m_img)
 
-    for stem, color_path, depth_path in pairs:
-        print(f"\n--- {stem} ---")
+        detections = result.get("detections", [])
+        if not isinstance(detections, list):
+            detections = []
+        debug_full = result.get("debug_image")
+        debug_full = rgb.copy() if debug_full is None else debug_full.copy()
+        text_blocks = []
+        image_detections = []
 
-        try:
-            rgb = read_color(color_path)
-            depth = read_depth(depth_path, rgb.shape)
-
-            if not warmed_up:  # CUDA warm-up, excluded from timing
-                estimator.predict(rgb=rgb, depth=depth, intrinsic=camera_matrix)
-                warmed_up = True
-
-            t0 = time.perf_counter()
-            result = estimator.predict(rgb=rgb, depth=depth, intrinsic=camera_matrix)
-            timings.append(time.perf_counter() - t0)
-
-            detections = result.get("detections", [])
-            if not isinstance(detections, list):
-                detections = []
-
-            # predict() returns the FULL-resolution debug image
-            debug_full = result.get("debug_image")
-            debug_full = rgb.copy() if debug_full is None else debug_full.copy()
-
-            text_blocks: list[list[str]] = []
-            n_kept = 0
-
-            for det in detections:
-                if not isinstance(det, dict):
-                    continue
-
-                if not draw_axis(
+        for det in detections:
+            if not isinstance(det, dict):
+                continue
+            image_detections.append(build_detection_json(det, label_names, True))
+            try:
+                draw_axis(
                     debug_full,
                     det.get("translation_mm"),
                     det.get("quat"),
-                    camera_matrix,
+                    DEFAULT_K,
                     AXIS_LENGTH_MM,
-                ):
-                    continue
+                )
+                draw_origins(debug_full, det, DEFAULT_K)
+            except Exception as e:
+                print(f"[WARN] {mode} draw failed: {type(e).__name__}: {e}")
+            row, lines = analyse_detection(det, stem, depth, cfg, label_names)
+            rows.append(row)
+            text_blocks.append(lines)
 
-                draw_origins(debug_full, det, camera_matrix)
+        image_record["success"] = True
+        image_record["detection_count"] = len(image_detections)
+        image_record["detections"] = image_detections
+        image_record["summary"] = {
+            "rgb_refine_success": sum(
+                d["refinement"]["rgb"]["ok"] for d in image_detections
+            ),
+            "rgb_refine_failure": sum(
+                d["refinement"]["rgb"]["enabled"] and not d["refinement"]["rgb"]["ok"]
+                for d in image_detections
+            ),
+            "rgb_methods": dict(
+                Counter(
+                    d["refinement"]["rgb"]["method"]
+                    for d in image_detections
+                    if d["refinement"]["rgb"]["ok"]
+                )
+            ),
+        }
 
-                row, lines = analyse_detection(det, stem, depth, cfg, label_names)
-                rows.append(row)
-                text_blocks.append(lines)
-                n_kept += 1
+        if not text_blocks:
+            text_blocks = [["No detection"]]
+        view = debug_full[:, CROP_X : CROP_X + CROP_WIDTH].copy()
+        y = 32
+        for lines in text_blocks:
+            for i, line in enumerate(lines):
+                put_text(
+                    view,
+                    line,
+                    (15, y),
+                    scale=0.6 if i else 0.75,
+                    color=(255, 255, 255) if i else (0, 255, 255),
+                )
+                y += 26
+            y += 10
+        put_text(view, f"{stem}  [{mode.upper()}]", (15, view.shape[0] - 15), scale=0.7)
+        put_text(
+            view,
+            "yellow=RACE top  green=accepted  red=rejected  cyan=refined",
+            (15, view.shape[0] - 45),
+            scale=0.5,
+            color=(200, 200, 200),
+            thick=1,
+        )
+        out_w = int(round(CROP_WIDTH * scale))
+        out_h = int(round(INPUT_HEIGHT * scale))
+        if (out_w, out_h) != (view.shape[1], view.shape[0]):
+            view = cv2.resize(view, (out_w, out_h), interpolation=cv2.INTER_AREA)
+        cv2.imwrite(str(out_dir / f"{stem}_race6d_{mode}.png"), view)
+    except Exception as e:
+        image_record["error"] = {"type": type(e).__name__, "message": str(e)}
+        print(f"[ERROR] {stem} [{mode}]: {type(e).__name__}: {e}")
+    return image_record, rows
 
-                print("\n".join(lines))
 
-            if not n_kept:
-                print("No detection.")
-                text_blocks = [["No detection"]]
+def _det_key(det):
+    bbox = det.get("bbox_xyxy")
+    if bbox is None:
+        bbox = []
+    return (
+        int(det.get("label", -1)),
+        tuple(round(float(x), 1) for x in np.asarray(bbox).reshape(-1)),
+    )
 
-            # ---- the single debug image (cropped, full resolution) ----
-            view = debug_full[:, CROP_X : CROP_X + CROP_WIDTH].copy()
 
-            y = 32
-            for lines in text_blocks:
-                for i, line in enumerate(lines):
-                    put_text(
-                        view,
-                        line,
-                        (15, y),
-                        scale=0.65 if i else 0.75,
-                        color=(255, 255, 255) if i else (0, 255, 255),
-                    )
-                    y += 28
-                y += 10
+def compare_detection_records(edge_record, texture_record):
+    edge_dets = edge_record.get("detections", [])
+    tex_dets = texture_record.get("detections", [])
+    tex_map = {_det_key(d): d for d in tex_dets}
+    comparisons = []
+    for edge in edge_dets:
+        key = _det_key(edge)
+        tex = tex_map.get(key)
+        if tex is None:
+            continue
+        ep = edge.get("pose", {})
+        tp = tex.get("pose", {})
+        er = ep.get("raw") or {}
+        et = ep.get("final") or {}
+        tr = tp.get("raw") or {}
+        tt = tp.get("final") or {}
+        epos = np.asarray(et.get("translation_mm") or [NAN] * 3, dtype=float)
+        tpos = np.asarray(tt.get("translation_mm") or [NAN] * 3, dtype=float)
+        raw = np.asarray(er.get("translation_mm") or [NAN] * 3, dtype=float)
+        try:
+            eR = np.asarray(et["rotation"], dtype=float)
+            tR = np.asarray(tt["rotation"], dtype=float)
+            dR = rotation_angle_deg(eR, tR)
+        except Exception:
+            dR = NAN
+        comparisons.append(
+            {
+                "label": key[0],
+                "name": edge.get("name"),
+                "bbox_xyxy": list(key[1]),
+                "edge_ok": bool(edge.get("refinement", {}).get("rgb", {}).get("ok")),
+                "edge_method": edge.get("refinement", {}).get("rgb", {}).get("method"),
+                "texture_ok": bool(tex.get("refinement", {}).get("rgb", {}).get("ok")),
+                "texture_method": tex.get("refinement", {})
+                .get("rgb", {})
+                .get("method"),
+                "raw_translation_mm": raw.tolist(),
+                "edge_translation_mm": epos.tolist(),
+                "texture_translation_mm": tpos.tolist(),
+                "edge_vs_raw_dt_mm": float(np.linalg.norm(epos - raw)),
+                "texture_vs_raw_dt_mm": float(np.linalg.norm(tpos - raw)),
+                "edge_texture_dt_mm": float(np.linalg.norm(epos - tpos)),
+                "edge_texture_dang_deg": dR,
+                "edge_reason": edge.get("refinement", {}).get("rgb", {}).get("reason"),
+                "texture_reason": tex.get("refinement", {})
+                .get("rgb", {})
+                .get("reason"),
+            }
+        )
+    return comparisons
 
-            put_text(view, f"{stem}  [{mode}]", (15, view.shape[0] - 15), scale=0.7)
-            put_text(
-                view,
-                "yellow=RACE face  green=corners  cyan=refined",
-                (15, view.shape[0] - 45),
-                scale=0.55,
-                color=(200, 200, 200),
-                thick=1,
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+    )
+    args = parse_args()
+    pairs = collect_pairs(args.input)
+    if not pairs:
+        raise SystemExit(
+            f"No *{COLOR_SUFFIX} / *{DEPTH_SUFFIX} pairs found in: {args.input}"
+        )
+
+    cfg = load_race6d_config()
+    if not cfg["model_path"].is_file():
+        raise FileNotFoundError(f"RACE-6D model not found: {cfg['model_path']}")
+    if not cfg["model_config"].is_file():
+        raise FileNotFoundError(f"RACE-6D config not found: {cfg['model_config']}")
+    base_refine = cfg["refine_config"]
+    if not isinstance(base_refine, dict) or not base_refine.get("ENABLED", False):
+        raise SystemExit("[ERROR] RGB_REFINE.ENABLED must be true in config.yaml")
+    if not (base_refine.get("TEXTURE") or {}).get("ENABLED", False):
+        raise SystemExit("[ERROR] RGB_REFINE.TEXTURE.ENABLED must be true")
+
+    edge_cfg = copy.deepcopy(base_refine)
+    edge_texture_cfg = copy.deepcopy(edge_cfg.get("TEXTURE") or {})
+    edge_texture_cfg["ENABLED"] = False
+    edge_cfg["TEXTURE"] = edge_texture_cfg
+
+    texture_cfg = copy.deepcopy(base_refine)
+    texture_params = dict(texture_cfg.get("PARAMS") or {})
+    texture_params["MIN_VALID_EDGES"] = 5
+    texture_cfg["PARAMS"] = texture_params
+
+    out_dir = (
+        Path(args.out_dir).resolve()
+        if args.out_dir
+        else Path.cwd() / "race6d_compare_out"
+    )
+    edge_dir = out_dir / "edge"
+    texture_dir = out_dir / "texture"
+    edge_dir.mkdir(parents=True, exist_ok=True)
+    texture_dir.mkdir(parents=True, exist_ok=True)
+    camera_matrix = DEFAULT_K.copy()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print("=" * 76)
+    print("RACE-6D OFFLINE REFINE COMPARISON: EDGE vs TEXTURE")
+    print("=" * 76)
+    print(f"Input       : {Path(args.input).resolve()} ({len(pairs)} pairs)")
+    print(f"Output      : {out_dir}")
+    print(f"Device      : {device}")
+    print(f"Edge labels : {sorted(int(k) for k in (edge_cfg.get('LABELS') or {}))}")
+    print("Edge path   : texture fallback disabled")
+    print("Texture path: MIN_VALID_EDGES=5; texture runs from original RACE pose")
+
+    print("[INFO] Initializing EDGE estimator...")
+    edge_estimator, eligible = make_estimator(cfg, edge_cfg, "edge")
+    print("[INFO] Initializing TEXTURE estimator...")
+    texture_estimator, texture_eligible = make_estimator(cfg, texture_cfg, "texture")
+    if eligible != texture_eligible:
+        print(
+            f"[WARN] Refine label mismatch: edge={sorted(eligible)}, texture={sorted(texture_eligible)}"
+        )
+
+    all_comparisons = []
+    edge_rows, texture_rows = [], []
+    edge_times, texture_times = [], []
+    n_done = 0
+    for stem, color_path, depth_path in pairs:
+        print(f"\n--- {stem} ---")
+        try:
+            rgb = read_color(color_path)
+            depth = read_depth(depth_path, rgb.shape)
+            edge_estimator.refiner.last_match_image = None
+            texture_estimator.refiner.last_match_image = None
+
+            t0 = time.perf_counter()
+            edge_result = edge_estimator.predict(
+                rgb=rgb, depth=depth, intrinsic=camera_matrix
+            )
+            edge_seconds = time.perf_counter() - t0
+            edge_times.append(edge_seconds)
+
+            t0 = time.perf_counter()
+            texture_result = texture_estimator.predict(
+                rgb=rgb, depth=depth, intrinsic=camera_matrix
+            )
+            texture_seconds = time.perf_counter() - t0
+            texture_times.append(texture_seconds)
+
+            edge_record, erows = process_result(
+                stem,
+                color_path,
+                depth_path,
+                rgb,
+                depth,
+                edge_result,
+                edge_estimator,
+                cfg,
+                cfg["label_names"],
+                "edge",
+                edge_dir,
+                args.scale,
+            )
+            texture_record, trows = process_result(
+                stem,
+                color_path,
+                depth_path,
+                rgb,
+                depth,
+                texture_result,
+                texture_estimator,
+                cfg,
+                cfg["label_names"],
+                "texture",
+                texture_dir,
+                args.scale,
+            )
+            edge_record["predict_seconds"] = edge_seconds
+            texture_record["predict_seconds"] = texture_seconds
+            edge_rows.extend(erows)
+            texture_rows.extend(trows)
+
+            comparisons = compare_detection_records(edge_record, texture_record)
+            all_comparisons.extend({"image": stem, **c} for c in comparisons)
+            compare_record = {
+                "schema_version": 1,
+                "image": stem,
+                "edge": edge_record,
+                "texture": texture_record,
+                "comparison": comparisons,
+            }
+            write_json(out_dir / f"{stem}_comparison.json", compare_record)
+
+            print(
+                f"EDGE    : {len(edge_record['detections'])} detections, {edge_seconds * 1000:.1f} ms"
+            )
+            print(
+                f"TEXTURE : {len(texture_record['detections'])} detections, {texture_seconds * 1000:.1f} ms"
+            )
+            for c in comparisons:
+                print(
+                    f"  {c['name']} label={c['label']} "
+                    f"edge={c['edge_ok']}({c['edge_method']}) "
+                    f"texture={c['texture_ok']}({c['texture_method']}) "
+                    f"dT(edge-texture)={c['edge_texture_dt_mm']:.2f} mm "
+                    f"dR={c['edge_texture_dang_deg']:.2f} deg"
+                )
+            write_json(edge_dir / f"{stem}_race6d_edge.json", edge_record)
+            write_json(texture_dir / f"{stem}_race6d_texture.json", texture_record)
+            n_done += 1
+        except Exception as e:
+            print(f"[ERROR] {stem}: {type(e).__name__}: {e}")
+
+    comparison_fields = [
+        "image",
+        "label",
+        "name",
+        "edge_ok",
+        "edge_method",
+        "texture_ok",
+        "texture_method",
+        "edge_vs_raw_dt_mm",
+        "texture_vs_raw_dt_mm",
+        "edge_texture_dt_mm",
+        "edge_texture_dang_deg",
+        "edge_reason",
+        "texture_reason",
+    ]
+    if all_comparisons:
+        with (out_dir / "race6d_refine_comparison.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as f:
+            writer = csv.DictWriter(f, fieldnames=comparison_fields)
+            writer.writeheader()
+            writer.writerows(
+                {k: r.get(k, "") for k in comparison_fields} for r in all_comparisons
             )
 
-            if (out_w, out_h) != (view.shape[1], view.shape[0]):
-                view = cv2.resize(view, (out_w, out_h), interpolation=cv2.INTER_AREA)
+    def report(label, rows, times):
+        ok = [r for r in rows if r["refined"]]
+        print(
+            f"{label:<10}: success={len(ok)}/{len(rows)} "
+            f"({100 * len(ok) / len(rows):.1f}%)"
+            if rows
+            else f"{label:<10}: no detections"
+        )
+        if times:
+            a = np.asarray(times) * 1000
+            print(
+                f"{'':<10}  predict mean={a.mean():.1f} ms median={np.median(a):.1f} ms"
+            )
+        if ok:
+            print(
+                f"{'':<10}  dt median={_med(ok, 'dt_mm'):.2f} mm, "
+                f"dR median={_med(ok, 'dang_deg'):.2f} deg, "
+                f"reproj median={_med(ok, 'reproj_px'):.2f} px"
+            )
+        fails = [r for r in rows if not r["refined"]]
+        if fails:
+            print(
+                f"{'':<10}  failures: "
+                + ", ".join(
+                    f"{k}={v}"
+                    for k, v in Counter(r["reason"] for r in fails).most_common()
+                )
+            )
 
-            cv2.imwrite(str(out_dir / f"{stem}_race6d_{mode}.png"), view)
-            n_done += 1
-
-        except Exception as error:
-            print(f"[ERROR] {stem}: {type(error).__name__}: {error}")
-
-    if args.csv and rows:
-        with csv_path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-            w.writeheader()
-            for r in rows:
-                w.writerow({k: r.get(k, "") for k in CSV_FIELDS})
-
-    print()
-    print("=" * 70)
-    print("DONE")
-    print("=" * 70)
-    print(f"Images      : {n_done}/{len(pairs)}")
-    print(f"Detections  : {len(rows)}")
-    print(f"Output dir  : {out_dir}")
-    if args.csv:
-        print(f"CSV         : {csv_path if rows else '(no detections, not written)'}")
-    print_summary(rows, timings, use_refine, n_done)
+    print("\n" + "=" * 76)
+    print("COMPARISON SUMMARY")
+    print("=" * 76)
+    print(f"Images processed: {n_done}/{len(pairs)}")
+    report("EDGE", edge_rows, edge_times)
+    report("TEXTURE", texture_rows, texture_times)
+    if all_comparisons:
+        print(f"Matched detections: {len(all_comparisons)}")
+        print(
+            f"Median edge-texture translation difference: "
+            f"{np.median([x['edge_texture_dt_mm'] for x in all_comparisons]):.2f} mm"
+        )
+        valid_rot = [
+            x["edge_texture_dang_deg"]
+            for x in all_comparisons
+            if np.isfinite(x["edge_texture_dang_deg"])
+        ]
+        if valid_rot:
+            print(
+                f"Median edge-texture rotation difference: {np.median(valid_rot):.2f} deg"
+            )
+    print(f"Output: {out_dir}")
+    print(f"Comparison CSV: {out_dir / 'race6d_refine_comparison.csv'}")
 
 
 if __name__ == "__main__":

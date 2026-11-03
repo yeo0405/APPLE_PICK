@@ -18,11 +18,11 @@ if str(RACE_ROOT) not in sys.path:
 import src.zoo  # noqa: F401,E402
 from src.core import YAMLConfig  # noqa: E402
 
-# [REFINE] RGB top-face PnP post-processing (pose_refine.py sits next to this file)
+# [REFINE] edge-based refine + texture fallback (see refine_manager.py)
 try:
-    from .pose_refine import PoseRefiner  # noqa: E402
+    from .refine_manager import RefineManager  # noqa: E402
 except ImportError:
-    from pose_refine import PoseRefiner  # noqa: E402
+    from refine_manager import RefineManager  # noqa: E402
 
 
 def _load_checkpoint(model: torch.nn.Module, path: str) -> None:
@@ -163,7 +163,16 @@ class PoseEstimator:
         _load_checkpoint(self.model, model_path)
 
         # [REFINE] None when RGB_REFINE is missing or ENABLED is false
-        self.refiner = PoseRefiner.from_config(refine_config)
+        self.refiner = RefineManager.from_config(refine_config)
+        if (
+            refine_config
+            and refine_config.get("ENABLED", False)
+            and self.refiner is None
+        ):
+            print(
+                "[WARN] RGB_REFINE is enabled but no refiner could be initialized "
+                "(check REF_IMAGE path / reference features); running RAW."
+            )
 
     def _crop(
         self,
@@ -413,6 +422,7 @@ class PoseEstimator:
             rotation_raw = rotation.copy()
             refine_info = None
             refined = False
+            refine_method = None
 
             if self.refiner is not None and label in self.refiner.boxes:
                 try:
@@ -420,6 +430,7 @@ class PoseEstimator:
                         rgb, camera, label, rotation, translation_mm
                     )
                     refine_info = res.info
+                    refine_method = res.method
                     self.refiner.draw(debug, res)
 
                     if res.ok:
@@ -452,7 +463,9 @@ class PoseEstimator:
                 cv2.LINE_AA,
             )
 
-            tag = " +refined" if refined else ""
+            tag = (
+                f" +{refine_method}" if refined else ""
+            )  # replaces: tag = " +refined" if refined else ""
             cv2.putText(
                 debug,
                 f"RACE label={label} score={score:.3f}{tag}",

@@ -82,13 +82,13 @@ RGB_REFINE:
   LABELS:
     0:
       NAME: iphone14_plus_blue
-      SIZE_M:
-        X: 0.178
-        Y: 0.0953
-        Z: 0.029
+      SIZE_M: {X: 0.178, Y: 0.0953, Z: 0.029}
       ORIGIN_OFFSET_M: [0.0, 0.0, 0.0]
+      REF_IMAGE: "config/iphone14_plus_blue_top.png"   # relative to project root, or absolute
+      REF_ROTATE_DEG: 0
+      REF_FLIP_X: false
   PARAMS:
-    BAND_PX: 30            # was 14: widen the search band so the real edge can be reached
+    BAND_PX: 30            # was 24: widen the search band so the real edge can be reached
     WEIGHT_RATIO: 3.0      # NEW: nearly flat weighting; the prior no longer pins edges to the prediction
     SAMPLES_PER_EDGE: 24
     EDGE_MARGIN: 0.12
@@ -97,7 +97,48 @@ RGB_REFINE:
     MIN_POINTS: 8
     MAX_REPROJ_PX: 2.0
     MAX_TRANS_MM: 40.0     # was 20.0: temporarily wider for diagnosis, otherwise a legitimate large correction gets rejected as trans_jump
-    MAX_ROT_DEG: 10.0      # was 8.0
+    MAX_ROT_DEG: 20.0      # was 8.0
     MAX_EDGE_ANGLE_DEG: 8.0
     SIGMA_ROT_DEG: 10.0    # was 5.0: weaker prior, trust the image more
     SIGMA_TRANS_MM: 20.0   # was 10.0
+
+  TEXTURE:
+    ENABLED: true
+    PARAMS:
+      METHOD: sift
+      PX_PER_MM: 1.5
+      MARGIN_MM: 40.0
+      # Feature Matching
+      GATE_MM: 80.0
+      RATIO: 0.90
+      N_FEATURES: 4000
+      SIFT_CONTRAST: 0.015
+      # Preprocessing
+      CLAHE: false
+      SHARPEN: false
+      # Homography
+      H_THRESH_PX: 5.0
+      # PnP
+      PNP_THRESH_PX: 5.0
+      # Relaxed matching requirements
+      MIN_MATCHES: 6
+      MIN_INLIERS: 6
+      MIN_COVERAGE: 0.05
+      # Relaxed validation
+      MAX_REPROJ_PX: 4.0
+      MAX_SCALE_DEV: 0.40
+      MAX_TRANS_MM: 40.0
+      MAX_ROT_DEG: 20.0
+      # Face visibility
+      MIN_FACE_COS: 0.25
+      # PnP prior
+      SIGMA_ROT_DEG: 20.0
+      SIGMA_TRANS_MM: 50.0
+      DEBUG_MATCHES: false
+      DEBUG_ORIENTATION: false
+      GRID_COLS: 4
+      GRID_ROWS: 4
+      MIN_GRID_CELLS: 3
+      MIN_QUADRANTS: 2
+      MIN_X_SPAN: 0.20
+      MIN_Y_SPAN: 0.20
