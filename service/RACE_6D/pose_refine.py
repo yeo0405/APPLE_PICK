@@ -166,11 +166,16 @@ class PoseRefiner:
         step = 0.5
         band_in = p.band_px
         band_out = p.band_px
-        # visible side wall: do not search past the wall's far (silhouette) edge
-        if p.wall_outer_ratio > 0 and wall_px > 4.0:
-            band_out = float(
-                np.clip(p.wall_outer_ratio * wall_px, p.min_out_px, p.band_px)
+
+        if p.wall_outer_ratio > 0 and abs(wall_px) > 4.0:
+            wall_limit = float(
+                np.clip(p.wall_outer_ratio * abs(wall_px), p.min_out_px, p.band_px)
             )
+
+            if wall_px > 0:
+                band_out = wall_limit
+            else:
+                band_in = wall_limit
 
         s = np.arange(-band_in, band_out + 1e-6, step)  # (M,)
         M = len(s)
@@ -435,10 +440,24 @@ class PoseRefiner:
         ratio = None
         if np.isfinite(obs).all():
             ratio = float(area(obs) / (area(pred) + 1e-9))
-            if not (p.area_ratio_min <= ratio <= p.area_ratio_max) or not (
-                cv2.isContourConvex(obs.astype(np.float32).reshape(-1, 1, 2))
-            ):
-                return fail("bad_quad", area_ratio=ratio)
+            convex = bool(cv2.isContourConvex(obs.astype(np.float32).reshape(-1, 1, 2)))
+
+            if not (p.area_ratio_min <= ratio <= p.area_ratio_max):
+                return fail(
+                    "quad_area_ratio",
+                    area_ratio=ratio,
+                    area_ratio_min=p.area_ratio_min,
+                    area_ratio_max=p.area_ratio_max,
+                    quad_corners=obs.tolist(),
+                    quad_convex=convex,
+                )
+            if not convex:
+                return fail(
+                    "quad_non_convex",
+                    area_ratio=ratio,
+                    quad_corners=obs.tolist(),
+                    quad_convex=False,
+                )
 
         # pose solve: corner-on-line residuals
         idxs, Pl, Nl = [], [], []
