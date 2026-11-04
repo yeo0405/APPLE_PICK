@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import rclpy
@@ -25,7 +26,7 @@ LABEL_NAMES = {
     4: "iphone14_plus_yellow",
 }
 
-DEFAULT_RATE_HZ = 1.0
+DEFAULT_RATE_HZ = 30.0
 
 
 class ContinuousTrigger(Node):
@@ -45,6 +46,11 @@ class ContinuousTrigger(Node):
         self.period = 1.0 / rate_hz
         self.label_names = dict(sorted(label_names.items()))
         self.name_to_label = {name: label for label, name in self.label_names.items()}
+
+        # FPS 计算相关变量
+        self.last_detection_time: Optional[float] = None
+        self.current_fps: float = 0.0
+        self.alpha = 0.2  # 平滑系数（指数移动平均，使 FPS 显示更平稳）
 
         self.trigger_clients = {}
 
@@ -153,9 +159,27 @@ class ContinuousTrigger(Node):
     def pose_callback(self, msg: Detection3DArray) -> None:
         """Process Detection3DArray results and match them by class ID."""
 
+        # --- FPS 计算逻辑 ---
+        now = time.time()
+        if self.last_detection_time is not None:
+            dt = now - self.last_detection_time
+            if dt > 0.0:
+                instant_fps = 1.0 / dt
+                # 使用指数移动平均 (EMA) 平滑 FPS 波动
+                if self.current_fps == 0.0:
+                    self.current_fps = instant_fps
+                else:
+                    self.current_fps = (
+                        1.0 - self.alpha
+                    ) * self.current_fps + self.alpha * instant_fps
+        self.last_detection_time = now
+        # ------------------
+
         self.get_logger().info("========================================")
+        fps_str = f"{self.current_fps:.2f}" if self.current_fps > 0 else "N/A"
         self.get_logger().info(
-            f"Received {len(msg.detections)} detections " f"from {POSE_TOPIC}"
+            f"Received {len(msg.detections)} detections "
+            f"from {POSE_TOPIC} | FPS: {fps_str}"
         )
 
         detected: Dict[int, Tuple[float, Any]] = {}
@@ -295,7 +319,8 @@ def main(args: Any = None) -> None:
         parser.error(str(error))
         return
 
-    rclpy.init(args=args)
+    rlypy_args = args if args is not None else []
+    rclpy.init(args=rlypy_args)
 
     node = None
 
