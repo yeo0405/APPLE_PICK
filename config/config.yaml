@@ -79,6 +79,21 @@ RIPCORD_CHECK:
 # ==========================================================
 RGB_REFINE:
   ENABLED: true
+  METHOD: yolo
+
+  YOLO:
+    WEIGHTS: /home/yeo/Downloads/Label&Train/YOLO/pose/runs/pose/yolo_pose_results/yolo26n_pose_300ep/weights/best.pt
+
+    CLASS_ID: 0
+
+    CONF: 0.25
+    IOU: 0.7
+    IMGSZ: 640
+
+    MIN_KEYPOINT_CONF: 0.15
+    ROI_PAD_PX: 36
+
+    DEVICE: 0
   LABELS:
     0:
       NAME: iphone14_plus_blue
