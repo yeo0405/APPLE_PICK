@@ -58,6 +58,9 @@ class RefineParams:
     # Corner construction
     edge_endpoint_as_corner: bool = False
 
+    # Other face edge rejection
+    other_face_exclusion_px: float = 5.0
+
     # Sanity
     max_reproj_px: float = 2.0
     max_trans_mm: float = 40.0
@@ -1238,6 +1241,36 @@ class VertexDetector:
             if c is not None:
                 cands.append(c)
 
+        # Reject candidates that are too close to the corresponding
+        # edge of the opposite face.
+        exclusion_px = max(
+            0.0,
+            float(p.other_face_exclusion_px),
+        )
+
+        other_face_rejected = 0
+
+        # Only enable rejection when the projected separation is
+        # sufficiently large. Otherwise the two faces are too close
+        # in the image to distinguish reliably.
+        if exclusion_px > 0.0 and abs(wall_px) > 2.0 * exclusion_px:
+            filtered = []
+
+            for c in cands:
+                distance = abs(float(c["s_mid"]) - float(wall_px))
+
+                if distance < exclusion_px:
+                    other_face_rejected += 1
+                    continue
+
+                filtered.append(c)
+
+            cands = filtered
+
+        info["other_face_rejected"] = int(other_face_rejected)
+        info["other_face_wall_px"] = float(wall_px)
+        info["other_face_exclusion_px"] = float(exclusion_px)
+
         cands.sort(key=lambda c: -c["unary"])
 
         kept: List[Dict[str, Any]] = []
@@ -2172,7 +2205,7 @@ class VertexDetector:
         debug: np.ndarray,
         res: VertexDetectionResult,
     ) -> None:
-        """Draw fitted edge segments and their observed corners."""
+        """Draw RACE6D predicted corners and RGB-observed corners."""
 
         def ip(q):
             return (
@@ -2180,6 +2213,7 @@ class VertexDetector:
                 int(round(float(q[1]))),
             )
 
+        # 1. Draw detected edge segments.
         for seg in res.edge_segs or []:
             if not np.isfinite(seg).all():
                 continue
@@ -2193,16 +2227,91 @@ class VertexDetector:
                 cv2.LINE_AA,
             )
 
-        if res.corners_obs is not None:
-            for q in res.corners_obs:
-                if not np.isfinite(q).all():
-                    continue
+        # 2. Draw original RACE6D projected corners (orange, points only).
+        if res.corners_pred is not None:
+            corners = np.asarray(
+                res.corners_pred,
+                dtype=np.float64,
+            )
 
-                cv2.circle(
-                    debug,
-                    ip(q),
-                    4,
-                    (0, 255, 255),
-                    -1,
-                    cv2.LINE_AA,
-                )
+            if corners.shape == (4, 2):
+                for i, q in enumerate(corners):
+                    if not np.isfinite(q).all():
+                        continue
+
+                    cv2.circle(
+                        debug,
+                        ip(q),
+                        5,
+                        (0, 165, 255),
+                        -1,
+                        cv2.LINE_AA,
+                    )
+
+                    cv2.putText(
+                        debug,
+                        f"R{i}",
+                        (int(q[0]) + 5, int(q[1]) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        (0, 165, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+        # 3. Draw observed corners from RGB vertex detection.
+        if res.corners_obs is not None:
+            corners = np.asarray(
+                res.corners_obs,
+                dtype=np.float64,
+            )
+
+            if corners.shape == (4, 2):
+                valid = np.isfinite(corners).all(axis=1)
+
+                for i, q in enumerate(corners):
+                    if not valid[i]:
+                        continue
+
+                    cv2.circle(
+                        debug,
+                        ip(q),
+                        5,
+                        (0, 255, 255),
+                        -1,
+                        cv2.LINE_AA,
+                    )
+
+                    cv2.putText(
+                        debug,
+                        f"V{i}",
+                        (int(q[0]) + 5, int(q[1]) + 12),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        (0, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+        # 4. Draw legend.
+        cv2.putText(
+            debug,
+            "RACE6D: Orange",
+            (15, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 165, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.putText(
+            debug,
+            "RGB vertices: Yellow",
+            (15, 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
