@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""ROS 2 endpoint for RACE-6D, DINOv3 Box Check, Flap Check, Ripcord Check, Alignment and Ripcord."""
+"""ROS 2 endpoint for RACE-6D, DINOv3 checks, LIP Check, Alignment and Ripcord."""
 
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -21,6 +21,7 @@ from vision_msgs.msg import Detection3D, Detection3DArray, ObjectHypothesisWithP
 from RACE_6D.core import PoseEstimator
 from BOX_CHECK.ear_esitimator import DINOv3Estimator
 from FLAP_CHECK.ear_esitimator import DINOv3Estimator as FlapCheckEstimator
+from LIP_CHECK.flap_presence_helper import FlapPresenceHelper
 from ALIGNMENT.alignment import AlignmentEstimator
 from RIPCORD.ripcord_estimator import RipcordEstimator
 from RIPCORD_CHECK.ripcord_esitimator import DINOv3Estimator as RipcordCheckEstimator
@@ -28,7 +29,7 @@ from tomo_camera_tcp import CameraTCPClient
 
 
 class PoseNode(Node):
-    """Keep RACE-6D, DINOv3, Alignment, Ripcord and cameras alive."""
+    """Keep RACE-6D, DINOv3, LIP Check, Alignment, Ripcord and cameras alive."""
 
     def __init__(self, cfg: Dict[str, Any], args: Any) -> None:
         super().__init__("pose6dof_ros_node")
@@ -82,7 +83,6 @@ class PoseNode(Node):
         self.get_logger().info(f"Labels       : {self.label_names}")
         self.get_logger().info("==============================")
 
-        # RGB_REFINE section of config.yaml (None if missing -> refine disabled)
         refine_cfg = cfg.get("RGB_REFINE")
 
         self.pose_estimator = PoseEstimator(
@@ -99,6 +99,19 @@ class PoseNode(Node):
         )
 
         self.get_logger().info("RACE-6D PoseEstimator initialized.")
+
+        lip_check_cfg = cfg.get("LIP_CHECK", {})
+        self.lip_check_enabled = bool(lip_check_cfg.get("ENABLED", True))
+        self.lip_check_estimator: Optional[FlapPresenceHelper] = None
+
+        if self.lip_check_enabled:
+            self.get_logger().info("Initializing LIP Check...")
+            self.lip_check_estimator = FlapPresenceHelper(
+                pose_estimator=self.pose_estimator,
+            )
+            self.get_logger().info("LIP Check initialized.")
+        else:
+            self.get_logger().info("LIP Check disabled.")
 
         box_cfg = cfg.get("BOX_CHECK", {})
         self.box_check_enabled = bool(box_cfg.get("ENABLED", True))
@@ -230,7 +243,11 @@ class PoseNode(Node):
             "/flap_check/predict",
             self.flap_check_callback,
         )
-        # Alignment: request carries the target pose (robot_localization/srv/SetPose)
+        self.lip_check_srv = self.create_service(
+            Trigger,
+            "/lip_check/predict",
+            self.lip_check_callback,
+        )
         self.alignment_srv = self.create_service(
             SetPose,
             "/alignment/predict",
@@ -275,6 +292,16 @@ class PoseNode(Node):
         self.flap_check_debug_pub = self.create_publisher(
             Image,
             "/flap_check/debug_image",
+            10,
+        )
+        self.lip_check_result_pub = self.create_publisher(
+            DiagnosticStatus,
+            "/lip_check/result",
+            10,
+        )
+        self.lip_check_debug_pub = self.create_publisher(
+            Image,
+            "/lip_check/debug_image",
             10,
         )
         self.alignment_result_pub = self.create_publisher(
@@ -323,6 +350,9 @@ class PoseNode(Node):
         self.get_logger().info("Service : /flap_check/predict")
         self.get_logger().info("Result  : /flap_check/result")
         self.get_logger().info("Debug   : /flap_check/debug_image")
+        self.get_logger().info("Service : /lip_check/predict")
+        self.get_logger().info("Result  : /lip_check/result [DiagnosticStatus]")
+        self.get_logger().info("Debug   : /lip_check/debug_image")
         self.get_logger().info(
             "Service : /alignment/predict [robot_localization/SetPose]"
         )
@@ -410,11 +440,6 @@ class PoseNode(Node):
     def _parse_request_pose(
         request: SetPose.Request,
     ) -> Tuple[np.ndarray, np.ndarray, str]:
-        """Return (location[3], rotation_xyzw[4], frame_id) from a SetPose request.
-
-        request.pose is PoseWithCovarianceStamped,
-        so the Pose itself is request.pose.pose.pose.
-        """
         stamped = request.pose
         pose = stamped.pose.pose
 
@@ -469,6 +494,9 @@ class PoseNode(Node):
 
     def _publish_flap_debug(self, image: Optional[np.ndarray]) -> None:
         self._publish_image(self.flap_check_debug_pub, image)
+
+    def _publish_lip_check_debug(self, image: Optional[np.ndarray]) -> None:
+        self._publish_image(self.lip_check_debug_pub, image)
 
     def _publish_alignment_debug(self, image: Optional[np.ndarray]) -> None:
         self._publish_image(self.alignment_debug_pub, image)
@@ -774,13 +802,132 @@ class PoseNode(Node):
             response,
         )
 
+    def lip_check_callback(
+        self,
+        request: Trigger.Request,
+        response: Trigger.Response,
+    ) -> Trigger.Response:
+        del request
+
+        if not self.lip_check_enabled:
+            response.success = False
+            response.message = "LIP Check disabled."
+            return response
+
+        if self.processing:
+            response.success = False
+            response.message = "busy"
+            return response
+
+        if self.lip_check_estimator is None:
+            response.success = False
+            response.message = "LIP Check estimator unavailable."
+            return response
+
+        self.processing = True
+
+        try:
+            self.get_logger().info("========================================")
+            self.get_logger().info("LIP Check prediction triggered.")
+
+            rgb, depth = self._get_camera_frame()
+
+            if rgb is None or depth is None:
+                response.success = False
+                response.message = "camera failed"
+                return response
+
+            if rgb.ndim != 3 or rgb.shape[2] != 3:
+                raise RuntimeError(f"Invalid RGB shape: {rgb.shape}")
+
+            if depth.ndim != 2:
+                raise RuntimeError(f"Invalid depth shape: {depth.shape}")
+
+            if depth.shape != rgb.shape[:2]:
+                raise RuntimeError(
+                    f"RGB/depth resolution mismatch: RGB={rgb.shape[:2]}, "
+                    f"Depth={depth.shape}"
+                )
+
+            if self.camera_matrix is None:
+                raise RuntimeError("Camera intrinsic matrix is None.")
+
+            camera_matrix = np.asarray(self.camera_matrix, dtype=np.float32)
+
+            if camera_matrix.shape != (3, 3):
+                raise RuntimeError(
+                    f"Invalid camera intrinsic matrix shape: {camera_matrix.shape}"
+                )
+
+            self.get_logger().info(f"RGB   : shape={rgb.shape}, dtype={rgb.dtype}")
+            self.get_logger().info(f"Depth : shape={depth.shape}, dtype={depth.dtype}")
+            self.get_logger().info("Running LIP Check...")
+
+            status = self.lip_check_estimator.predict(
+                rgb=rgb,
+                depth=depth,
+                intrinsic=camera_matrix,
+            )
+
+            if status not in ("PRESENT", "ABSENT"):
+                raise RuntimeError(f"LIP Check returned an invalid status: {status}")
+
+            result_data = {"lip_check": status}
+
+            result_msg = DiagnosticStatus()
+            result_msg.name = "lip_check"
+            result_msg.level = DiagnosticStatus.OK
+            result_msg.message = "success"
+            result_msg.values = [
+                KeyValue(key="lip_check", value=status),
+            ]
+            self.lip_check_result_pub.publish(result_msg)
+
+            result_text = json.dumps(
+                result_data,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+
+            debug_image = self.lip_check_estimator.debug_image
+            self._publish_lip_check_debug(
+                debug_image if debug_image is not None else rgb
+            )
+
+            response.success = True
+            response.message = result_text
+
+            self.get_logger().info(f"LIP Check result: {result_text}")
+            self.get_logger().info("========================================")
+
+        except Exception as error:
+            self.get_logger().error(
+                f"LIP Check exception: {type(error).__name__}: {error}"
+            )
+
+            result_msg = DiagnosticStatus()
+            result_msg.name = "lip_check"
+            result_msg.level = DiagnosticStatus.ERROR
+            result_msg.message = str(error)
+            result_msg.values = [
+                KeyValue(key="lip_check", value="UNKNOWN"),
+                KeyValue(key="error", value=str(error)),
+            ]
+            self.lip_check_result_pub.publish(result_msg)
+
+            response.success = False
+            response.message = f"lip_check:UNKNOWN error:{error}"
+
+        finally:
+            self.processing = False
+
+        return response
+
     def alignment_callback(
         self,
         request: SetPose.Request,
         response: SetPose.Response,
     ) -> SetPose.Response:
-        # SetPose has an empty response: failures can only be logged, and a
-        # NaN pose is published on /alignment/result so callers can detect them.
         if not self.alignment_enabled:
             self.get_logger().warning("Alignment disabled.")
             return response
@@ -799,8 +946,6 @@ class PoseNode(Node):
             self.get_logger().info("========================================")
             self.get_logger().info("Alignment prediction triggered.")
 
-            # Target (GT) pose carried by the request:
-            # location (x, y, z), rotation (x, y, z, w)
             req_location, req_rotation, req_frame = self._parse_request_pose(request)
             self.get_logger().info(
                 f"Target pose in '{req_frame or self.parent_frame}': "
@@ -853,14 +998,12 @@ class PoseNode(Node):
             )
             self.get_logger().info("Running Alignment...")
 
-            # The SAM2 ROI is derived from the target pose + configured
-            # height/width; delta = T_target @ inv(T_input).
             result = self.alignment_estimator.predict(
                 image=rgb,
                 depth=depth,
                 K=camera_matrix,
-                location=req_location,  # np.ndarray (3,)  x, y, z
-                rotation=req_rotation,  # np.ndarray (4,)  x, y, z, w (normalized)
+                location=req_location,
+                rotation=req_rotation,
             )
 
             input_pose = result.get("input_pose")

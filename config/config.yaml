@@ -70,6 +70,12 @@ RIPCORD_CHECK:
   COVERAGE_THRESHOLD: 0.4
 
 # ==========================================================
+# LIP CHECK
+# ==========================================================
+LIP_CHECK:
+  ENABLED: true
+
+# ==========================================================
 # RGB REFINE (top-face edge fitting + PnP post-processing)
 # SIZE_M: real size of the cuboid in METERS, in the object frame (X, Y, Z).
 # ORIGIN_OFFSET_M: position of the box geometric center expressed in the
