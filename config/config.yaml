@@ -92,6 +92,12 @@ RGB_REFINE:
       ORIGIN_OFFSET_M: [0.0, 0.0, 0.0]  # relative to project root, or absolute
       REF_ROTATE_DEG: 0
       REF_FLIP_X: false
+    3:
+      NAME: iphone14_pro_max
+      SIZE_M: {X: 0.179, Y: 0.0953, Z: 0.029}
+      ORIGIN_OFFSET_M: [0.0, 0.0, 0.0]  # relative to project root, or absolute
+      REF_ROTATE_DEG: 0
+      REF_FLIP_X: false
 
   PARAMS:
     CHECKPOINT: ../model/pose_refine_1106.pth
