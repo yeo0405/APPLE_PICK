@@ -89,20 +89,10 @@ RGB_REFINE:
     0:
       NAME: iphone14_plus_blue
       SIZE_M: {X: 0.178, Y: 0.0953, Z: 0.029}
-      ORIGIN_OFFSET_M: [0.0, 0.0, 0.0]
-      REF_IMAGE: "config/iphone14_plus_blue_top.png"   # relative to project root, or absolute
+      ORIGIN_OFFSET_M: [0.0, 0.0, 0.0]  # relative to project root, or absolute
       REF_ROTATE_DEG: 0
       REF_FLIP_X: false
 
   PARAMS:
-    CHECKPOINT: ../model/pose_refine_1105.pth
-    DEVICE: cuda
+    CHECKPOINT: ../model/pose_refine_1106.pth
 
-    MAX_DELTA: 0.1
-    IMAGE_SIZE: 224
-    ROI_PADDING: 0.25
-    MIN_ROI_SIZE: 64
-    MAX_CORNER_SHIFT_PX: 40.0
-    MIN_FACE_COS: 0.2
-    MIN_EDGE_LEN_PX: 5.0
-    MIN_ROI_PX: 30.0

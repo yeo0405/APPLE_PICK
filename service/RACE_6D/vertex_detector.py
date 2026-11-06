@@ -1,126 +1,94 @@
-"""RGB vertex detection primitives for RACE-6D pose refinement.
+"""RGB keypoint refinement for RACE-6D pose refinement (pure ML).
 
-This module contains the traditional image-processing vertex detector.
-Pose optimization and validation are implemented in pose_refine.py.
+Pipeline:
+  1. Project the RACE-6D pose onto the RGB image.
+  2. Build a pose-guided ROI from the four projected face corners.
+  3. Prepare RGB + initial-keypoint heatmaps.
+  4. Predict refined corners with KeypointRefinementNet (FPN + soft-argmax,
+     cascaded; conditioned on the box size if the checkpoint was trained so).
+     Legacy checkpoints (pooled regression) are still supported.
+  5. Optionally project the 4 corners onto a rigid pose (IPPE, geometry only).
+  6. Return VertexDetectionResult for pose_refine.py.
+
+Model / preprocessing settings (arch, cond_dim, size_scale_mm, num_iters,
+image_size, roi_padding, min_roi_size) are read from the checkpoint's saved
+config so inference always matches training.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, fields
-from itertools import product
+import math
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+import torch
+
+from models.keypoint_refinement import build_model_from_config
 
 logger = logging.getLogger(__name__)
-_MIN_PAIR_SEP = 0.15
+
+
+def build_condition(size_mm, scale_mm: float) -> np.ndarray:
+    """Object-size condition vector. Must be identical to train.py."""
+    sx, sy, sz = [max(float(v), 1e-6) for v in size_mm]
+
+    return np.array(
+        [
+            sx / scale_mm,
+            sy / scale_mm,
+            sz / scale_mm,
+            math.log(sx / sy),
+            math.log(sz / sx),
+            math.log(sz / sy),
+        ],
+        dtype=np.float32,
+    )
 
 
 @dataclass
 class RefineParams:
-    # Edge search
-    band_px: float = 30.0
-    weight_ratio: float = 3.0
-    samples_per_edge: int = 40
-    sample_spacing_px: float = 4.0
-    min_samples_per_edge: int = 16
-    max_samples_per_edge: int = 100
-    edge_margin: float = 0.0
+    # Model (overridden by the checkpoint's saved config when available)
+    checkpoint: str = "runs/keypoint_refinement_v2/best.pth"
+    device: str = "cuda"
+    max_delta: float = 0.3  # legacy architecture only
 
-    # Gradient
-    min_grad: float = 3.0
-    grad_cap: float = 25.0
-    peak_min_distance_px: float = 1.0
-    max_peaks_per_sample: int = 3
-    polarity_penalty: float = 0.15
+    # ROI (overridden by the checkpoint's saved config when available)
+    image_size: int = 320
+    roi_padding: float = 0.5
+    min_roi_size: int = 32
 
-    # Search direction
-    search_angle_deg: float = 8.0
-    angle_step_deg: float = 0.5
-    support_px: float = 2.5
-    min_support_frac: float = 0.35
+    # Cascade stages at inference (new architecture only). 0 = use checkpoint value.
+    num_iters: int = 0
 
-    # Side wall
-    wall_outer_ratio: float = 0.75
-    min_out_px: float = 10.0
+    # Skip the network correction when it is smaller than this (px).
+    # 0 disables the guard. Small offsets (< ~10px) tend to be made worse.
+    min_correction_px: float = 0.0
 
-    # Line fitting
-    min_valid_edges: int = 3
-    inlier_px: float = 2.0
-    min_points: int = 8
-    max_edge_angle_deg: float = 10.0
-    min_line_coverage: float = 0.35
-    max_line_fit_error_px: float = 2.5
-    ransac_max_hypotheses: int = 1500
-
-    # Corner construction
-    edge_endpoint_as_corner: bool = False
-
-    # Other face edge rejection
-    other_face_exclusion_px: float = 5.0
+    # Rigid-body projection of the final 4 corners (IPPE, geometry only)
+    rigid_project: bool = False
+    rigid_max_px: float = 4.0  # skip the projection if the residual is larger
 
     # Sanity
-    max_reproj_px: float = 2.0
-    max_trans_mm: float = 40.0
-    max_rot_deg: float = 20.0
-    area_ratio_min: float = 0.7
-    area_ratio_max: float = 1.4
+    max_corner_shift_px: float = 40.0
     min_face_cos: float = 0.2
-    min_edge_len_px: float = 20.0
+    min_edge_len_px: float = 5.0
     min_roi_px: float = 30.0
-    blur_ksize: int = 3
+
+    # Pose refinement validation
+    corner_tol_px: float = 40.0
+    area_ratio_min: float = 0.5
+    area_ratio_max: float = 2.0
+    max_reproj_px: float = 5.0
+    max_trans_mm: float = 50.0
+    max_rot_deg: float = 15.0
 
     # Pose prior
     sigma_rot_deg: float = 5.0
     sigma_trans_mm: float = 10.0
-
-    # Offset prior
-    offset_prior_center_px: float = 0.0
-    offset_prior_sigma_in_px: float = 10.0
-    offset_prior_sigma_out_px: float = 16.0
-
-    # Boundary model
-    boundary_enabled: bool = True
-    boundary_strip_near_px: float = 2.0
-    boundary_strip_far_px: float = 8.0
-    boundary_interior_shrink: float = 0.6
-    boundary_similar_sigma: float = 3.0
-    boundary_min_sigma: float = 6.0
-
-    # Boundary score weights
-    boundary_weight: float = 0.85
-    boundary_inside_weight: float = 0.45
-    boundary_contrast_weight: float = 0.25
-    boundary_continuity_weight: float = 0.30
-
-    # Lab colour contrast
-    boundary_contrast_min: float = 5.0
-    boundary_contrast_full: float = 22.0
-    boundary_contrast_consistency: float = 8.0
-    boundary_min_inside_similarity: float = 0.35
-    boundary_max_outside_similarity: float = 0.75
-
-    min_boundary_score: float = -1.0
-
-    # Candidates and joint selection
-    candidates_per_edge: int = 8
-    joint_candidates: int = 4
-    nms_offset_px: float = 3.0
-    nms_angle_deg: float = 2.0
-    min_candidate_unary: float = 0.01
-    corner_tol_px: float = 30.0
-    corner_penalty: float = 0.5
-    opposite_penalty: float = 0.5
-    opposite_ratio_tol: float = 0.3
-    opposite_angle_tol_deg: float = 6.0
-
-    # Corner gradient evidence
-    corner_evidence_enabled: bool = True
-    corner_evidence_radius_px: int = 4
-    corner_evidence_weight: float = 0.12
-    corner_gradient_min: float = 3.0
 
 
 @dataclass
@@ -141,45 +109,208 @@ class VertexDetectionResult:
 
 
 class VertexDetector:
-    def __init__(self, boxes: Dict[int, Dict[str, np.ndarray]], params: RefineParams):
+    IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+    IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+
+    def __init__(
+        self,
+        boxes: Dict[int, Dict[str, np.ndarray]],
+        params: RefineParams,
+    ):
         self.boxes = boxes
         self.p = params
 
+        # Filled in by _load_model from the checkpoint
+        self.cond_dim: int = 0
+        self.size_scale_mm: float = 300.0
+        self.arch: str = "legacy"
+        self.is_cascade: bool = False
+        self.num_iters: int = 1
+
+        self.device = torch.device(
+            params.device
+            if params.device == "cpu" or torch.cuda.is_available()
+            else "cpu"
+        )
+
+        self.model = self._load_model()
+
     @classmethod
-    def from_config(cls, cfg: Optional[dict]) -> Optional["VertexDetector"]:
+    def from_config(
+        cls,
+        cfg: Optional[dict],
+    ) -> Optional["VertexDetector"]:
         if not cfg or not cfg.get("ENABLED", False):
             return None
+
         boxes: Dict[int, Dict[str, np.ndarray]] = {}
+
         for label, item in (cfg.get("LABELS") or {}).items():
-            s = item["SIZE_M"]
-            size_mm = np.array([s["X"], s["Y"], s["Z"]], dtype=np.float64) * 1000.0
+            size = item["SIZE_M"]
+
+            size_mm = (
+                np.array([size["X"], size["Y"], size["Z"]], dtype=np.float64) * 1000.0
+            )
+
             offset_mm = (
                 np.asarray(item.get("ORIGIN_OFFSET_M", [0, 0, 0]), dtype=np.float64)
                 * 1000.0
             )
-            boxes[int(label)] = {"size_mm": size_mm, "offset_mm": offset_mm}
-        valid = {f.name for f in fields(RefineParams)}
+
+            boxes[int(label)] = {
+                "size_mm": size_mm,
+                "offset_mm": offset_mm,
+            }
+
+        params_cfg = cfg.get("PARAMS") or {}
+
+        valid = {
+            "checkpoint",
+            "device",
+            "max_delta",
+            "image_size",
+            "roi_padding",
+            "min_roi_size",
+            "num_iters",
+            "min_correction_px",
+            "rigid_project",
+            "rigid_max_px",
+            "max_corner_shift_px",
+            "min_face_cos",
+            "min_edge_len_px",
+            "min_roi_px",
+            "corner_tol_px",
+            "area_ratio_min",
+            "area_ratio_max",
+            "max_reproj_px",
+            "max_trans_mm",
+            "max_rot_deg",
+            "sigma_rot_deg",
+            "sigma_trans_mm",
+        }
+
         kwargs = {}
-        for k, v in (cfg.get("PARAMS") or {}).items():
-            key = k.lower()
+
+        for key, value in params_cfg.items():
+            key = key.lower()
+
             if key in valid:
-                kwargs[key] = v
+                kwargs[key] = value
             else:
-                logger.warning("Unknown RGB_REFINE param ignored: %s", k)
-        return cls(boxes, RefineParams(**kwargs))
+                logger.warning("Unknown RGB_REFINE param ignored: %s", key)
+
+        return cls(boxes=boxes, params=RefineParams(**kwargs))
+
+    def _load_model(self) -> torch.nn.Module:
+        checkpoint_path = Path(self.p.checkpoint).expanduser()
+
+        if not checkpoint_path.is_absolute():
+            module_dir = Path(__file__).resolve().parent
+
+            candidates = [
+                Path.cwd() / checkpoint_path,
+                module_dir / checkpoint_path,
+                module_dir.parent / checkpoint_path,
+            ]
+
+            checkpoint_path = next(
+                (path.resolve() for path in candidates if path.is_file()),
+                candidates[0].resolve(),
+            )
+
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"Keypoint refinement checkpoint not found: {checkpoint_path}"
+            )
+
+        checkpoint = torch.load(
+            str(checkpoint_path),
+            map_location="cpu",
+            weights_only=False,
+        )
+
+        state_dict = (
+            checkpoint["model"]
+            if isinstance(checkpoint, dict) and "model" in checkpoint
+            else checkpoint
+        )
+
+        ckpt_cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+        ckpt_cfg = ckpt_cfg or {}
+        ckpt_model = dict(ckpt_cfg.get("model", {}) or {})
+        ckpt_dataset = ckpt_cfg.get("dataset", {}) or {}
+
+        # cond_dim: prefer the saved config, otherwise infer from the weights
+        if "cond_dim" in ckpt_model:
+            self.cond_dim = int(ckpt_model["cond_dim"])
+        elif "cond_encoder.0.weight" in state_dict:
+            self.cond_dim = int(state_dict["cond_encoder.0.weight"].shape[1])
+        else:
+            self.cond_dim = 0
+
+        self.size_scale_mm = float(ckpt_model.get("size_scale_mm", 300.0))
+
+        # Preprocessing settings must match training
+        if "image_size" in ckpt_dataset:
+            self.p.image_size = int(ckpt_dataset["image_size"])
+
+        if "roi_padding" in ckpt_dataset:
+            self.p.roi_padding = float(ckpt_dataset["roi_padding"])
+
+        if "min_roi_size" in ckpt_dataset:
+            self.p.min_roi_size = int(ckpt_dataset["min_roi_size"])
+
+        if "max_delta" in ckpt_model:
+            self.p.max_delta = float(ckpt_model["max_delta"])
+
+        # A config without "arch" belongs to the legacy pooled-regression net
+        model = build_model_from_config(
+            ckpt_model, cond_dim=self.cond_dim, pretrained=False
+        )
+
+        model.load_state_dict(state_dict, strict=True)
+
+        model.to(self.device)
+        model.eval()
+
+        self.arch = str(ckpt_model.get("arch") or "legacy")
+        self.is_cascade = hasattr(model, "num_iters")
+
+        if self.is_cascade:
+            self.num_iters = (
+                int(self.p.num_iters)
+                if int(self.p.num_iters) > 0
+                else int(model.num_iters)
+            )
+        else:
+            self.num_iters = 1
+
+        logger.info("Loaded KeypointRefinementNet: %s", checkpoint_path)
+        logger.info("Device: %s", self.device)
+        logger.info(
+            "Model settings: arch=%s cond_dim=%d size_scale_mm=%.1f num_iters=%d "
+            "image_size=%d roi_padding=%.2f min_roi_size=%d",
+            self.arch,
+            self.cond_dim,
+            self.size_scale_mm,
+            self.num_iters,
+            self.p.image_size,
+            self.p.roi_padding,
+            self.p.min_roi_size,
+        )
+
+        return model
 
     @staticmethod
     def _project(pts_cam: np.ndarray, K: np.ndarray) -> np.ndarray:
         z = np.maximum(pts_cam[:, 2], 1e-3)
+
         u = K[0, 0] * pts_cam[:, 0] / z + K[0, 2]
         v = K[1, 1] * pts_cam[:, 1] / z + K[1, 2]
+
         return np.stack([u, v], axis=1)
 
-    def _face_corners_obj(
-        self,
-        box: Dict[str, np.ndarray],
-        sign: int,
-    ) -> np.ndarray:
+    def _face_corners_obj(self, box: Dict[str, np.ndarray], sign: int) -> np.ndarray:
         hx, hy, hz = box["size_mm"] / 2.0
 
         corners = np.array(
@@ -203,1471 +334,216 @@ class VertexDetector:
         best = None
 
         for sign in (+1, -1):
-            normal = R @ np.array(
-                [0.0, 0.0, float(sign)],
-                dtype=np.float64,
-            )
+            normal = R @ np.array([0.0, 0.0, float(sign)], dtype=np.float64)
 
             center_obj = box["offset_mm"] + np.array(
-                [0.0, 0.0, sign * box["size_mm"][2] / 2.0],
-                dtype=np.float64,
+                [0.0, 0.0, sign * box["size_mm"][2] / 2.0], dtype=np.float64
             )
 
             center = R @ center_obj + t
+
             cos = float(-normal @ center / (np.linalg.norm(center) + 1e-9))
 
             if best is None or cos > best[2]:
-                best = (
-                    sign,
-                    self._face_corners_obj(box, sign),
-                    cos,
-                )
+                best = (sign, self._face_corners_obj(box, sign), cos)
 
         return best
 
+    def _get_roi(
+        self,
+        keypoints: np.ndarray,
+        image_width: int,
+        image_height: int,
+    ) -> Tuple[float, float, float]:
+        points = keypoints[:, :2].copy()
+
+        points[:, 0] *= image_width
+        points[:, 1] *= image_height
+
+        valid = keypoints[:, 2] > 0
+
+        if valid.sum() >= 2:
+            points = points[valid]
+
+        x_min = float(points[:, 0].min())
+        x_max = float(points[:, 0].max())
+        y_min = float(points[:, 1].min())
+        y_max = float(points[:, 1].max())
+
+        center_x = (x_min + x_max) * 0.5
+        center_y = (y_min + y_max) * 0.5
+
+        roi_side = max(
+            x_max - x_min,
+            y_max - y_min,
+            float(self.p.min_roi_size),
+        ) * (1.0 + 2.0 * float(self.p.roi_padding))
+
+        return center_x, center_y, roi_side
+
     @staticmethod
-    def _point_line_distance(points, p0, direction) -> np.ndarray:
-        return np.abs(
-            (points[:, 0] - p0[0]) * direction[1]
-            - (points[:, 1] - p0[1]) * direction[0]
+    def _crop_square(
+        image: np.ndarray,
+        center_x: float,
+        center_y: float,
+        side: float,
+        output_size: int,
+    ) -> Tuple[np.ndarray, float, float, float]:
+        side = max(1, int(round(side)))
+
+        x0 = int(math.floor(center_x - side * 0.5))
+        y0 = int(math.floor(center_y - side * 0.5))
+
+        pad = side + 2
+
+        padded = cv2.copyMakeBorder(
+            image, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(0, 0, 0)
         )
 
-    @staticmethod
-    def _line_angle_error_deg(direction, expected) -> float:
-        cross = abs(direction[0] * expected[1] - direction[1] * expected[0])
-        dot = abs(float(direction @ expected))
-        return float(np.degrees(np.arctan2(cross, dot + 1e-12)))
+        crop = padded[y0 + pad : y0 + pad + side, x0 + pad : x0 + pad + side]
+
+        if crop.shape[:2] != (side, side):
+            raise RuntimeError("ROI crop size mismatch.")
+
+        crop = cv2.resize(
+            crop, (output_size, output_size), interpolation=cv2.INTER_LINEAR
+        )
+
+        return crop, float(x0), float(y0), float(side)
 
     @staticmethod
-    def _normalize_direction(direction) -> np.ndarray:
-        direction = np.asarray(direction, dtype=np.float64)
-        return direction / (np.linalg.norm(direction) + 1e-12)
-
-    @staticmethod
-    def _orient(
-        direction: np.ndarray,
-        expected: np.ndarray,
+    def _make_gaussian_heatmaps(
+        keypoints: np.ndarray,
+        resolution: int,
+        sigma: float = 4.0,
     ) -> np.ndarray:
-        return direction if float(direction @ expected) >= 0.0 else -direction
+        heatmaps = np.zeros((4, resolution, resolution), dtype=np.float32)
 
-    @staticmethod
-    def _wrap_half_pi(deg: float) -> float:
-        return ((deg + 90.0) % 180.0) - 90.0
-
-    @staticmethod
-    def _dir_angle_deg(direction: np.ndarray) -> float:
-        return float(np.degrees(np.arctan2(direction[1], direction[0])))
-
-    @staticmethod
-    def _line_offset(pt, d, mid, normal) -> float:
-        cross_nd = normal[0] * d[1] - normal[1] * d[0]
-
-        if abs(cross_nd) < 1e-6:
-            cross_nd = 1e-6
-
-        cross_p = (pt[0] - mid[0]) * d[1] - (pt[1] - mid[1]) * d[0]
-
-        return float(cross_p / cross_nd)
-
-    def _offset_prior(self, s):
-        p = self.p
-        s = np.asarray(s, dtype=np.float64)
-        c = float(p.offset_prior_center_px)
-
-        sigma = np.where(
-            s > c,
-            float(p.offset_prior_sigma_out_px),
-            float(p.offset_prior_sigma_in_px),
-        )
-
-        sigma = np.maximum(sigma, 1e-3)
-
-        return np.exp(-0.5 * ((s - c) / sigma) ** 2)
-
-    def _sample_edge(self, length: float) -> np.ndarray:
-        p = self.p
-
-        n = int(np.ceil(length / max(p.sample_spacing_px, 1.0))) + 1
-
-        n = max(
-            n,
-            p.min_samples_per_edge,
-            p.samples_per_edge,
-        )
-
-        n = min(n, p.max_samples_per_edge)
-
-        margin = float(np.clip(p.edge_margin, 0.0, 0.49))
-
-        return np.linspace(
-            margin,
-            1.0 - margin,
-            n,
-        )
-
-    def _collect_gradient_candidates(
-        self,
-        gray,
-        p0,
-        p1,
-        normal,
-        band_in,
-        band_out,
-        offset,
-    ):
-        p = self.p
-
-        direction = p1 - p0
-        length = float(np.linalg.norm(direction))
-        ts = self._sample_edge(length)
-
-        S = len(ts)
-        Pm = max(1, int(p.max_peaks_per_sample))
-
-        arrs = {
-            "pts": np.full(
-                (S, Pm, 2),
-                np.nan,
-                dtype=np.float64,
-            ),
-            "valid": np.zeros((S, Pm), dtype=bool),
-            "grad": np.zeros((S, Pm), dtype=np.float64),
-            "pol": np.zeros((S, Pm), dtype=np.int8),
-            "ts": ts,
-        }
-
-        info = {
-            "gradient_candidate_count": 0,
-            "sample_count": int(S),
-        }
-
-        base = p0[None, :] + ts[:, None] * direction[None, :]
-
-        step = 0.5
-
-        offsets = np.arange(
-            -band_in,
-            band_out + step * 0.5,
-            step,
-            dtype=np.float32,
-        )
-
-        if len(offsets) < 3:
-            return arrs, info
-
-        h, w = gray.shape
-
-        mx = (base[:, None, 0] + offsets[None, :] * normal[0]).astype(np.float32)
-
-        my = (base[:, None, 1] + offsets[None, :] * normal[1]).astype(np.float32)
-
-        inside = (mx >= 1) & (mx < w - 2) & (my >= 1) & (my < h - 2)
-
-        prof = cv2.remap(
-            gray,
-            mx,
-            my,
-            cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
-
-        grad = np.gradient(prof, step, axis=1)
-        magnitude = np.abs(grad)
-        inner = magnitude[:, 1:-1]
-
-        is_peak = (
-            (inner >= magnitude[:, :-2])
-            & (inner >= magnitude[:, 2:])
-            & (inner >= p.min_grad)
-            & inside[:, 1:-1]
-            & inside[:, :-2]
-            & inside[:, 2:]
-        )
-
-        min_gap = max(
-            1,
-            int(round(p.peak_min_distance_px / step)),
-        )
-
-        for s in range(S):
-            js = np.nonzero(is_peak[s])[0] + 1
-
-            if js.size == 0:
+        for i, (x, y, visibility) in enumerate(keypoints):
+            if visibility <= 0:
                 continue
 
-            order = js[np.argsort(-magnitude[s, js])]
-            selected: List[int] = []
-
-            for j in order:
-                j = int(j)
-
-                if any(abs(j - o) < min_gap for o in selected):
-                    continue
-
-                selected.append(j)
-
-                if len(selected) >= Pm:
-                    break
-
-            for m, j in enumerate(selected):
-                arrs["pts"][s, m] = base[s] + float(offsets[j]) * normal + offset
-
-                arrs["valid"][s, m] = True
-                arrs["grad"][s, m] = float(magnitude[s, j])
-                arrs["pol"][s, m] = 1 if grad[s, j] >= 0 else -1
-
-        info["gradient_candidate_count"] = int(arrs["valid"].sum())
-
-        return arrs, info
-
-    def _rank_hypotheses(
-        self,
-        arrs,
-        expected,
-        mid_g,
-        normal,
-        length,
-    ):
-        p = self.p
-
-        pts_pad = arrs["pts"]
-        valid_pad = arrs["valid"]
-
-        S, Pm = valid_pad.shape
-
-        flat_idx = np.nonzero(valid_pad.ravel())[0]
-
-        if flat_idx.size < max(2, p.min_points):
-            return []
-
-        flat_pts = pts_pad.reshape(-1, 2)[flat_idx]
-        flat_sample = (flat_idx // Pm).astype(np.int32)
-
-        ii, jj = np.triu_indices(len(flat_pts), k=1)
-
-        keep = flat_sample[ii] != flat_sample[jj]
-        ii, jj = ii[keep], jj[keep]
-
-        if ii.size == 0:
-            return []
-
-        delta = flat_pts[jj] - flat_pts[ii]
-        norm = np.linalg.norm(delta, axis=1)
-
-        keep = norm >= max(_MIN_PAIR_SEP * length, 1e-6)
-
-        ii = ii[keep]
-        delta = delta[keep]
-        norm = norm[keep]
-
-        if ii.size == 0:
-            return []
-
-        d = delta / norm[:, None]
-
-        dot = d @ expected
-
-        d = (
-            d
-            * np.where(
-                dot < 0.0,
-                -1.0,
-                1.0,
-            )[:, None]
-        )
-
-        cross = np.abs(d[:, 0] * expected[1] - d[:, 1] * expected[0])
-
-        ang = np.degrees(np.arctan2(cross, np.abs(dot)))
-
-        keep = ang <= p.search_angle_deg
-
-        ii = ii[keep]
-        d = d[keep]
-
-        if ii.size == 0:
-            return []
-
-        if ii.size > p.ransac_max_hypotheses:
-            sel = np.linspace(
-                0,
-                ii.size - 1,
-                int(p.ransac_max_hypotheses),
-            ).astype(np.int64)
-
-            ii = ii[sel]
-            d = d[sel]
-
-        p0 = flat_pts[ii]
-
-        rel_x = pts_pad[None, :, :, 0] - p0[:, None, None, 0]
-
-        rel_y = pts_pad[None, :, :, 1] - p0[:, None, None, 1]
-
-        dist = np.abs(rel_x * d[:, None, None, 1] - rel_y * d[:, None, None, 0])
-
-        dist = np.where(
-            valid_pad[None, :, :],
-            dist,
-            np.inf,
-        )
-
-        dmin = dist.min(axis=2)
-        amin = dist.argmin(axis=2)
-
-        inl = dmin <= p.inlier_px
-        n_in = inl.sum(axis=1)
-
-        keep = n_in >= p.min_points
-
-        if not keep.any():
-            return []
-
-        p0 = p0[keep]
-        d = d[keep]
-        dmin = dmin[keep]
-        amin = amin[keep]
-        inl = inl[keep]
-        n_in = n_in[keep]
-
-        Hn = len(n_in)
-
-        rows = np.arange(S)[None, :]
-        sel_pts = pts_pad[rows, amin]
-
-        t_all = (sel_pts[..., 0] - mid_g[0]) * expected[0] + (
-            sel_pts[..., 1] - mid_g[1]
-        ) * expected[1]
-
-        tmax = np.where(
-            inl,
-            t_all,
-            -np.inf,
-        ).max(axis=1)
-
-        tmin = np.where(
-            inl,
-            t_all,
-            np.inf,
-        ).min(axis=1)
-
-        coverage = np.clip(
-            (tmax - tmin) / max(length, 1e-6),
-            0.0,
-            1.0,
-        )
-
-        d_sorted = np.sort(
-            np.where(inl, dmin, np.inf),
-            axis=1,
-        )
-
-        resid = d_sorted[
-            np.arange(Hn),
-            (n_in - 1) // 2,
-        ]
-
-        g_sel = arrs["grad"][rows, amin]
-
-        grad_score = (
-            np.minimum(
-                g_sel / max(p.grad_cap, 1e-6),
-                1.0,
-            )
-            * inl
-        ).sum(axis=1) / n_in
-
-        pol_sel = arrs["pol"][rows, amin]
-
-        pos = ((pol_sel > 0) & inl).sum(axis=1)
-        pol_cons = np.maximum(pos, n_in - pos) / n_in
-        support = n_in / float(S)
-
-        base = (
-            support
-            * (0.5 + 0.5 * coverage)
-            * (0.5 + 0.5 * grad_score)
-            * (1.0 - p.polarity_penalty * (1.0 - pol_cons))
-            / (1.0 + resid)
-        )
-
-        cross_nd = normal[0] * d[:, 1] - normal[1] * d[:, 0]
-
-        cross_nd = np.where(
-            np.abs(cross_nd) < 1e-6,
-            1e-6,
-            cross_nd,
-        )
-
-        cross_p = (p0[:, 0] - mid_g[0]) * d[:, 1] - (p0[:, 1] - mid_g[1]) * d[:, 0]
-
-        s_mid = cross_p / cross_nd
-        score = base * self._offset_prior(s_mid)
-
-        ang_signed = np.degrees(
-            np.arctan2(
-                expected[0] * d[:, 1] - expected[1] * d[:, 0],
-                d @ expected,
-            )
-        )
-
-        order = np.argsort(-score)[:300]
-        picked: List[int] = []
-
-        for h in order:
-            h = int(h)
-
-            if any(
-                abs(s_mid[h] - s_mid[q]) < p.nms_offset_px
-                and abs(ang_signed[h] - ang_signed[q]) < p.nms_angle_deg
-                for q in picked
-            ):
+            if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
                 continue
 
-            picked.append(h)
+            px = x * (resolution - 1)
+            py = y * (resolution - 1)
 
-            if len(picked) >= max(
-                1,
-                int(p.candidates_per_edge),
-            ):
-                break
+            radius = max(1, int(math.ceil(3.0 * sigma)))
 
-        return [
-            {
-                "pts": sel_pts[h][inl[h]],
-                "score": float(score[h]),
-                "s_mid": float(s_mid[h]),
-                "angle": float(ang_signed[h]),
-            }
-            for h in picked
-        ]
+            x0 = max(0, int(math.floor(px)) - radius)
+            x1 = min(resolution, int(math.floor(px)) + radius + 1)
+            y0 = max(0, int(math.floor(py)) - radius)
+            y1 = min(resolution, int(math.floor(py)) + radius + 1)
 
-    def _fit_line(
-        self,
-        pts: np.ndarray,
-        expected_direction: Optional[np.ndarray] = None,
-    ) -> Optional[Tuple[np.ndarray, np.ndarray, int]]:
-        p = self.p
+            yy, xx = np.mgrid[y0:y1, x0:x1]
 
-        if pts is None or len(pts) < p.min_points:
-            return None
-
-        pts = np.asarray(
-            pts,
-            dtype=np.float32,
-        ).reshape(-1, 2)
-
-        vx, vy, x0, y0 = cv2.fitLine(
-            pts,
-            cv2.DIST_HUBER,
-            0,
-            0.01,
-            0.01,
-        ).ravel()
-
-        direction = self._normalize_direction(np.array([vx, vy], dtype=np.float64))
-
-        point = np.array(
-            [x0, y0],
-            dtype=np.float64,
-        )
-
-        distances = self._point_line_distance(
-            pts.astype(np.float64),
-            point,
-            direction,
-        )
-
-        keep = distances <= p.inlier_px
-
-        if keep.sum() < p.min_points:
-            return None
-
-        vx, vy, x0, y0 = cv2.fitLine(
-            pts[keep],
-            cv2.DIST_L2,
-            0,
-            0.01,
-            0.01,
-        ).ravel()
-
-        direction = self._normalize_direction(np.array([vx, vy], dtype=np.float64))
-
-        point = np.array(
-            [x0, y0],
-            dtype=np.float64,
-        )
-
-        distances = self._point_line_distance(
-            pts.astype(np.float64),
-            point,
-            direction,
-        )
-
-        keep = distances <= p.inlier_px
-
-        if keep.sum() < p.min_points:
-            return None
-
-        if expected_direction is not None:
-            angle = self._line_angle_error_deg(
-                direction,
-                expected_direction,
+            heatmaps[i, y0:y1, x0:x1] = np.exp(
+                -((xx - px) ** 2 + (yy - py) ** 2) / (2.0 * sigma * sigma)
             )
 
-            if angle > p.max_edge_angle_deg:
-                return None
+        return heatmaps
 
-        return point, direction, int(keep.sum())
-
-    def _interior_model(
+    def _prepare_input(
         self,
-        lab: np.ndarray,
-        pred_local: np.ndarray,
-    ):
-        p = self.p
+        image: np.ndarray,
+        keypoints: np.ndarray,
+    ) -> Tuple[torch.Tensor, np.ndarray, float, float, float]:
+        height, width = image.shape[:2]
 
-        center = pred_local.mean(axis=0)
+        offset = keypoints.copy()
 
-        poly = center + float(p.boundary_interior_shrink) * (pred_local - center)
+        center_x, center_y, roi_side = self._get_roi(offset, width, height)
 
-        mask = np.zeros(
-            lab.shape[:2],
-            dtype=np.uint8,
+        crop, x0, y0, roi_side = self._crop_square(
+            image, center_x, center_y, roi_side, int(self.p.image_size)
         )
 
-        cv2.fillConvexPoly(
-            mask,
-            np.rint(poly).astype(np.int32),
-            255,
+        crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+
+        scale = float(self.p.image_size) / roi_side
+
+        offset[:, 0] = (offset[:, 0] * width - x0) * scale / self.p.image_size
+        offset[:, 1] = (offset[:, 1] * height - y0) * scale / self.p.image_size
+
+        crop = crop.astype(np.float32) / 255.0
+        crop = (crop - self.IMAGENET_MEAN) / self.IMAGENET_STD
+
+        input_heatmaps = self._make_gaussian_heatmaps(
+            offset, int(self.p.image_size), sigma=4.0
         )
 
-        px = lab[mask > 0]
+        model_input = np.concatenate([crop.transpose(2, 0, 1), input_heatmaps], axis=0)
 
-        if len(px) < 150:
-            return None
-
-        if len(px) > 6000:
-            px = px[:: max(1, len(px) // 6000)]
-
-        mu = np.median(px, axis=0)
-
-        mad = np.median(np.abs(px - mu), axis=0) * 1.4826
-
-        sig = np.maximum(
-            mad,
-            float(p.boundary_min_sigma),
-        )
+        initial_coords = offset[:, :2].astype(np.float32)
 
         return (
-            mu.astype(np.float32),
-            sig.astype(np.float32),
+            torch.from_numpy(model_input.astype(np.float32)),
+            initial_coords,
+            x0,
+            y0,
+            roi_side,
         )
-
-    def _boundary_stats(
-        self,
-        lab,
-        interior,
-        pt,
-        d,
-        normal,
-        t_lo,
-        t_hi,
-        offset,
-    ) -> Optional[Dict[str, float]]:
-        p = self.p
-        mu, sig = interior
-
-        span = max(t_hi - t_lo, 1.0)
-
-        n = int(
-            np.clip(
-                np.ceil(span / 4.0) + 1,
-                8,
-                60,
-            )
-        )
-
-        ts = np.linspace(t_lo, t_hi, n)
-
-        base = pt[None, :] + ts[:, None] * d[None, :] - offset[None, :]
-
-        near = max(
-            float(p.boundary_strip_near_px),
-            0.5,
-        )
-
-        far = max(
-            float(p.boundary_strip_far_px),
-            near + 1.0,
-        )
-
-        mags = np.arange(
-            near,
-            far + 1e-6,
-            1.0,
-        )
-
-        if len(mags) < 2:
-            return None
-
-        k = len(mags)
-
-        offs = np.concatenate([-mags, mags]).astype(np.float32)
-
-        mx = (base[:, 0:1] + offs[None, :] * normal[0]).astype(np.float32)
-
-        my = (base[:, 1:2] + offs[None, :] * normal[1]).astype(np.float32)
-
-        h, w = lab.shape[:2]
-
-        valid = (mx >= 1) & (mx < w - 1) & (my >= 1) & (my < h - 1)
-
-        samp = cv2.remap(
-            lab,
-            mx,
-            my,
-            cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
-        )
-
-        z = (samp - mu[None, None, :]) / sig[None, None, :]
-
-        dist = np.sqrt(np.mean(z * z, axis=2))
-
-        similar = dist < float(p.boundary_similar_sigma)
-
-        valid_in = valid[:, :k]
-        valid_out = valid[:, k:]
-
-        n_in = valid_in.sum(axis=1)
-        n_out = valid_out.sum(axis=1)
-
-        need = max(
-            2,
-            int(np.ceil(k * 0.6)),
-        )
-
-        good = (n_in >= need) & (n_out >= need)
-
-        if int(good.sum()) < 5:
-            return None
-
-        in_frac = (similar[:, :k] & valid_in).sum(axis=1) / np.maximum(n_in, 1)
-
-        out_frac = (similar[:, k:] & valid_out).sum(axis=1) / np.maximum(n_out, 1)
-
-        inside_lab = samp[:, :k, :]
-        outside_lab = samp[:, k:, :]
-
-        paired_delta = np.linalg.norm(
-            inside_lab - outside_lab,
-            axis=2,
-        )
-
-        paired_valid = valid_in & valid_out
-        paired_count = paired_valid.sum(axis=1)
-
-        contrast_per_sample = np.where(
-            paired_valid,
-            paired_delta,
-            0.0,
-        ).sum(
-            axis=1
-        ) / np.maximum(paired_count, 1)
-
-        contrast_per_sample = contrast_per_sample[good]
-        inside_good = in_frac[good]
-        outside_good = out_frac[good]
-
-        contrast = float(np.median(contrast_per_sample))
-
-        contrast_min = float(p.boundary_contrast_min)
-
-        contrast_full = max(
-            float(p.boundary_contrast_full),
-            contrast_min + 1e-6,
-        )
-
-        contrast_score = float(
-            np.clip(
-                (contrast - contrast_min) / (contrast_full - contrast_min),
-                0.0,
-                1.0,
-            )
-        )
-
-        contrast_consistency = float(
-            np.mean(contrast_per_sample >= float(p.boundary_contrast_consistency))
-        )
-
-        inside_score = float(np.mean(inside_good))
-
-        outside_score = float(1.0 - np.mean(outside_good))
-
-        separation_score = float(
-            np.clip(
-                np.mean(inside_good - outside_good),
-                0.0,
-                1.0,
-            )
-        )
-
-        inside_weight = max(
-            float(p.boundary_inside_weight),
-            0.0,
-        )
-
-        contrast_weight = max(
-            float(p.boundary_contrast_weight),
-            0.0,
-        )
-
-        continuity_weight = max(
-            float(p.boundary_continuity_weight),
-            0.0,
-        )
-
-        weight_sum = inside_weight + contrast_weight + continuity_weight
-
-        if weight_sum <= 1e-9:
-            score = separation_score
-        else:
-            score = (
-                inside_weight * separation_score
-                + contrast_weight * contrast_score
-                + continuity_weight * contrast_consistency
-            ) / weight_sum
-
-        if inside_score < float(p.boundary_min_inside_similarity):
-            score *= inside_score / max(
-                float(p.boundary_min_inside_similarity),
-                1e-6,
-            )
-
-        max_out = float(p.boundary_max_outside_similarity)
-
-        if outside_score < (1.0 - max_out):
-            score *= 0.5 + 0.5 * outside_score / max(1.0 - max_out, 1e-6)
-
-        return {
-            "score": float(np.clip(score, 0.0, 1.0)),
-            "inside": inside_score,
-            "outside": float(np.mean(outside_good)),
-            "separation": separation_score,
-            "contrast": contrast,
-            "contrast_score": contrast_score,
-            "continuity": contrast_consistency,
-            "samples": int(good.sum()),
-        }
-
-    def _finalize_candidate(
-        self,
-        hyp,
-        arrs,
-        expected,
-        mid_g,
-        normal,
-        length,
-        lab,
-        interior,
-        offset,
-    ) -> Optional[Dict[str, Any]]:
-        p = self.p
-
-        pts_pad = arrs["pts"]
-        valid_pad = arrs["valid"]
-
-        S = valid_pad.shape[0]
-        rows = np.arange(S)
-
-        fit = self._fit_line(
-            hyp["pts"],
-            expected,
-        )
-
-        if fit is None:
-            return None
-
-        pt, d, _ = fit
-        d = self._orient(d, expected)
-
-        dist = np.abs(
-            (pts_pad[..., 0] - pt[0]) * d[1] - (pts_pad[..., 1] - pt[1]) * d[0]
-        )
-
-        dist = np.where(
-            valid_pad,
-            dist,
-            np.inf,
-        )
-
-        amin = dist.argmin(axis=1)
-        dmin = dist[rows, amin]
-        sel = dmin <= p.inlier_px
-
-        if int(sel.sum()) < p.min_points:
-            return None
-
-        sel_pts = pts_pad[rows, amin][sel]
-
-        fit = self._fit_line(
-            sel_pts,
-            expected,
-        )
-
-        if fit is None:
-            return None
-
-        pt, d, _ = fit
-        d = self._orient(d, expected)
-
-        dist_f = self._point_line_distance(
-            sel_pts,
-            pt,
-            d,
-        )
-
-        inl = dist_f <= p.inlier_px
-
-        if int(inl.sum()) < p.min_points:
-            return None
-
-        final_pts = sel_pts[inl]
-
-        sel_samples = np.nonzero(sel)[0][inl]
-        peak_idx = amin[sel_samples]
-
-        grads = arrs["grad"][sel_samples, peak_idx]
-        pols = arrs["pol"][sel_samples, peak_idx]
-
-        fit_err = float(np.median(dist_f[inl]))
-
-        angle_err = self._line_angle_error_deg(
-            d,
-            expected,
-        )
-
-        support = float(len(final_pts) / max(S, 1))
-
-        t = (final_pts - mid_g[None, :]) @ expected
-
-        coverage = float(
-            np.clip(
-                (t.max() - t.min()) / max(length, 1e-6),
-                0.0,
-                1.0,
-            )
-        )
-
-        grad_score = float(
-            np.mean(
-                np.minimum(
-                    grads / max(p.grad_cap, 1e-6),
-                    1.0,
-                )
-            )
-        )
-
-        pos = int(np.count_nonzero(pols > 0))
-
-        neg = int(np.count_nonzero(pols < 0))
-
-        pol_cons = max(pos, neg) / max(len(pols), 1)
-
-        base = (
-            support
-            * (0.5 + 0.5 * coverage)
-            * (0.5 + 0.5 * grad_score)
-            * (1.0 - p.polarity_penalty * (1.0 - pol_cons))
-            / (1.0 + fit_err)
-        )
-
-        s_mid = self._line_offset(
-            pt,
-            d,
-            mid_g,
-            normal,
-        )
-
-        prior = float(self._offset_prior(s_mid))
-
-        boundary = None
-
-        if p.boundary_enabled and interior is not None:
-            tl = (final_pts - pt[None, :]) @ d
-
-            boundary = self._boundary_stats(
-                lab,
-                interior,
-                pt,
-                d,
-                normal,
-                float(tl.min()),
-                float(tl.max()),
-                offset,
-            )
-
-        bfactor = 1.0
-
-        if boundary is not None:
-            bw = float(np.clip(p.boundary_weight, 0.0, 1.0))
-
-            bfactor = (1.0 - bw) + bw * float(np.clip(boundary["score"], 0.0, 1.0))
-
-        unary = float(base * prior * bfactor)
-
-        reject = None
-
-        if support < p.min_support_frac:
-            reject = "support_too_low"
-        elif coverage < p.min_line_coverage:
-            reject = "coverage_too_low"
-        elif fit_err > p.max_line_fit_error_px:
-            reject = "fit_error_too_large"
-        elif angle_err > p.max_edge_angle_deg:
-            reject = "angle_rejected"
-        elif boundary is not None and boundary["score"] < p.min_boundary_score:
-            reject = "boundary_rejected"
-
-        return {
-            "accepted": reject is None,
-            "reject": reject,
-            "point": pt,
-            "dir": d,
-            "pts": final_pts,
-            "line": (
-                pt,
-                d,
-                int(len(final_pts)),
-            ),
-            "s_mid": float(s_mid),
-            "angle_deg": float(
-                np.degrees(
-                    np.arctan2(
-                        expected[0] * d[1] - expected[1] * d[0],
-                        float(d @ expected),
-                    )
-                )
-            ),
-            "support": support,
-            "coverage": coverage,
-            "fit_err": fit_err,
-            "angle_err": float(angle_err),
-            "pol_cons": float(pol_cons),
-            "grad_score": grad_score,
-            "base": float(base),
-            "prior": prior,
-            "boundary": boundary,
-            "bfactor": float(bfactor),
-            "unary": unary,
-        }
-
-    def _edge_candidates(
-        self,
-        gray,
-        lab,
-        interior,
-        p0,
-        p1,
-        normal,
-        wall_px,
-        offset,
-        expected,
-        mid_g,
-    ):
-        p = self.p
-
-        length = float(np.linalg.norm(p1 - p0))
-
-        band_in = float(p.band_px)
-        band_out = float(p.band_px)
-
-        if p.wall_outer_ratio > 0 and abs(wall_px) > 4.0:
-            wall_limit = float(
-                np.clip(
-                    p.wall_outer_ratio * abs(wall_px),
-                    p.min_out_px,
-                    p.band_px,
-                )
-            )
-
-            if wall_px > 0:
-                band_out = wall_limit
-            else:
-                band_in = wall_limit
-
-        arrs, info = self._collect_gradient_candidates(
-            gray,
-            p0,
-            p1,
-            normal,
-            band_in,
-            band_out,
-            offset,
-        )
-
-        info["n_candidates"] = 0
-
-        if info["gradient_candidate_count"] < p.min_points:
-            return [], info
-
-        hyps = self._rank_hypotheses(
-            arrs,
-            expected,
-            mid_g,
-            normal,
-            length,
-        )
-
-        if not hyps:
-            return [], info
-
-        cands = []
-
-        for hyp in hyps:
-            c = self._finalize_candidate(
-                hyp,
-                arrs,
-                expected,
-                mid_g,
-                normal,
-                length,
-                lab,
-                interior,
-                offset,
-            )
-
-            if c is not None:
-                cands.append(c)
-
-        # Reject candidates that are too close to the corresponding
-        # edge of the opposite face.
-        exclusion_px = max(
-            0.0,
-            float(p.other_face_exclusion_px),
-        )
-
-        other_face_rejected = 0
-
-        # Only enable rejection when the projected separation is
-        # sufficiently large. Otherwise the two faces are too close
-        # in the image to distinguish reliably.
-        if exclusion_px > 0.0 and abs(wall_px) > 2.0 * exclusion_px:
-            filtered = []
-
-            for c in cands:
-                distance = abs(float(c["s_mid"]) - float(wall_px))
-
-                if distance < exclusion_px:
-                    other_face_rejected += 1
-                    continue
-
-                filtered.append(c)
-
-            cands = filtered
-
-        info["other_face_rejected"] = int(other_face_rejected)
-        info["other_face_wall_px"] = float(wall_px)
-        info["other_face_exclusion_px"] = float(exclusion_px)
-
-        cands.sort(key=lambda c: -c["unary"])
-
-        kept: List[Dict[str, Any]] = []
-
-        for c in cands:
-            if any(
-                abs(c["s_mid"] - k["s_mid"]) < 0.5 * p.nms_offset_px
-                and abs(c["angle_deg"] - k["angle_deg"]) < 0.5 * p.nms_angle_deg
-                for k in kept
-            ):
-                continue
-
-            kept.append(c)
-
-        info["n_candidates"] = len(kept)
-
-        return kept, info
-
-    def _corner_gradient_evidence(
-        self,
-        gray: np.ndarray,
-        corner_global: np.ndarray,
-        normal_a: np.ndarray,
-        normal_b: np.ndarray,
-        offset: np.ndarray,
-    ) -> float:
-        p = self.p
-
-        if not p.corner_evidence_enabled:
-            return 1.0
-
-        q = corner_global - offset
-
-        cx = int(round(float(q[0])))
-        cy = int(round(float(q[1])))
-
-        radius = max(
-            1,
-            int(p.corner_evidence_radius_px),
-        )
-
-        h, w = gray.shape
-
-        x0 = max(0, cx - radius)
-        x1 = min(w, cx + radius + 1)
-        y0 = max(0, cy - radius)
-        y1 = min(h, cy + radius + 1)
-
-        if x1 - x0 < 3 or y1 - y0 < 3:
-            return 0.0
-
-        gx = cv2.Sobel(
-            gray,
-            cv2.CV_32F,
-            1,
-            0,
-            ksize=3,
-        )[y0:y1, x0:x1]
-
-        gy = cv2.Sobel(
-            gray,
-            cv2.CV_32F,
-            0,
-            1,
-            ksize=3,
-        )[y0:y1, x0:x1]
-
-        mag = np.sqrt(gx * gx + gy * gy) + 1e-6
-
-        min_grad = float(p.corner_gradient_min)
-
-        cap = max(
-            float(p.grad_cap),
-            min_grad + 1e-6,
-        )
-
-        def directional_score(normal):
-            normal = self._normalize_direction(normal)
-
-            projection = np.abs(gx * normal[0] + gy * normal[1])
-
-            aligned = projection / mag
-
-            strength = np.clip(
-                (mag - min_grad) / (cap - min_grad),
-                0.0,
-                1.0,
-            )
-
-            score = aligned * strength
-
-            if score.size == 0:
-                return 0.0
-
-            return float(np.percentile(score, 85))
-
-        score_a = directional_score(normal_a)
-        score_b = directional_score(normal_b)
-
-        return float(np.sqrt(max(score_a, 0.0) * max(score_b, 0.0)))
 
     @staticmethod
-    def _intersect(l1, l2) -> Optional[np.ndarray]:
-        (p1, d1, _), (p2, d2, _) = l1, l2
+    def _rigid_project(
+        quad: np.ndarray, K: np.ndarray, c3d: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """Fit a pose to the 4 coplanar corners (IPPE) and reproject them."""
+        try:
+            obj = np.ascontiguousarray(c3d, dtype=np.float64)
+            img = np.ascontiguousarray(quad, dtype=np.float64).reshape(-1, 1, 2)
+            cam = np.ascontiguousarray(K, dtype=np.float64)
 
-        cr = d1[0] * d2[1] - d1[1] * d2[0]
+            ok, rvec, tvec = cv2.solvePnP(obj, img, cam, None, flags=cv2.SOLVEPNP_IPPE)
 
-        if abs(cr) < 0.2:
+            if not ok:
+                return None
+
+            proj, _ = cv2.projectPoints(obj, rvec, tvec, cam, None)
+
+            return proj.reshape(-1, 2)
+        except cv2.error:
             return None
 
-        a = ((p2[0] - p1[0]) * d2[1] - (p2[1] - p1[1]) * d2[0]) / cr
+    @staticmethod
+    def _line_from_points(
+        p0: np.ndarray,
+        p1: np.ndarray,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, int]]:
+        direction = p1 - p0
 
-        return p1 + a * d1
+        length = float(np.linalg.norm(direction))
+
+        if length < 1e-6:
+            return None
+
+        direction = direction / length
+        point = 0.5 * (p0 + p1)
+
+        return point.astype(np.float64), direction.astype(np.float64), 2
 
     @staticmethod
-    def _segment(line, pts: np.ndarray) -> np.ndarray:
-        p0, direction, _ = line
-
-        t = (pts.astype(np.float64) - p0[None, :]) @ direction
-
-        return np.stack(
-            [
-                p0 + t.min() * direction,
-                p0 + t.max() * direction,
-            ]
-        )
-
-    def _build_observed_corners(
-        self,
-        lines: List[Optional[Tuple[np.ndarray, np.ndarray, int]]],
-        segments: Dict[int, np.ndarray],
-        pred: np.ndarray,
-    ) -> Tuple[np.ndarray, List[str]]:
-        """Build four corners from line intersections and optional endpoints.
-
-        Edge i connects corner i to corner (i + 1) % 4.
-
-        When one adjacent edge is missing, the remaining edge's fitted
-        segment endpoint nearest to the predicted corner can be used.
-        """
-        p = self.p
-
-        obs = np.full(
-            (4, 2),
-            np.nan,
-            dtype=np.float64,
-        )
-
-        sources = ["missing"] * 4
-
-        n_lines = sum(line is not None for line in lines)
-
-        for corner_id in range(4):
-            prev_edge = (corner_id - 1) % 4
-            next_edge = corner_id
-
-            prev_line = lines[prev_edge]
-            next_line = lines[next_edge]
-
-            if prev_line is not None and next_line is not None:
-                corner = self._intersect(
-                    prev_line,
-                    next_line,
-                )
-
-                if corner is not None:
-                    obs[corner_id] = corner
-                    sources[corner_id] = "intersection"
-
-                continue
-
-            if not p.edge_endpoint_as_corner:
-                continue
-
-            # Endpoint fallback is intended for exactly three detected
-            # edges. It is not used to fabricate corners from fewer edges.
-            if n_lines != 3:
-                continue
-
-            available_edge = (
-                prev_edge
-                if prev_line is not None
-                else next_edge if next_line is not None else None
-            )
-
-            if available_edge is None:
-                continue
-
-            seg = segments.get(available_edge)
-
-            if seg is None or seg.shape != (2, 2):
-                continue
-
-            distances = np.linalg.norm(
-                seg - pred[corner_id][None, :],
-                axis=1,
-            )
-
-            endpoint_idx = int(np.argmin(distances))
-
-            endpoint = seg[endpoint_idx]
-
-            if (
-                not np.isfinite(endpoint).all()
-                or distances[endpoint_idx] > p.corner_tol_px
-            ):
-                continue
-
-            obs[corner_id] = endpoint
-            sources[corner_id] = "edge_endpoint"
-
-        return obs, sources
-
-    def _select_joint(
-        self,
-        cands,
-        pred,
-        geoms,
-        gray=None,
-        offset=None,
-    ):
-        p = self.p
-
-        K = [len(c) for c in cands]
-
-        unary = [[c["unary"] for c in cs] for cs in cands]
-
-        adj = []
-        corner_evidence = []
+    def _build_lines(
+        corners: np.ndarray,
+    ) -> List[Optional[Tuple[np.ndarray, np.ndarray, int]]]:
+        lines = []
 
         for i in range(4):
             j = (i + 1) % 4
+            lines.append(VertexDetector._line_from_points(corners[i], corners[j]))
 
-            tab = [[0.0] * K[j] for _ in range(K[i])]
+        return lines
 
-            ev_tab = [[0.0] * K[j] for _ in range(K[i])]
+    @staticmethod
+    def _build_segments(corners: np.ndarray) -> List[np.ndarray]:
+        segments = []
 
-            for a in range(K[i]):
-                for b in range(K[j]):
-                    ca = cands[i][a]
-                    cb = cands[j][b]
+        for i in range(4):
+            j = (i + 1) % 4
+            segments.append(np.stack([corners[i], corners[j]]).astype(np.float64))
 
-                    corner = self._intersect(
-                        ca["line"],
-                        cb["line"],
-                    )
-
-                    if corner is None:
-                        pen = p.corner_penalty
-                        ev = 0.0
-                    else:
-                        dist = float(np.linalg.norm(corner - pred[j]))
-
-                        pen = p.corner_penalty * min(
-                            1.0,
-                            (dist / max(p.corner_tol_px, 1e-6)) ** 2,
-                        )
-
-                        if (
-                            gray is not None
-                            and offset is not None
-                            and p.corner_evidence_enabled
-                        ):
-                            na = np.array(
-                                [
-                                    -ca["dir"][1],
-                                    ca["dir"][0],
-                                ],
-                                dtype=np.float64,
-                            )
-
-                            nb = np.array(
-                                [
-                                    -cb["dir"][1],
-                                    cb["dir"][0],
-                                ],
-                                dtype=np.float64,
-                            )
-
-                            ev = self._corner_gradient_evidence(
-                                gray,
-                                corner,
-                                na,
-                                nb,
-                                offset,
-                            )
-
-                            pen += p.corner_evidence_weight * (1.0 - ev)
-                        else:
-                            ev = 1.0
-
-                    tab[a][b] = pen
-                    ev_tab[a][b] = ev
-
-            adj.append(tab)
-            corner_evidence.append(ev_tab)
-
-        # Opposite edges: parallelism and plausible separation.
-        opp = []
-
-        for i in (0, 1):
-            k = i + 2
-
-            tab = [[0.0] * K[k] for _ in range(K[i])]
-
-            if K[i] and K[k]:
-                gi, gk = geoms[i], geoms[k]
-
-                axis = gi["normal"] - gk["normal"]
-                axis = axis / (np.linalg.norm(axis) + 1e-12)
-
-                d_pred = abs(float((gk["mid"] - gi["mid"]) @ axis))
-
-                ang_pred = self._wrap_half_pi(
-                    self._dir_angle_deg(gk["u"]) - self._dir_angle_deg(gi["u"])
-                )
-
-                if d_pred > 5.0:
-                    for a in range(K[i]):
-                        for b in range(K[k]):
-                            ca = cands[i][a]
-                            cb = cands[k][b]
-
-                            ratio = (d_pred + ca["s_mid"] + cb["s_mid"]) / d_pred
-
-                            pr = min(
-                                1.0,
-                                ((ratio - 1.0) / max(p.opposite_ratio_tol, 1e-6)) ** 2,
-                            )
-
-                            ang_c = self._wrap_half_pi(
-                                self._dir_angle_deg(cb["dir"])
-                                - self._dir_angle_deg(ca["dir"])
-                            )
-
-                            pa = min(
-                                1.0,
-                                (
-                                    self._wrap_half_pi(ang_c - ang_pred)
-                                    / max(
-                                        p.opposite_angle_tol_deg,
-                                        1e-6,
-                                    )
-                                )
-                                ** 2,
-                            )
-
-                            tab[a][b] = p.opposite_penalty * min(1.0, pr + pa)
-
-            opp.append(tab)
-
-        required_edges = (
-            max(3, min(4, int(p.min_valid_edges))) if p.edge_endpoint_as_corner else 4
-        )
-
-        best = None
-        n_combos = 0
-
-        for combo in product(*[range(k + 1) for k in K]):
-            chosen = [e for e in range(4) if combo[e] < K[e]]
-
-            if len(chosen) < required_edges:
-                continue
-
-            n_combos += 1
-
-            total = sum(unary[e][combo[e]] for e in chosen)
-
-            for i in range(4):
-                j = (i + 1) % 4
-                a, b = combo[i], combo[j]
-
-                if a < K[i] and b < K[j]:
-                    total -= adj[i][a][b]
-
-            for i in (0, 1):
-                a = combo[i]
-                b = combo[i + 2]
-
-                if a < K[i] and b < K[i + 2]:
-                    total -= opp[i][a][b]
-
-            if best is None or total > best[0]:
-                best = (
-                    float(total),
-                    combo,
-                )
-
-        if best is None:
-            return None
-
-        return (
-            best[1],
-            best[0],
-            n_combos,
-            corner_evidence,
-        )
+        return segments
 
     def detect(
         self,
@@ -1676,85 +552,43 @@ class VertexDetector:
         label: int,
         R: np.ndarray,
         t_mm: np.ndarray,
-    ) -> "VertexDetectionResult":
+    ) -> VertexDetectionResult:
         p = self.p
 
-        R0 = np.asarray(
-            R,
-            dtype=np.float64,
-        )
+        R0 = np.asarray(R, dtype=np.float64)
+        t0 = np.asarray(t_mm, dtype=np.float64).reshape(3)
+        K = np.asarray(camera, dtype=np.float64)
 
-        t0 = np.asarray(
-            t_mm,
-            dtype=np.float64,
-        )
+        info: Dict[str, Any] = {
+            "ok": False,
+            "reason": None,
+            "method": "keypoint_refinement_net",
+            "model_checkpoint": str(p.checkpoint),
+            "device": str(self.device),
+            "arch": self.arch,
+            "cond_dim": int(self.cond_dim),
+            "num_iters": int(self.num_iters),
+        }
 
-        K = np.asarray(
-            camera,
-            dtype=np.float64,
-        )
+        pred = None
+        pred_b = None
+        c3d = None
 
-        vis: Dict[str, Any] = {}
+        def fail(reason: str, **kwargs) -> VertexDetectionResult:
+            info.update(kwargs)
+            info["ok"] = False
+            info["reason"] = reason
 
-        shifts: List[Optional[float]] = [None] * 4
-        support: List[Optional[float]] = [None] * 4
-        walls: List[Optional[float]] = [None] * 4
-
-        edge_diagnostics: List[Dict[str, Any]] = [
-            {
-                "edge_id": i,
-                "gradient_candidate_count": 0,
-                "n_candidates": 0,
-                "line_inlier_count": 0,
-                "line_support_ratio": 0.0,
-                "line_coverage_ratio": 0.0,
-                "line_fit_error_px": None,
-                "line_angle_error_deg": None,
-                "line_accepted": False,
-                "reason": None,
-            }
-            for i in range(4)
-        ]
-
-        extra_info: Dict[str, Any] = {}
-
-        def mk_info(
-            ok: bool,
-            reason: str,
-            **kw,
-        ) -> Dict[str, Any]:
-            info = {
-                "ok": ok,
-                "reason": reason,
-                "edge_shift_px": list(shifts),
-                "edge_support": list(support),
-                "edge_wall_px": list(walls),
-                "edge_diagnostics": edge_diagnostics,
-            }
-
-            info.update(extra_info)
-            info.update(kw)
-
-            return info
-
-        lines: List[Optional[Tuple[np.ndarray, np.ndarray, int]]] = [None] * 4
-        valid_idx: List[int] = []
-        edge_pts: List[np.ndarray] = []
-        edge_segs: List[np.ndarray] = []
-        obs: Optional[np.ndarray] = None
-        c3d: Optional[np.ndarray] = None
-
-        def fail(reason: str, **kw) -> "VertexDetectionResult":
             return VertexDetectionResult(
                 ok=False,
-                info=mk_info(False, reason, **kw),
-                corners_pred=vis.get("corners_pred"),
-                corners_bottom=vis.get("corners_bottom"),
-                corners_obs=vis.get("corners_obs"),
-                lines=lines,
-                valid_idx=valid_idx,
-                edge_pts=edge_pts,
-                edge_segs=edge_segs,
+                info=info,
+                corners_pred=pred,
+                corners_bottom=pred_b,
+                corners_obs=None,
+                lines=None,
+                valid_idx=[],
+                edge_pts=[],
+                edge_segs=[],
                 c3d=c3d,
                 K=K,
                 R0=R0,
@@ -1766,22 +600,14 @@ class VertexDetector:
         if box is None:
             return fail("no_size_for_label")
 
-        sign, c3d, cos = self._pick_visible_face(
-            box,
-            R0,
-            t0,
-        )
+        sign, c3d, face_cos = self._pick_visible_face(box, R0, t0)
 
-        if cos < p.min_face_cos:
-            return fail(
-                "face_grazing",
-                cos=float(cos),
-            )
+        info["face_cos"] = float(face_cos)
 
-        c3d_b = self._face_corners_obj(
-            box,
-            -sign,
-        )
+        if face_cos < p.min_face_cos:
+            return fail("face_grazing")
+
+        c3d_b = self._face_corners_obj(box, -sign)
 
         cam_pts = c3d @ R0.T + t0
         cam_b = c3d_b @ R0.T + t0
@@ -1789,357 +615,199 @@ class VertexDetector:
         if (cam_pts[:, 2] <= 0).any() or (cam_b[:, 2] <= 0).any():
             return fail("behind_camera")
 
-        pred = self._project(
-            cam_pts,
-            K,
-        )
+        pred = self._project(cam_pts, K)
+        pred_b = self._project(cam_b, K)
 
-        pred_b = self._project(
-            cam_b,
-            K,
-        )
+        info["corners_pred"] = pred.tolist()
 
-        vis["corners_pred"] = pred
-        vis["corners_bottom"] = pred_b
-
-        # ROI around predicted top and bottom faces.
         h, w = bgr.shape[:2]
+
+        if not np.isfinite(pred).all() or not np.isfinite(pred_b).all():
+            return fail("invalid_projected_corners")
 
         allp = np.vstack([pred, pred_b])
 
-        pad = int(p.band_px + 6)
+        pad = 6
 
-        x0 = int(
-            max(
-                0,
-                np.floor(allp[:, 0].min()) - pad,
-            )
-        )
-
-        y0 = int(
-            max(
-                0,
-                np.floor(allp[:, 1].min()) - pad,
-            )
-        )
-
-        x1 = int(
-            min(
-                w,
-                np.ceil(allp[:, 0].max()) + pad,
-            )
-        )
-
-        y1 = int(
-            min(
-                h,
-                np.ceil(allp[:, 1].max()) + pad,
-            )
-        )
+        x0 = max(0, int(np.floor(allp[:, 0].min())) - pad)
+        y0 = max(0, int(np.floor(allp[:, 1].min())) - pad)
+        x1 = min(w, int(np.ceil(allp[:, 0].max())) + pad)
+        y1 = min(h, int(np.ceil(allp[:, 1].max())) + pad)
 
         if x1 <= x0 or y1 <= y0 or (x1 - x0) < p.min_roi_px or (y1 - y0) < p.min_roi_px:
-            return fail("roi_too_small")
+            return fail("roi_too_small", roi=[x0, y0, x1, y1])
 
-        roi = bgr[y0:y1, x0:x1]
-
-        gray = cv2.cvtColor(
-            roi,
-            cv2.COLOR_BGR2GRAY,
+        # All four projected corners are used as visible initial points.
+        # Visibility is kept at 1 to match training (online offset, vis=1).
+        offset_keypoints = np.concatenate(
+            [pred.astype(np.float32), np.ones((4, 1), dtype=np.float32)],
+            axis=1,
         )
 
-        lab = cv2.cvtColor(
-            roi,
-            cv2.COLOR_BGR2LAB,
-        ).astype(np.float32)
+        offset_keypoints[:, 0] /= float(w)
+        offset_keypoints[:, 1] /= float(h)
 
-        k = max(
-            1,
-            int(p.blur_ksize) | 1,
+        (
+            model_input,
+            initial_coords,
+            roi_x0,
+            roi_y0,
+            roi_side,
+        ) = self._prepare_input(bgr, offset_keypoints)
+
+        model_input = model_input.unsqueeze(0).to(self.device)
+
+        initial_keypoints = (
+            torch.from_numpy(initial_coords).float().unsqueeze(0).to(self.device)
         )
 
-        if k > 1:
-            gray = cv2.GaussianBlur(
-                gray,
-                (k, k),
-                0,
+        cond = None
+
+        if self.cond_dim > 0:
+            cond = (
+                torch.from_numpy(build_condition(box["size_mm"], self.size_scale_mm))
+                .float()
+                .unsqueeze(0)
+                .to(self.device)
             )
 
-            lab = cv2.GaussianBlur(
-                lab,
-                (k, k),
-                0,
-            )
-
-        gray = gray.astype(np.float32)
-
-        offset = np.array(
-            [x0, y0],
-            dtype=np.float64,
-        )
-
-        # Face interior colour model.
-        interior = None
-
-        if p.boundary_enabled:
-            interior = self._interior_model(
-                lab,
-                pred - offset,
-            )
-
-            if interior is not None:
-                extra_info["boundary_model"] = {
-                    "lab_median": [float(v) for v in interior[0]],
-                    "sigma": [float(v) for v in interior[1]],
-                }
-            else:
-                extra_info["boundary_model"] = None
-
-        # Candidate lines for every edge.
-        centroid = pred.mean(axis=0)
-
-        geoms: List[Dict[str, Any]] = []
-        edge_cands: List[List[Dict[str, Any]]] = []
-
-        for i in range(4):
-            j = (i + 1) % 4
-
-            u = pred[j] - pred[i]
-
-            Lu = float(np.linalg.norm(u))
-
-            u = u / Lu if Lu > 1e-9 else np.array([1.0, 0.0])
-
-            normal = np.array(
-                [-u[1], u[0]],
-                dtype=np.float64,
-            )
-
-            mid = 0.5 * (pred[i] + pred[j])
-
-            if normal @ (mid - centroid) < 0:
-                normal = -normal
-
-            mid_b = 0.5 * (pred_b[i] + pred_b[j])
-
-            wall = float(normal @ (mid_b - mid))
-
-            walls[i] = wall
-
-            geoms.append(
-                {
-                    "u": u,
-                    "normal": normal,
-                    "mid": mid,
-                }
-            )
-
-            if Lu < p.min_edge_len_px:
-                edge_diagnostics[i]["reason"] = "edge_too_short"
-
-                edge_cands.append([])
-                continue
-
-            cands, sinfo = self._edge_candidates(
-                gray,
-                lab,
-                interior,
-                pred[i] - offset,
-                pred[j] - offset,
-                normal,
-                wall,
-                offset,
-                u,
-                mid,
-            )
-
-            edge_diagnostics[i].update(sinfo)
-            edge_cands.append(cands)
-
-        # Joint candidate selection.
-        accepted: List[List[Dict[str, Any]]] = []
-
-        for i in range(4):
-            cs = [
-                c
-                for c in edge_cands[i]
-                if (c["accepted"] and c["unary"] >= p.min_candidate_unary)
-            ]
-
-            cs = cs[: max(1, int(p.joint_candidates))]
-
-            for rank, c in enumerate(cs):
-                c["rank"] = rank
-
-            accepted.append(cs)
-
-        joint = self._select_joint(
-            accepted,
-            pred,
-            geoms,
-            gray,
-            offset,
-        )
-
-        chosen: Dict[int, Dict[str, Any]] = {}
-
-        if joint is not None:
-            (
-                combo,
-                joint_score,
-                n_combos,
-                corner_evidence,
-            ) = joint
-
-            extra_info["joint_score"] = float(joint_score)
-
-            extra_info["joint_combos"] = int(n_combos)
-
-            selected_corner_scores = []
-
-            for i in range(4):
-                if combo[i] < len(accepted[i]):
-                    chosen[i] = accepted[i][combo[i]]
-
-            for i in range(4):
-                j = (i + 1) % 4
-
-                a = combo[i]
-                b = combo[j]
-
-                if a < len(accepted[i]) and b < len(accepted[j]):
-                    ev = float(corner_evidence[i][a][b])
-
-                    selected_corner_scores.append(ev)
-
-                    edge_diagnostics[i]["corner_evidence"] = ev
-
-            extra_info["corner_evidence"] = selected_corner_scores
-
-            extra_info["corner_evidence_mean"] = (
-                float(np.mean(selected_corner_scores))
-                if selected_corner_scores
-                else None
-            )
-
-        # Per-edge diagnostics.
-        for i in range(4):
-            diag = edge_diagnostics[i]
-            cands = edge_cands[i]
-
-            top = None
-
-            if i in chosen:
-                top = chosen[i]
-            elif accepted[i]:
-                top = accepted[i][0]
-            elif cands:
-                top = cands[0]
-
-            if top is not None:
-                self._fill_diag(
-                    diag,
-                    top,
+        with torch.inference_mode():
+            if self.is_cascade:
+                output = self.model(
+                    model_input, initial_keypoints, cond, num_iters=self.num_iters
                 )
+            else:
+                output = self.model(model_input, initial_keypoints, cond)
 
-            if i in chosen:
-                diag["line_accepted"] = True
-                diag["reason"] = "ok"
-                diag["selected_rank"] = int(chosen[i]["rank"])
-            elif accepted[i]:
-                diag["line_accepted"] = False
-                diag["reason"] = "not_selected_joint"
-            elif cands:
-                diag["line_accepted"] = False
-                diag["reason"] = cands[0]["reject"] or "unary_too_low"
-            elif diag.get("reason") is None:
-                diag["reason"] = "line_detection_failed"
+        if (
+            not isinstance(output, dict)
+            or "keypoints" not in output
+            or "delta" not in output
+        ):
+            return fail("invalid_model_output")
 
-        # Keep segments indexed by their corresponding edge ID.
-        segments: Dict[int, np.ndarray] = {}
+        pred_roi = output["keypoints"][0].float().detach().cpu().numpy()
+        predicted_delta_roi = output["delta"][0].float().detach().cpu().numpy()
 
-        for i in sorted(chosen):
-            c = chosen[i]
+        if pred_roi.shape != (4, 2) or not np.isfinite(pred_roi).all():
+            return fail("invalid_predicted_keypoints")
 
-            line = (
-                c["point"],
-                c["dir"],
-                int(len(c["pts"])),
+        # Normalized ROI coordinates -> image pixels.
+        pred_pixels = np.zeros((4, 2), dtype=np.float64)
+        pred_pixels[:, 0] = roi_x0 + pred_roi[:, 0] * roi_side
+        pred_pixels[:, 1] = roi_y0 + pred_roi[:, 1] * roi_side
+
+        stages = output.get("stages")
+
+        if stages:
+            s1 = stages[0]["keypoints"][0].float().detach().cpu().numpy()
+            stage1_pixels = np.zeros((4, 2), dtype=np.float64)
+            stage1_pixels[:, 0] = roi_x0 + s1[:, 0] * roi_side
+            stage1_pixels[:, 1] = roi_y0 + s1[:, 1] * roi_side
+            info["corners_stage1"] = stage1_pixels.tolist()
+
+        raw_shifts = np.linalg.norm(pred_pixels - pred, axis=1)
+
+        info["raw_corner_shift_mean_px"] = float(raw_shifts.mean())
+
+        # Optional guard: tiny corrections are within the network's noise
+        # floor, so keep the original projected corners instead.
+        info["correction_skipped"] = False
+
+        if float(p.min_correction_px) > 0.0 and float(raw_shifts.mean()) < float(
+            p.min_correction_px
+        ):
+            pred_pixels = pred.copy()
+            info["correction_skipped"] = True
+
+        info["corners_ml"] = pred_pixels.tolist()
+
+        # Optional rigid-body projection (geometry only, no image evidence).
+        info["rigid_applied"] = False
+
+        if p.rigid_project:
+            q = self._rigid_project(pred_pixels, K, c3d)
+
+            if q is not None and np.isfinite(q).all():
+                residual = float(np.linalg.norm(q - pred_pixels, axis=1).mean())
+                info["rigid_residual_px"] = residual
+
+                if residual <= float(p.rigid_max_px):
+                    pred_pixels = q
+                    info["rigid_applied"] = True
+
+        shifts = np.linalg.norm(pred_pixels - pred, axis=1)
+
+        info["roi"] = {
+            "x0": float(roi_x0),
+            "y0": float(roi_y0),
+            "side": float(roi_side),
+            "image_size": int(p.image_size),
+        }
+
+        info["initial_keypoints_roi"] = initial_coords.tolist()
+        info["predicted_keypoints_roi"] = pred_roi.tolist()
+        info["predicted_delta_roi"] = predicted_delta_roi.tolist()
+        info["corner_shift_px"] = shifts.tolist()
+        info["corner_shift_mean_px"] = float(shifts.mean())
+        info["corner_shift_max_px"] = float(shifts.max())
+        info["corners_obs"] = pred_pixels.tolist()
+
+        if not np.isfinite(pred_pixels).all():
+            return fail("invalid_corners_obs")
+
+        if float(shifts.max()) > float(p.max_corner_shift_px):
+            return fail(
+                "corner_shift_too_large",
+                max_corner_shift_px=float(p.max_corner_shift_px),
             )
 
-            lines[i] = line
-
-            shifts[i] = float(c["s_mid"])
-            support[i] = float(c["support"])
-
-            seg = self._segment(
-                line,
-                c["pts"],
-            )
-
-            segments[i] = seg
-
-            edge_pts.append(c["pts"])
-            edge_segs.append(seg)
-
-        valid_idx = sorted(chosen)
-
-        required_edges = (
-            max(3, min(4, int(p.min_valid_edges))) if p.edge_endpoint_as_corner else 4
+        # Check the refined quadrilateral.
+        edge_lengths = np.linalg.norm(
+            np.roll(pred_pixels, -1, axis=0) - pred_pixels, axis=1
         )
 
-        extra_info["edge_endpoint_as_corner"] = bool(p.edge_endpoint_as_corner)
+        info["edge_lengths_px"] = edge_lengths.tolist()
 
-        extra_info["required_edges"] = int(required_edges)
+        if (edge_lengths < float(p.min_edge_len_px)).any():
+            return fail("edge_too_short")
 
-        if len(valid_idx) < required_edges:
-            vis["edge_pts"] = edge_pts
-            vis["edge_segs"] = edge_segs
+        contour = pred_pixels.astype(np.float32).reshape(-1, 1, 2)
 
-            with_candidates = [i for i in range(4) if accepted[i]]
+        if not cv2.isContourConvex(contour.astype(np.int32)):
+            return fail("non_convex_corners")
 
-            return fail(
-                "too_few_edges",
-                n_edges=len(valid_idx),
-                valid_edges=valid_idx,
-                available_edges=with_candidates,
-                required_edges=required_edges,
-                joint_selected=False,
-            )
+        area_pred = abs(cv2.contourArea(pred.astype(np.float32).reshape(-1, 1, 2)))
+        area_obs = abs(cv2.contourArea(contour))
 
-        vis["edge_pts"] = edge_pts
-        vis["edge_segs"] = edge_segs
+        area_ratio = float(area_obs / max(area_pred, 1e-6))
 
-        # Construct four corners.
-        obs, corner_sources = self._build_observed_corners(
-            lines,
-            segments,
-            pred,
-        )
+        info["area_ratio"] = area_ratio
 
-        vis["corners_obs"] = obs
+        if not (p.area_ratio_min <= area_ratio <= p.area_ratio_max):
+            return fail("area_ratio_invalid")
 
-        extra_info["corner_sources"] = corner_sources
-        extra_info["corner_valid"] = [bool(np.isfinite(q).all()) for q in obs]
+        # Build compatibility lines from the four refined corners.
+        lines = self._build_lines(pred_pixels)
+        segments = self._build_segments(pred_pixels)
 
-        # Four valid corners are mandatory before pose correction.
-        if obs.shape != (4, 2) or not np.isfinite(obs).all():
-            missing = [i for i in range(4) if not np.isfinite(obs[i]).all()]
+        valid_idx = [i for i, line in enumerate(lines) if line is not None]
 
-            return fail(
-                "incomplete_corners",
-                n_edges=len(valid_idx),
-                valid_edges=valid_idx,
-                missing_corners=missing,
-                corner_sources=corner_sources,
-                quad_corners=obs.tolist(),
-            )
+        edge_pts = [segments[i].copy() for i in valid_idx]
+        edge_segs = [segments[i].copy() for i in valid_idx]
+
+        info["valid_edges"] = valid_idx
+        info["n_edges"] = len(valid_idx)
+
+        info["reason"] = "vertices_detected"
+        info["ok"] = True
 
         return VertexDetectionResult(
             ok=True,
-            info=mk_info(True, "vertices_detected", corner_sources=corner_sources),
+            info=info,
             corners_pred=pred,
             corners_bottom=pred_b,
-            corners_obs=obs,
+            corners_obs=pred_pixels,
             lines=lines,
             valid_idx=valid_idx,
             edge_pts=edge_pts,
@@ -2151,167 +819,77 @@ class VertexDetector:
         )
 
     @staticmethod
-    def _fill_diag(
-        diag: Dict[str, Any],
-        c: Dict[str, Any],
-    ) -> None:
-        diag["line_inlier_count"] = int(len(c["pts"]))
-
-        diag["line_support_ratio"] = float(c["support"])
-
-        diag["line_coverage_ratio"] = float(c["coverage"])
-
-        diag["line_fit_error_px"] = float(c["fit_err"])
-
-        diag["line_angle_error_deg"] = float(c["angle_err"])
-
-        diag["line_polarity_consistency"] = float(c["pol_cons"])
-
-        diag["line_gradient_score"] = float(c["grad_score"])
-
-        diag["line_ransac_score"] = float(c["base"] * c["prior"])
-
-        diag["line_offset_px"] = float(c["s_mid"])
-
-        diag["line_offset_prior"] = float(c["prior"])
-
-        diag["line_unary_score"] = float(c["unary"])
-
-        diag["line_accepted"] = bool(c["accepted"])
-
-        b = c["boundary"]
-
-        if b is not None:
-            diag["line_boundary_score"] = float(b["score"])
-
-            diag["line_inside_similarity"] = float(b["inside"])
-
-            diag["line_outside_similarity"] = float(b["outside"])
-
-            diag["line_boundary_separation"] = float(b["separation"])
-
-            diag["line_boundary_contrast"] = float(b["contrast"])
-
-            diag["line_boundary_contrast_score"] = float(b["contrast_score"])
-
-            diag["line_boundary_continuity"] = float(b["continuity"])
-        else:
-            diag["line_boundary_score"] = None
-            diag["line_boundary_contrast"] = None
-            diag["line_boundary_continuity"] = None
-
-    @staticmethod
-    def draw(
-        debug: np.ndarray,
-        res: VertexDetectionResult,
-    ) -> None:
-        """Draw RACE6D predicted corners and RGB-observed corners."""
+    def draw(debug: np.ndarray, res: VertexDetectionResult) -> None:
+        """Draw RACE projection (orange I), raw network output (blue M, only if
+        the rigid projection moved it) and the final corners (yellow P)."""
 
         def ip(q):
-            return (
-                int(round(float(q[0]))),
-                int(round(float(q[1]))),
-            )
+            return int(round(float(q[0]))), int(round(float(q[1])))
 
-        # 1. Draw detected edge segments.
-        for seg in res.edge_segs or []:
-            if not np.isfinite(seg).all():
-                continue
-
-            cv2.line(
-                debug,
-                ip(seg[0]),
-                ip(seg[1]),
-                (255, 0, 255),
-                1,
-                cv2.LINE_AA,
-            )
-
-        # 2. Draw original RACE6D projected corners (orange, points only).
         if res.corners_pred is not None:
-            corners = np.asarray(
-                res.corners_pred,
-                dtype=np.float64,
-            )
+            for i, q in enumerate(res.corners_pred):
+                if not np.isfinite(q).all():
+                    continue
 
-            if corners.shape == (4, 2):
-                for i, q in enumerate(corners):
-                    if not np.isfinite(q).all():
-                        continue
+                cv2.circle(debug, ip(q), 5, (0, 165, 255), 2, cv2.LINE_AA)
+                cv2.putText(
+                    debug,
+                    f"I{i}",
+                    (int(q[0]) + 6, int(q[1]) - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 165, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
 
-                    cv2.circle(
-                        debug,
-                        ip(q),
-                        5,
-                        (0, 165, 255),
-                        -1,
-                        cv2.LINE_AA,
-                    )
+        info = res.info or {}
 
-                    cv2.putText(
-                        debug,
-                        f"R{i}",
-                        (int(q[0]) + 5, int(q[1]) - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        (0, 165, 255),
-                        1,
-                        cv2.LINE_AA,
-                    )
+        if info.get("rigid_applied") and info.get("corners_ml") is not None:
+            for i, q in enumerate(np.asarray(info["corners_ml"], dtype=np.float64)):
+                if not np.isfinite(q).all():
+                    continue
 
-        # 3. Draw observed corners from RGB vertex detection.
+                cv2.circle(debug, ip(q), 4, (255, 128, 0), 1, cv2.LINE_AA)
+                cv2.putText(
+                    debug,
+                    f"M{i}",
+                    (int(q[0]) + 6, int(q[1]) + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 128, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+
         if res.corners_obs is not None:
-            corners = np.asarray(
-                res.corners_obs,
-                dtype=np.float64,
-            )
+            corners = res.corners_obs
 
-            if corners.shape == (4, 2):
-                valid = np.isfinite(corners).all(axis=1)
+            for i in range(4):
+                j = (i + 1) % 4
 
-                for i, q in enumerate(corners):
-                    if not valid[i]:
-                        continue
+                if (
+                    not np.isfinite(corners[i]).all()
+                    or not np.isfinite(corners[j]).all()
+                ):
+                    continue
 
-                    cv2.circle(
-                        debug,
-                        ip(q),
-                        5,
-                        (0, 255, 255),
-                        -1,
-                        cv2.LINE_AA,
-                    )
+                cv2.line(
+                    debug, ip(corners[i]), ip(corners[j]), (255, 0, 255), 2, cv2.LINE_AA
+                )
 
-                    cv2.putText(
-                        debug,
-                        f"V{i}",
-                        (int(q[0]) + 5, int(q[1]) + 12),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        (0, 255, 255),
-                        1,
-                        cv2.LINE_AA,
-                    )
+            for i, q in enumerate(corners):
+                if not np.isfinite(q).all():
+                    continue
 
-        # 4. Draw legend.
-        cv2.putText(
-            debug,
-            "RACE6D: Orange",
-            (15, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 165, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-        cv2.putText(
-            debug,
-            "RGB vertices: Yellow",
-            (15, 48),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (0, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+                cv2.circle(debug, ip(q), 5, (0, 255, 255), -1, cv2.LINE_AA)
+                cv2.putText(
+                    debug,
+                    f"P{i}",
+                    (int(q[0]) + 6, int(q[1]) - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )

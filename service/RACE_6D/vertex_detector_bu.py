@@ -1,22 +1,14 @@
 """RGB keypoint refinement for RACE-6D pose refinement.
 
 Pipeline:
-  1. Project the RACE-6D pose onto the RGB image (candidate "race").
-  2. Build a pose-guided ROI from the four projected face corners.
-  3. Predict refined corners with KeypointRefinementNet (candidate "ml"),
-     conditioned on the box size if the checkpoint was trained with it.
-  4. Classical RGB snapping: for every candidate quadrilateral, fit the real
-     image edge along each side and move each corner to the intersection of
-     its two adjacent edge lines (falls back to the candidate corner when
-     unreliable).
-  5. Score each snapped quadrilateral by its edge evidence in the image and
-     keep the best one (ML is preferred unless RACE is clearly better).
-  6. Optionally project the result onto a rigid pose (IPPE).
-  7. Return VertexDetectionResult for pose_refine.py.
-
-Model / preprocessing settings (cond_dim, size_scale_mm, max_delta,
-image_size, roi_padding, min_roi_size) are read from the checkpoint's saved
-config so inference always matches training.
+  1. Project the RACE-6D pose onto the RGB image.
+  2. Build the pose-guided ROI for KeypointRefinementNet.
+  3. Predict four refined keypoints using KeypointRefinementNet.
+  4. Search independently within a local circular neighborhood around
+     each ML keypoint using Harris response and RGB gradients.
+  5. Validate the four RGB-refined corners as a quadrilateral.
+  6. Use RGB corners only when all four points pass validation;
+     otherwise fall back to the ML predictions.
 """
 
 from __future__ import annotations
@@ -36,8 +28,65 @@ from models.keypoint_refinement import KeypointRefinementNet
 logger = logging.getLogger(__name__)
 
 
-def build_condition(size_mm, scale_mm: float) -> np.ndarray:
-    """Object-size condition vector. Must be identical to train.py."""
+# ============================================================
+# Global parameters
+# ============================================================
+
+# Model
+DEFAULT_DEVICE = "cuda"
+CHECKPOINT_DEFAULT = "runs/keypoint_refinement/best.pth"
+
+# ML refinement
+MAX_DELTA = 0.1
+IMAGE_SIZE = 224
+ROI_PADDING = 0.25
+MIN_ROI_SIZE = 64
+MIN_CORRECTION_PX = 0.0
+
+# Geometry validation
+MAX_CORNER_SHIFT_PX = 40.0
+MIN_FACE_COS = 0.2
+MIN_EDGE_LEN_PX = 5.0
+MIN_ROI_PX = 30.0
+
+CORNER_TOL_PX = 40.0
+AREA_RATIO_MIN = 0.5
+AREA_RATIO_MAX = 2.0
+
+MAX_REPROJ_PX = 5.0
+MAX_TRANS_MM = 50.0
+MAX_ROT_DEG = 15.0
+
+SIGMA_ROT_DEG = 5.0
+SIGMA_TRANS_MM = 10.0
+
+# RGB local corner refinement
+RGB_REFINE_ENABLED = True
+RGB_SEARCH_RADIUS = 6.0
+
+RGB_HARRIS_BLOCK_SIZE = 2
+RGB_HARRIS_KSIZE = 3
+RGB_HARRIS_K = 0.04
+
+RGB_MIN_HARRIS_RESPONSE = 1e-7
+
+RGB_HARRIS_WEIGHT = 0.75
+RGB_GRADIENT_WEIGHT = 0.15
+RGB_DISTANCE_WEIGHT = 0.10
+
+RGB_AREA_RATIO_MIN = 0.75
+RGB_AREA_RATIO_MAX = 1.25
+
+
+# ============================================================
+# Utility
+# ============================================================
+
+
+def build_condition(
+    size_mm,
+    scale_mm: float,
+) -> np.ndarray:
     sx, sy, sz = [max(float(v), 1e-6) for v in size_mm]
 
     return np.array(
@@ -53,79 +102,102 @@ def build_condition(size_mm, scale_mm: float) -> np.ndarray:
     )
 
 
+# ============================================================
+# Parameters
+# ============================================================
+
+
 @dataclass
 class RefineParams:
-    # Model (overridden by the checkpoint's saved config when available)
-    checkpoint: str = "runs/keypoint_refinement/best.pth"
-    device: str = "cuda"
-    max_delta: float = 0.3
+    checkpoint: str = CHECKPOINT_DEFAULT
+    device: str = DEFAULT_DEVICE
 
-    # ROI (overridden by the checkpoint's saved config when available)
-    image_size: int = 256
-    roi_padding: float = 1.0
-    min_roi_size: int = 32
+    max_delta: float = MAX_DELTA
 
-    # Skip the network correction when it is smaller than this (px).
-    # 0 disables the guard. Small offsets (< ~10px) tend to be made worse.
-    min_correction_px: float = 0.0
+    image_size: int = IMAGE_SIZE
+    roi_padding: float = ROI_PADDING
+    min_roi_size: int = MIN_ROI_SIZE
 
-    # Classical RGB corner snapping
-    snap_enabled: bool = True
-    snap_search_px: float = 14.0  # search range across each edge
-    snap_samples: int = 24  # sample points per edge
-    snap_edge_margin: float = 0.12  # skip the ends of each edge
-    snap_min_grad: float = 4.0  # min gradient (gray levels / px)
-    snap_inlier_tol_px: float = 1.5
-    snap_min_inlier: float = 0.5  # min inlier ratio of the line fit
-    snap_min_angle_deg: float = 25.0  # min angle between the two lines
-    snap_max_shift_px: float = 20.0  # max move from the candidate corner
-    snap_allow_partial: bool = True  # one valid line only: project onto it
+    min_correction_px: float = MIN_CORRECTION_PX
 
-    # Multi-candidate selection
-    snap_multi: bool = True  # also snap from the RACE-6D projected corners
-    snap_select_margin: float = 0.05  # race must beat ml by this ratio to be chosen
-    snap_rigid: bool = False  # project the result onto a rigid pose (IPPE)
-    snap_rigid_max_px: float = 4.0  # skip rigid projection if residual is larger
+    max_corner_shift_px: float = MAX_CORNER_SHIFT_PX
+    min_face_cos: float = MIN_FACE_COS
+    min_edge_len_px: float = MIN_EDGE_LEN_PX
+    min_roi_px: float = MIN_ROI_PX
 
-    # Sanity
-    max_corner_shift_px: float = 40.0
-    min_face_cos: float = 0.2
-    min_edge_len_px: float = 5.0
-    min_roi_px: float = 30.0
+    corner_tol_px: float = CORNER_TOL_PX
+    area_ratio_min: float = AREA_RATIO_MIN
+    area_ratio_max: float = AREA_RATIO_MAX
 
-    # Pose refinement validation
-    corner_tol_px: float = 40.0
-    area_ratio_min: float = 0.5
-    area_ratio_max: float = 2.0
-    max_reproj_px: float = 5.0
-    max_trans_mm: float = 50.0
-    max_rot_deg: float = 15.0
+    max_reproj_px: float = MAX_REPROJ_PX
+    max_trans_mm: float = MAX_TRANS_MM
+    max_rot_deg: float = MAX_ROT_DEG
 
-    # Pose prior
-    sigma_rot_deg: float = 5.0
-    sigma_trans_mm: float = 10.0
+    sigma_rot_deg: float = SIGMA_ROT_DEG
+    sigma_trans_mm: float = SIGMA_TRANS_MM
+
+    rgb_refine_enabled: bool = RGB_REFINE_ENABLED
+    rgb_search_radius: float = RGB_SEARCH_RADIUS
+
+    rgb_harris_block_size: int = RGB_HARRIS_BLOCK_SIZE
+    rgb_harris_ksize: int = RGB_HARRIS_KSIZE
+    rgb_harris_k: float = RGB_HARRIS_K
+
+    rgb_min_harris_response: float = RGB_MIN_HARRIS_RESPONSE
+
+    rgb_harris_weight: float = RGB_HARRIS_WEIGHT
+    rgb_gradient_weight: float = RGB_GRADIENT_WEIGHT
+    rgb_distance_weight: float = RGB_DISTANCE_WEIGHT
+
+    rgb_area_ratio_min: float = RGB_AREA_RATIO_MIN
+    rgb_area_ratio_max: float = RGB_AREA_RATIO_MAX
+
+
+# ============================================================
+# Result
+# ============================================================
 
 
 @dataclass
 class VertexDetectionResult:
     ok: bool
     info: Dict[str, Any]
+
     corners_pred: Optional[np.ndarray] = None
     corners_bottom: Optional[np.ndarray] = None
     corners_obs: Optional[np.ndarray] = None
+
     lines: Optional[List[Optional[Tuple[np.ndarray, np.ndarray, int]]]] = None
     valid_idx: Optional[List[int]] = None
+
     edge_pts: Optional[List[np.ndarray]] = None
     edge_segs: Optional[List[np.ndarray]] = None
+
     c3d: Optional[np.ndarray] = None
     K: Optional[np.ndarray] = None
     R0: Optional[np.ndarray] = None
     t0: Optional[np.ndarray] = None
 
+    corners_ml: Optional[np.ndarray] = None
+    corners_rgb: Optional[np.ndarray] = None
+
+
+# ============================================================
+# Vertex Detector
+# ============================================================
+
 
 class VertexDetector:
-    IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
-    IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+
+    IMAGENET_MEAN = np.array(
+        [0.485, 0.456, 0.406],
+        dtype=np.float32,
+    ).reshape(1, 1, 3)
+
+    IMAGENET_STD = np.array(
+        [0.229, 0.224, 0.225],
+        dtype=np.float32,
+    ).reshape(1, 1, 3)
 
     def __init__(
         self,
@@ -135,7 +207,6 @@ class VertexDetector:
         self.boxes = boxes
         self.p = params
 
-        # Filled in by _load_model from the checkpoint
         self.cond_dim: int = 0
         self.size_scale_mm: float = 300.0
 
@@ -147,25 +218,42 @@ class VertexDetector:
 
         self.model = self._load_model()
 
+    # ========================================================
+    # Configuration
+    # ========================================================
+
     @classmethod
     def from_config(
         cls,
         cfg: Optional[dict],
     ) -> Optional["VertexDetector"]:
+
         if not cfg or not cfg.get("ENABLED", False):
             return None
 
         boxes: Dict[int, Dict[str, np.ndarray]] = {}
 
         for label, item in (cfg.get("LABELS") or {}).items():
+
             size = item["SIZE_M"]
 
             size_mm = (
-                np.array([size["X"], size["Y"], size["Z"]], dtype=np.float64) * 1000.0
+                np.array(
+                    [
+                        size["X"],
+                        size["Y"],
+                        size["Z"],
+                    ],
+                    dtype=np.float64,
+                )
+                * 1000.0
             )
 
             offset_mm = (
-                np.asarray(item.get("ORIGIN_OFFSET_M", [0, 0, 0]), dtype=np.float64)
+                np.asarray(
+                    item.get("ORIGIN_OFFSET_M", [0, 0, 0]),
+                    dtype=np.float64,
+                )
                 * 1000.0
             )
 
@@ -176,58 +264,32 @@ class VertexDetector:
 
         params_cfg = cfg.get("PARAMS") or {}
 
-        valid = {
-            "checkpoint",
-            "device",
-            "max_delta",
-            "image_size",
-            "roi_padding",
-            "min_roi_size",
-            "min_correction_px",
-            "snap_enabled",
-            "snap_search_px",
-            "snap_samples",
-            "snap_edge_margin",
-            "snap_min_grad",
-            "snap_inlier_tol_px",
-            "snap_min_inlier",
-            "snap_min_angle_deg",
-            "snap_max_shift_px",
-            "snap_allow_partial",
-            "snap_multi",
-            "snap_select_margin",
-            "snap_rigid",
-            "snap_rigid_max_px",
-            "max_corner_shift_px",
-            "min_face_cos",
-            "min_edge_len_px",
-            "min_roi_px",
-            "corner_tol_px",
-            "area_ratio_min",
-            "area_ratio_max",
-            "max_reproj_px",
-            "max_trans_mm",
-            "max_rot_deg",
-            "sigma_rot_deg",
-            "sigma_trans_mm",
-        }
+        checkpoint = params_cfg.get(
+            "CHECKPOINT",
+            CHECKPOINT_DEFAULT,
+        )
 
-        kwargs = {}
+        params = RefineParams(
+            checkpoint=str(checkpoint),
+        )
 
-        for key, value in params_cfg.items():
-            key = key.lower()
+        logger.info("VertexDetector parameters are configured in vertex_detector.py")
 
-            if key in valid:
-                kwargs[key] = value
-            else:
-                logger.warning("Unknown RGB_REFINE param ignored: %s", key)
+        return cls(
+            boxes=boxes,
+            params=params,
+        )
 
-        return cls(boxes=boxes, params=RefineParams(**kwargs))
+    # ========================================================
+    # Model
+    # ========================================================
 
     def _load_model(self) -> torch.nn.Module:
+
         checkpoint_path = Path(self.p.checkpoint).expanduser()
 
         if not checkpoint_path.is_absolute():
+
             module_dir = Path(__file__).resolve().parent
 
             candidates = [
@@ -259,30 +321,21 @@ class VertexDetector:
         )
 
         ckpt_cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+
         ckpt_cfg = ckpt_cfg or {}
+
         ckpt_model = ckpt_cfg.get("model", {}) or {}
-        ckpt_dataset = ckpt_cfg.get("dataset", {}) or {}
 
         if "cond_dim" in ckpt_model:
             self.cond_dim = int(ckpt_model["cond_dim"])
+
         elif "cond_encoder.0.weight" in state_dict:
             self.cond_dim = int(state_dict["cond_encoder.0.weight"].shape[1])
+
         else:
             self.cond_dim = 0
 
         self.size_scale_mm = float(ckpt_model.get("size_scale_mm", 300.0))
-
-        if "max_delta" in ckpt_model:
-            self.p.max_delta = float(ckpt_model["max_delta"])
-
-        if "image_size" in ckpt_dataset:
-            self.p.image_size = int(ckpt_dataset["image_size"])
-
-        if "roi_padding" in ckpt_dataset:
-            self.p.roi_padding = float(ckpt_dataset["roi_padding"])
-
-        if "min_roi_size" in ckpt_dataset:
-            self.p.min_roi_size = int(ckpt_dataset["min_roi_size"])
 
         model = KeypointRefinementNet(
             pretrained=False,
@@ -290,16 +343,28 @@ class VertexDetector:
             cond_dim=self.cond_dim,
         )
 
-        model.load_state_dict(state_dict, strict=True)
+        model.load_state_dict(
+            state_dict,
+            strict=True,
+        )
 
         model.to(self.device)
         model.eval()
 
-        logger.info("Loaded KeypointRefinementNet: %s", checkpoint_path)
-        logger.info("Device: %s", self.device)
         logger.info(
-            "Model settings: cond_dim=%d size_scale_mm=%.1f max_delta=%.3f "
-            "image_size=%d roi_padding=%.2f min_roi_size=%d",
+            "Loaded KeypointRefinementNet: %s",
+            checkpoint_path,
+        )
+
+        logger.info(
+            "Device: %s",
+            self.device,
+        )
+
+        logger.info(
+            "Model settings: cond_dim=%d size_scale_mm=%.1f "
+            "max_delta=%.3f image_size=%d roi_padding=%.2f "
+            "min_roi_size=%d",
             self.cond_dim,
             self.size_scale_mm,
             self.p.max_delta,
@@ -308,18 +373,48 @@ class VertexDetector:
             self.p.min_roi_size,
         )
 
+        logger.info(
+            "RGB refinement: enabled=%s radius=%.1f " "harris_threshold=%.2e",
+            self.p.rgb_refine_enabled,
+            self.p.rgb_search_radius,
+            self.p.rgb_min_harris_response,
+        )
+
         return model
 
+    # ========================================================
+    # Projection
+    # ========================================================
+
     @staticmethod
-    def _project(pts_cam: np.ndarray, K: np.ndarray) -> np.ndarray:
-        z = np.maximum(pts_cam[:, 2], 1e-3)
+    def _project(
+        pts_cam: np.ndarray,
+        K: np.ndarray,
+    ) -> np.ndarray:
+
+        z = np.maximum(
+            pts_cam[:, 2],
+            1e-3,
+        )
 
         u = K[0, 0] * pts_cam[:, 0] / z + K[0, 2]
         v = K[1, 1] * pts_cam[:, 1] / z + K[1, 2]
 
-        return np.stack([u, v], axis=1)
+        return np.stack(
+            [u, v],
+            axis=1,
+        )
 
-    def _face_corners_obj(self, box: Dict[str, np.ndarray], sign: int) -> np.ndarray:
+    # ========================================================
+    # Object geometry
+    # ========================================================
+
+    def _face_corners_obj(
+        self,
+        box: Dict[str, np.ndarray],
+        sign: int,
+    ) -> np.ndarray:
+
         hx, hy, hz = box["size_mm"] / 2.0
 
         corners = np.array(
@@ -340,13 +435,23 @@ class VertexDetector:
         R: np.ndarray,
         t: np.ndarray,
     ) -> Tuple[int, np.ndarray, float]:
+
         best = None
 
         for sign in (+1, -1):
-            normal = R @ np.array([0.0, 0.0, float(sign)], dtype=np.float64)
+
+            normal = R @ np.array(
+                [0.0, 0.0, float(sign)],
+                dtype=np.float64,
+            )
 
             center_obj = box["offset_mm"] + np.array(
-                [0.0, 0.0, sign * box["size_mm"][2] / 2.0], dtype=np.float64
+                [
+                    0.0,
+                    0.0,
+                    sign * box["size_mm"][2] / 2.0,
+                ],
+                dtype=np.float64,
             )
 
             center = R @ center_obj + t
@@ -354,9 +459,17 @@ class VertexDetector:
             cos = float(-normal @ center / (np.linalg.norm(center) + 1e-9))
 
             if best is None or cos > best[2]:
-                best = (sign, self._face_corners_obj(box, sign), cos)
+                best = (
+                    sign,
+                    self._face_corners_obj(box, sign),
+                    cos,
+                )
 
         return best
+
+    # ========================================================
+    # ROI
+    # ========================================================
 
     def _get_roi(
         self,
@@ -364,6 +477,7 @@ class VertexDetector:
         image_width: int,
         image_height: int,
     ) -> Tuple[float, float, float]:
+
         points = keypoints[:, :2].copy()
 
         points[:, 0] *= image_width
@@ -376,15 +490,19 @@ class VertexDetector:
 
         x_min = float(points[:, 0].min())
         x_max = float(points[:, 0].max())
+
         y_min = float(points[:, 1].min())
         y_max = float(points[:, 1].max())
 
         center_x = (x_min + x_max) * 0.5
         center_y = (y_min + y_max) * 0.5
 
+        span_x = x_max - x_min
+        span_y = y_max - y_min
+
         roi_side = max(
-            x_max - x_min,
-            y_max - y_min,
+            span_x,
+            span_y,
             float(self.p.min_roi_size),
         ) * (1.0 + 2.0 * float(self.p.roi_padding))
 
@@ -398,27 +516,55 @@ class VertexDetector:
         side: float,
         output_size: int,
     ) -> Tuple[np.ndarray, float, float, float]:
-        side = max(1, int(round(side)))
+
+        side = max(
+            1,
+            int(round(side)),
+        )
 
         x0 = int(math.floor(center_x - side * 0.5))
+
         y0 = int(math.floor(center_y - side * 0.5))
 
         pad = side + 2
 
         padded = cv2.copyMakeBorder(
-            image, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(0, 0, 0)
+            image,
+            pad,
+            pad,
+            pad,
+            pad,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
         )
 
-        crop = padded[y0 + pad : y0 + pad + side, x0 + pad : x0 + pad + side]
+        crop_x0 = x0 + pad
+        crop_y0 = y0 + pad
+
+        crop = padded[
+            crop_y0 : crop_y0 + side,
+            crop_x0 : crop_x0 + side,
+        ]
 
         if crop.shape[:2] != (side, side):
             raise RuntimeError("ROI crop size mismatch.")
 
         crop = cv2.resize(
-            crop, (output_size, output_size), interpolation=cv2.INTER_LINEAR
+            crop,
+            (output_size, output_size),
+            interpolation=cv2.INTER_LINEAR,
         )
 
-        return crop, float(x0), float(y0), float(side)
+        return (
+            crop,
+            float(x0),
+            float(y0),
+            float(side),
+        )
+
+    # ========================================================
+    # Heatmaps
+    # ========================================================
 
     @staticmethod
     def _make_gaussian_heatmaps(
@@ -426,9 +572,14 @@ class VertexDetector:
         resolution: int,
         sigma: float = 4.0,
     ) -> np.ndarray:
-        heatmaps = np.zeros((4, resolution, resolution), dtype=np.float32)
+
+        heatmaps = np.zeros(
+            (4, resolution, resolution),
+            dtype=np.float32,
+        )
 
         for i, (x, y, visibility) in enumerate(keypoints):
+
             if visibility <= 0:
                 continue
 
@@ -438,14 +589,35 @@ class VertexDetector:
             px = x * (resolution - 1)
             py = y * (resolution - 1)
 
-            radius = max(1, int(math.ceil(3.0 * sigma)))
+            radius = max(
+                1,
+                int(math.ceil(3.0 * sigma)),
+            )
 
-            x0 = max(0, int(math.floor(px)) - radius)
-            x1 = min(resolution, int(math.floor(px)) + radius + 1)
-            y0 = max(0, int(math.floor(py)) - radius)
-            y1 = min(resolution, int(math.floor(py)) + radius + 1)
+            x0 = max(
+                0,
+                int(math.floor(px)) - radius,
+            )
 
-            yy, xx = np.mgrid[y0:y1, x0:x1]
+            x1 = min(
+                resolution,
+                int(math.floor(px)) + radius + 1,
+            )
+
+            y0 = max(
+                0,
+                int(math.floor(py)) - radius,
+            )
+
+            y1 = min(
+                resolution,
+                int(math.floor(py)) + radius + 1,
+            )
+
+            yy, xx = np.mgrid[
+                y0:y1,
+                x0:x1,
+            ]
 
             heatmaps[i, y0:y1, x0:x1] = np.exp(
                 -((xx - px) ** 2 + (yy - py) ** 2) / (2.0 * sigma * sigma)
@@ -453,36 +625,68 @@ class VertexDetector:
 
         return heatmaps
 
+    # ========================================================
+    # Model input
+    # ========================================================
+
     def _prepare_input(
         self,
         image: np.ndarray,
         keypoints: np.ndarray,
-    ) -> Tuple[torch.Tensor, np.ndarray, float, float, float]:
+    ) -> Tuple[
+        torch.Tensor,
+        np.ndarray,
+        float,
+        float,
+        float,
+    ]:
+
         height, width = image.shape[:2]
 
         offset = keypoints.copy()
 
-        center_x, center_y, roi_side = self._get_roi(offset, width, height)
-
-        crop, x0, y0, roi_side = self._crop_square(
-            image, center_x, center_y, roi_side, int(self.p.image_size)
+        center_x, center_y, roi_side = self._get_roi(
+            offset,
+            width,
+            height,
         )
 
-        crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        crop, x0, y0, roi_side = self._crop_square(
+            image,
+            center_x,
+            center_y,
+            roi_side,
+            int(self.p.image_size),
+        )
+
+        crop = cv2.cvtColor(
+            crop,
+            cv2.COLOR_BGR2RGB,
+        )
 
         scale = float(self.p.image_size) / roi_side
 
         offset[:, 0] = (offset[:, 0] * width - x0) * scale / self.p.image_size
+
         offset[:, 1] = (offset[:, 1] * height - y0) * scale / self.p.image_size
 
         crop = crop.astype(np.float32) / 255.0
+
         crop = (crop - self.IMAGENET_MEAN) / self.IMAGENET_STD
 
         input_heatmaps = self._make_gaussian_heatmaps(
-            offset, int(self.p.image_size), sigma=4.0
+            offset,
+            int(self.p.image_size),
+            sigma=4.0,
         )
 
-        model_input = np.concatenate([crop.transpose(2, 0, 1), input_heatmaps], axis=0)
+        model_input = np.concatenate(
+            [
+                crop.transpose(2, 0, 1),
+                input_heatmaps,
+            ],
+            axis=0,
+        )
 
         initial_coords = offset[:, :2].astype(np.float32)
 
@@ -494,382 +698,445 @@ class VertexDetector:
             roi_side,
         )
 
-    # ------------------------------------------------------------------
-    # Classical RGB corner snapping
-    # ------------------------------------------------------------------
-
-    def _edge_line_fit(self, gx, gy, a, b):
-        """Fit a line to the real image edge near the segment a->b.
-
-        Returns (point, direction, inlier_ratio, mean_strength) or None.
-        """
-        p = self.p
-
-        a = np.asarray(a, dtype=np.float64)
-        b = np.asarray(b, dtype=np.float64)
-
-        length = float(np.linalg.norm(b - a))
-
-        if length < 20.0:
-            return None
-
-        d = (b - a) / length
-        n = np.array([-d[1], d[0]], dtype=np.float64)
-
-        N = int(p.snap_samples)
-        S = float(p.snap_search_px)
-        m = float(p.snap_edge_margin)
-
-        ts = np.linspace(m, 1.0 - m, N)
-        base = a[None, :] + ts[:, None] * (b - a)[None, :]  # (N, 2)
-
-        offs = np.arange(-S, S + 1e-6, 0.5, dtype=np.float64)  # (M,)
-        M = len(offs)
-
-        pos = base[:, None, :] + offs[None, :, None] * n[None, None, :]  # (N, M, 2)
-
-        map_x = pos[..., 0].astype(np.float32)
-        map_y = pos[..., 1].astype(np.float32)
-
-        sx = cv2.remap(
-            gx, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
-        )
-        sy = cv2.remap(
-            gy, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
-        )
-
-        # Gradient component across the edge (signed)
-        proj = sx * n[0] + sy * n[1]
-
-        # Prefer edges close to the predicted line
-        prior = np.exp(-0.5 * (offs / (0.6 * S)) ** 2)[None, :]
-
-        score_pos = np.clip(proj, 0, None) * prior
-        score_neg = np.clip(-proj, 0, None) * prior
-
-        # One polarity per edge (object vs background); robust to inner texture
-        score = (
-            score_pos
-            if score_pos.max(axis=1).sum() >= score_neg.max(axis=1).sum()
-            else score_neg
-        )
-
-        rows = np.arange(N)
-        idx = score.argmax(axis=1)
-        peak = score[rows, idx]
-
-        keep = (peak >= float(p.snap_min_grad)) & (idx > 0) & (idx < M - 1)
-
-        if keep.sum() < max(6, int(0.4 * N)):
-            return None
-
-        # Sub-pixel refinement (parabola through the peak)
-        y0 = score[rows, np.clip(idx - 1, 0, M - 1)]
-        y1 = score[rows, idx]
-        y2 = score[rows, np.clip(idx + 1, 0, M - 1)]
-
-        den = y0 - 2.0 * y1 + y2
-        delta = np.where(np.abs(den) > 1e-9, 0.5 * (y0 - y2) / den, 0.0)
-        delta = np.clip(delta, -1.0, 1.0)
-
-        off = offs[idx] + delta * 0.5
-
-        pts = (base + off[:, None] * n[None, :])[keep].astype(np.float32)
-
-        # Robust fit followed by inlier refit
-        vx, vy, fx, fy = cv2.fitLine(
-            pts.reshape(-1, 1, 2), cv2.DIST_HUBER, 0, 0.01, 0.01
-        ).reshape(-1)
-
-        pt = np.array([fx, fy], dtype=np.float64)
-        v = np.array([vx, vy], dtype=np.float64)
-
-        tol = float(p.snap_inlier_tol_px)
-
-        for _ in range(2):
-            res = np.abs((pts - pt) @ np.array([-v[1], v[0]]))
-            inl = res < tol
-
-            if inl.sum() < 5:
-                return None
-
-            vx, vy, fx, fy = cv2.fitLine(
-                pts[inl].reshape(-1, 1, 2), cv2.DIST_L2, 0, 0.01, 0.01
-            ).reshape(-1)
-
-            pt = np.array([fx, fy], dtype=np.float64)
-            v = np.array([vx, vy], dtype=np.float64)
-
-        res = np.abs((pts - pt) @ np.array([-v[1], v[0]]))
-        inlier_ratio = float((res < tol).sum()) / float(N)
-
-        return pt, v, inlier_ratio, float(peak[keep].mean())
-
-    @staticmethod
-    def _intersect_lines(l1, l2, min_angle_deg):
-        p1, d1 = l1[0], l1[1]
-        p2, d2 = l2[0], l2[1]
-
-        cross = d1[0] * d2[1] - d1[1] * d2[0]
-
-        if abs(cross) < math.sin(math.radians(min_angle_deg)):
-            return None
-
-        w = p2 - p1
-        t = (w[0] * d2[1] - w[1] * d2[0]) / cross
-
-        return p1 + t * d1
-
-    def _gradient_field(self, bgr: np.ndarray, corners: np.ndarray):
-        """Colour gradient (per pixel, the channel with the strongest gradient)
-        over a ROI covering all candidate corners.
-
-        Returns (gx, gy, origin) or None.
-        """
-        p = self.p
-        h, w = bgr.shape[:2]
-
-        pad = int(math.ceil(float(p.snap_search_px))) + 8
-
-        x0 = max(0, int(np.floor(corners[:, 0].min())) - pad)
-        y0 = max(0, int(np.floor(corners[:, 1].min())) - pad)
-        x1 = min(w, int(np.ceil(corners[:, 0].max())) + pad)
-        y1 = min(h, int(np.ceil(corners[:, 1].max())) + pad)
-
-        if x1 - x0 < 16 or y1 - y0 < 16:
-            return None
-
-        roi = cv2.GaussianBlur(bgr[y0:y1, x0:x1].astype(np.float32), (0, 0), 1.0)
-
-        gxs = cv2.Sobel(roi, cv2.CV_32F, 1, 0, ksize=3, scale=1.0 / 8.0)
-        gys = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3, scale=1.0 / 8.0)
-
-        best = (gxs**2 + gys**2).argmax(axis=2)[..., None]
-
-        gx = np.take_along_axis(gxs, best, axis=2)[..., 0]
-        gy = np.take_along_axis(gys, best, axis=2)[..., 0]
-
-        return (
-            np.ascontiguousarray(gx, dtype=np.float32),
-            np.ascontiguousarray(gy, dtype=np.float32),
-            np.array([x0, y0], dtype=np.float64),
-        )
-
-    def _snap_one(self, gx, gy, origin, corners):
-        """Snap one candidate quadrilateral. Returns (corners, info)."""
-        p = self.p
-
-        corners = np.asarray(corners, dtype=np.float64)
-        local = corners - origin
-
-        snap_info: Dict[str, Any] = {
-            "snapped": [False] * 4,
-            "reason": [""] * 4,
-            "shift_px": [0.0] * 4,
-            "inlier_ratio": [None] * 4,
-        }
-
-        lines = []
-
-        for i in range(4):
-            fit = self._edge_line_fit(gx, gy, local[i], local[(i + 1) % 4])
-
-            if fit is not None and fit[2] < float(p.snap_min_inlier):
-                fit = None
-
-            lines.append(fit)
-
-        out = corners.copy()
-
-        for i in range(4):
-            l_prev = lines[(i - 1) % 4]
-            l_next = lines[i]
-
-            vals = [lines[k][2] for k in ((i - 1) % 4, i) if lines[k] is not None]
-            snap_info["inlier_ratio"][i] = float(min(vals)) if vals else None
-
-            if l_prev is not None and l_next is not None:
-                q = self._intersect_lines(l_prev, l_next, p.snap_min_angle_deg)
-
-                if q is None:
-                    snap_info["reason"][i] = "lines_nearly_parallel"
-                    continue
-
-                kind = "intersection"
-
-            elif p.snap_allow_partial and (l_prev is not None or l_next is not None):
-                ln = l_prev if l_prev is not None else l_next
-                normal = np.array([-ln[1][1], ln[1][0]])
-                q = local[i] - float((local[i] - ln[0]) @ normal) * normal
-                kind = "partial"
-
-            else:
-                snap_info["reason"][i] = "no_valid_edge"
-                continue
-
-            shift = float(np.linalg.norm(q - local[i]))
-
-            if not np.isfinite(shift) or shift > float(p.snap_max_shift_px):
-                snap_info["reason"][i] = "shift_too_large"
-                continue
-
-            out[i] = q + origin
-            snap_info["snapped"][i] = True
-            snap_info["reason"][i] = kind
-            snap_info["shift_px"][i] = shift
-
-        return out, snap_info
-
-    def _quad_energy(self, gx, gy, quad_local, n_samples: int = 40):
-        """Edge evidence of a quadrilateral: per edge |mean signed gradient|
-        times the fraction of samples with the same polarity. Real boundaries
-        keep a consistent sign; inner texture edges flip and cancel out."""
-        scores = []
-
-        for i in range(4):
-            a = quad_local[i]
-            b = quad_local[(i + 1) % 4]
-
-            length = float(np.linalg.norm(b - a))
-
-            if length < 20.0:
-                scores.append(0.0)
-                continue
-
-            d = (b - a) / length
-            n = np.array([-d[1], d[0]])
-
-            ts = np.linspace(0.12, 0.88, n_samples)
-            pts = a[None, :] + ts[:, None] * (b - a)[None, :]
-
-            mx = pts[:, 0].astype(np.float32).reshape(1, -1)
-            my = pts[:, 1].astype(np.float32).reshape(1, -1)
-
-            sx = cv2.remap(
-                gx, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
-            )[0]
-            sy = cv2.remap(
-                gy, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
-            )[0]
-
-            proj = sx * n[0] + sy * n[1]
-            mean = float(proj.mean())
-
-            same = (np.sign(proj) == np.sign(mean)) & (
-                np.abs(proj) > 0.5 * float(self.p.snap_min_grad)
-            )
-
-            scores.append(abs(mean) * float(same.mean()))
-
-        return float(np.mean(scores)), scores
-
-    @staticmethod
-    def _rigid_project(quad, K, c3d):
-        """Fit a pose to the 4 coplanar corners (IPPE) and reproject them."""
-        try:
-            obj = np.ascontiguousarray(c3d, dtype=np.float64)
-            img = np.ascontiguousarray(quad, dtype=np.float64).reshape(-1, 1, 2)
-            cam = np.ascontiguousarray(K, dtype=np.float64)
-
-            ok, rvec, tvec = cv2.solvePnP(obj, img, cam, None, flags=cv2.SOLVEPNP_IPPE)
-
-            if not ok:
-                return None
-
-            proj, _ = cv2.projectPoints(obj, rvec, tvec, cam, None)
-
-            return proj.reshape(-1, 2)
-        except cv2.error:
-            return None
-
-    def _snap_select(
+    # ========================================================
+    # RGB feature maps
+    # ========================================================
+
+    def _build_rgb_feature_maps(
         self,
         bgr: np.ndarray,
-        candidates: Dict[str, np.ndarray],
-        K: np.ndarray,
-        c3d: np.ndarray,
-    ) -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Snap every candidate quad, score it by image evidence, keep the best.
+    ) -> Tuple[np.ndarray, np.ndarray]:
 
-        The first candidate ("ml") is the default; "race" is chosen only if its
-        score beats ml by snap_select_margin.
-        """
-        p = self.p
-
-        names = list(candidates.keys())
-        stacked = np.vstack(
-            [np.asarray(candidates[n], dtype=np.float64) for n in names]
+        gray = cv2.cvtColor(
+            bgr,
+            cv2.COLOR_BGR2GRAY,
         )
 
-        info: Dict[str, Any] = {"chosen": names[0], "candidates": {}}
+        gray = gray.astype(np.float32) / 255.0
 
-        field = self._gradient_field(bgr, stacked)
+        gray = cv2.GaussianBlur(
+            gray,
+            (3, 3),
+            0.8,
+        )
 
-        if field is None:
-            info["error"] = "roi_too_small"
-            return np.asarray(candidates[names[0]], dtype=np.float64).copy(), info
+        harris = cv2.cornerHarris(
+            gray,
+            blockSize=max(
+                2,
+                int(self.p.rgb_harris_block_size),
+            ),
+            ksize=max(
+                3,
+                int(self.p.rgb_harris_ksize),
+            ),
+            k=float(self.p.rgb_harris_k),
+        )
 
-        gx, gy, origin = field
+        lab = cv2.cvtColor(
+            bgr,
+            cv2.COLOR_BGR2LAB,
+        ).astype(np.float32)
 
-        results: Dict[str, Dict[str, Any]] = {}
+        gradients = []
 
-        for name in names:
-            out, one = self._snap_one(gx, gy, origin, candidates[name])
+        for channel in (
+            gray,
+            lab[:, :, 0] / 255.0,
+            lab[:, :, 1] / 255.0,
+            lab[:, :, 2] / 255.0,
+        ):
 
-            n_ok = int(sum(one["snapped"]))
-            energy, edge_scores = self._quad_energy(gx, gy, out - origin)
-            score = energy * math.sqrt(n_ok / 4.0)
-
-            results[name] = {"corners": out, "score": score}
-
-            info["candidates"][name] = {
-                "score": float(score),
-                "energy": float(energy),
-                "edge_scores": [float(s) for s in edge_scores],
-                "n_snapped": n_ok,
-                "corners": out.tolist(),
-                "snap": one,
-            }
-
-        chosen = names[0]
-
-        if "race" in results and "ml" in results:
-            if results["race"]["score"] > results["ml"]["score"] * (
-                1.0 + float(p.snap_select_margin)
-            ):
-                chosen = "race"
-
-            info["agreement_px"] = float(
-                np.linalg.norm(
-                    results["race"]["corners"] - results["ml"]["corners"], axis=1
-                ).mean()
+            gx = cv2.Sobel(
+                channel,
+                cv2.CV_32F,
+                1,
+                0,
+                ksize=3,
             )
 
-        info["chosen"] = chosen
+            gy = cv2.Sobel(
+                channel,
+                cv2.CV_32F,
+                0,
+                1,
+                ksize=3,
+            )
 
-        corners = results[chosen]["corners"]
+            gradients.append(cv2.magnitude(gx, gy))
 
-        if p.snap_rigid:
-            q = self._rigid_project(corners, K, c3d)
+        gradient = np.maximum.reduce(gradients)
 
-            if q is not None:
-                residual = float(np.linalg.norm(q - corners, axis=1).mean())
-                info["rigid_residual_px"] = residual
-                info["rigid_applied"] = False
+        return harris, gradient
 
-                if residual <= float(p.snap_rigid_max_px):
-                    corners = q
-                    info["rigid_applied"] = True
+    # ========================================================
+    # RGB local corner search
+    # ========================================================
 
-        return corners, info
+    def _find_rgb_corner(
+        self,
+        point: np.ndarray,
+        harris: np.ndarray,
+        gradient: np.ndarray,
+    ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
 
-    # ------------------------------------------------------------------
+        height, width = harris.shape
+
+        radius = float(self.p.rgb_search_radius)
+
+        cx = float(point[0])
+        cy = float(point[1])
+
+        x0 = max(
+            0,
+            int(math.floor(cx - radius)),
+        )
+
+        x1 = min(
+            width - 1,
+            int(math.ceil(cx + radius)),
+        )
+
+        y0 = max(
+            0,
+            int(math.floor(cy - radius)),
+        )
+
+        y1 = min(
+            height - 1,
+            int(math.ceil(cy + radius)),
+        )
+
+        if x1 < x0 or y1 < y0:
+            return None, {
+                "reason": "search_region_outside_image",
+                "candidate_count": 0,
+            }
+
+        yy, xx = np.mgrid[
+            y0 : y1 + 1,
+            x0 : x1 + 1,
+        ]
+
+        distance = np.sqrt(
+            (xx.astype(np.float32) - cx) ** 2 + (yy.astype(np.float32) - cy) ** 2
+        )
+
+        circle_mask = distance <= radius
+
+        local_harris = harris[
+            y0 : y1 + 1,
+            x0 : x1 + 1,
+        ]
+
+        local_gradient = gradient[
+            y0 : y1 + 1,
+            x0 : x1 + 1,
+        ]
+
+        valid = circle_mask & np.isfinite(local_harris) & np.isfinite(local_gradient)
+
+        if not valid.any():
+            return None, {
+                "reason": "no_valid_candidates",
+                "candidate_count": 0,
+            }
+
+        positive_harris = np.maximum(
+            local_harris,
+            0.0,
+        )
+
+        max_harris = float(positive_harris[valid].max())
+
+        if not np.isfinite(max_harris) or max_harris < float(
+            self.p.rgb_min_harris_response
+        ):
+            return None, {
+                "reason": "harris_response_too_weak",
+                "candidate_count": int(valid.sum()),
+                "max_harris_response": max_harris,
+            }
+
+        harris_norm = np.clip(
+            positive_harris
+            / max(
+                max_harris,
+                1e-12,
+            ),
+            0.0,
+            1.0,
+        )
+
+        valid_gradients = local_gradient[valid]
+
+        grad_scale = float(
+            np.percentile(
+                valid_gradients,
+                95,
+            )
+        )
+
+        gradient_norm = np.clip(
+            local_gradient
+            / max(
+                grad_scale,
+                1e-6,
+            ),
+            0.0,
+            1.0,
+        )
+
+        distance_norm = np.clip(
+            distance
+            / max(
+                radius,
+                1e-6,
+            ),
+            0.0,
+            1.0,
+        )
+
+        score = (
+            float(self.p.rgb_harris_weight) * harris_norm
+            + float(self.p.rgb_gradient_weight) * gradient_norm
+            + float(self.p.rgb_distance_weight) * (1.0 - distance_norm)
+        )
+
+        score[~valid] = -np.inf
+
+        best_y, best_x = np.unravel_index(
+            int(np.argmax(score)),
+            score.shape,
+        )
+
+        candidate = np.array(
+            [
+                float(x0 + best_x),
+                float(y0 + best_y),
+            ],
+            dtype=np.float64,
+        )
+
+        shift = float(np.linalg.norm(candidate - point))
+
+        details = {
+            "reason": "candidate_found",
+            "candidate_count": int(valid.sum()),
+            "max_harris_response": max_harris,
+            "selected_harris_response": float(local_harris[best_y, best_x]),
+            "selected_gradient": float(local_gradient[best_y, best_x]),
+            "selected_score": float(score[best_y, best_x]),
+            "shift_px": shift,
+        }
+
+        return candidate, details
+
+    # ========================================================
+    # Quadrilateral validation
+    # ========================================================
+
+    @staticmethod
+    def _quadrilateral_valid(
+        corners: np.ndarray,
+        min_edge_len_px: float,
+    ) -> Tuple[bool, Dict[str, Any]]:
+
+        corners = np.asarray(
+            corners,
+            dtype=np.float32,
+        ).reshape(4, 2)
+
+        if not np.isfinite(corners).all():
+            return False, {
+                "reason": "non_finite_corners",
+            }
+
+        edges = (
+            np.roll(
+                corners,
+                -1,
+                axis=0,
+            )
+            - corners
+        )
+
+        edge_lengths = np.linalg.norm(
+            edges,
+            axis=1,
+        )
+
+        if (edge_lengths < float(min_edge_len_px)).any():
+            return False, {
+                "reason": "edge_too_short",
+                "edge_lengths_px": edge_lengths.tolist(),
+            }
+
+        contour = corners.reshape(
+            -1,
+            1,
+            2,
+        )
+
+        if not cv2.isContourConvex(np.round(contour).astype(np.int32)):
+            return False, {
+                "reason": "non_convex_corners",
+                "edge_lengths_px": edge_lengths.tolist(),
+            }
+
+        area = abs(float(cv2.contourArea(contour)))
+
+        if area < 1.0:
+            return False, {
+                "reason": "quadrilateral_area_too_small",
+                "area": area,
+            }
+
+        return True, {
+            "reason": "valid",
+            "edge_lengths_px": edge_lengths.tolist(),
+            "area": area,
+        }
+
+    # ========================================================
+    # RGB refinement
+    # ========================================================
+
+    def _refine_rgb_corners(
+        self,
+        bgr: np.ndarray,
+        corners_ml: np.ndarray,
+    ) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+
+        info: Dict[str, Any] = {
+            "enabled": bool(self.p.rgb_refine_enabled),
+            "search_radius_px": float(self.p.rgb_search_radius),
+            "accepted": False,
+            "reason": "not_attempted",
+        }
+
+        if not self.p.rgb_refine_enabled:
+            info["reason"] = "disabled"
+            return None, info
+
+        if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3 or bgr.dtype != np.uint8:
+            info["reason"] = "invalid_rgb_image"
+            return None, info
+
+        corners_ml = np.asarray(
+            corners_ml,
+            dtype=np.float64,
+        ).reshape(4, 2)
+
+        if not np.isfinite(corners_ml).all():
+            info["reason"] = "invalid_ml_corners"
+            return None, info
+
+        height, width = bgr.shape[:2]
+
+        if (
+            (corners_ml[:, 0] < 0).any()
+            or (corners_ml[:, 0] >= width).any()
+            or (corners_ml[:, 1] < 0).any()
+            or (corners_ml[:, 1] >= height).any()
+        ):
+            info["reason"] = "ml_corner_outside_image"
+            return None, info
+
+        harris, gradient = self._build_rgb_feature_maps(bgr)
+
+        candidates = np.zeros(
+            (4, 2),
+            dtype=np.float64,
+        )
+
+        point_details = []
+        all_valid = True
+
+        for i in range(4):
+
+            candidate, details = self._find_rgb_corner(
+                corners_ml[i],
+                harris,
+                gradient,
+            )
+
+            details["index"] = i
+
+            if candidate is None:
+                all_valid = False
+                point_details.append(details)
+                continue
+
+            candidates[i] = candidate
+            point_details.append(details)
+
+        info["points"] = point_details
+
+        if not all_valid:
+            info["reason"] = "one_or_more_corners_not_found"
+            return candidates, info
+
+        shifts = np.linalg.norm(
+            candidates - corners_ml,
+            axis=1,
+        )
+
+        info["corner_shift_px"] = shifts.tolist()
+        info["corner_shift_mean_px"] = float(shifts.mean())
+        info["corner_shift_max_px"] = float(shifts.max())
+
+        if (shifts > float(self.p.rgb_search_radius) + 1e-3).any():
+            info["reason"] = "rgb_corner_shift_exceeds_radius"
+            return candidates, info
+
+        valid, geom = self._quadrilateral_valid(
+            candidates,
+            self.p.min_edge_len_px,
+        )
+
+        info["geometry"] = geom
+
+        if not valid:
+            info["reason"] = "rgb_" + str(geom["reason"])
+            return candidates, info
+
+        area_ml = abs(
+            float(cv2.contourArea(corners_ml.astype(np.float32).reshape(-1, 1, 2)))
+        )
+
+        area_rgb = float(geom["area"])
+
+        area_ratio = area_rgb / max(
+            area_ml,
+            1e-6,
+        )
+
+        info["area_ratio"] = float(area_ratio)
+
+        if not (
+            float(self.p.rgb_area_ratio_min)
+            <= area_ratio
+            <= float(self.p.rgb_area_ratio_max)
+        ):
+            info["reason"] = "rgb_area_ratio_invalid"
+            return candidates, info
+
+        info["accepted"] = True
+        info["reason"] = "rgb_refinement_accepted"
+
+        return candidates, info
+
+    # ========================================================
+    # Lines and segments
+    # ========================================================
 
     @staticmethod
     def _line_from_points(
         p0: np.ndarray,
         p1: np.ndarray,
     ) -> Optional[Tuple[np.ndarray, np.ndarray, int]]:
+
         direction = p1 - p0
 
         length = float(np.linalg.norm(direction))
@@ -880,29 +1147,57 @@ class VertexDetector:
         direction = direction / length
         point = 0.5 * (p0 + p1)
 
-        return point.astype(np.float64), direction.astype(np.float64), 2
+        return (
+            point.astype(np.float64),
+            direction.astype(np.float64),
+            2,
+        )
 
     @staticmethod
     def _build_lines(
         corners: np.ndarray,
     ) -> List[Optional[Tuple[np.ndarray, np.ndarray, int]]]:
+
         lines = []
 
         for i in range(4):
+
             j = (i + 1) % 4
-            lines.append(VertexDetector._line_from_points(corners[i], corners[j]))
+
+            lines.append(
+                VertexDetector._line_from_points(
+                    corners[i],
+                    corners[j],
+                )
+            )
 
         return lines
 
     @staticmethod
-    def _build_segments(corners: np.ndarray) -> List[np.ndarray]:
+    def _build_segments(
+        corners: np.ndarray,
+    ) -> List[np.ndarray]:
+
         segments = []
 
         for i in range(4):
+
             j = (i + 1) % 4
-            segments.append(np.stack([corners[i], corners[j]]).astype(np.float64))
+
+            segments.append(
+                np.stack(
+                    [
+                        corners[i],
+                        corners[j],
+                    ]
+                ).astype(np.float64)
+            )
 
         return segments
+
+    # ========================================================
+    # Detection
+    # ========================================================
 
     def detect(
         self,
@@ -912,26 +1207,46 @@ class VertexDetector:
         R: np.ndarray,
         t_mm: np.ndarray,
     ) -> VertexDetectionResult:
+
         p = self.p
 
-        R0 = np.asarray(R, dtype=np.float64)
-        t0 = np.asarray(t_mm, dtype=np.float64).reshape(3)
-        K = np.asarray(camera, dtype=np.float64)
+        R0 = np.asarray(
+            R,
+            dtype=np.float64,
+        )
+
+        t0 = np.asarray(
+            t_mm,
+            dtype=np.float64,
+        ).reshape(3)
+
+        K = np.asarray(
+            camera,
+            dtype=np.float64,
+        )
 
         info: Dict[str, Any] = {
             "ok": False,
             "reason": None,
-            "method": "keypoint_refinement_net",
+            "method": "keypoint_refinement_net+rgb_local_corner",
             "model_checkpoint": str(p.checkpoint),
             "device": str(self.device),
             "cond_dim": int(self.cond_dim),
+            "rgb_refine_enabled": bool(p.rgb_refine_enabled),
         }
 
         pred = None
         pred_b = None
         c3d = None
 
-        def fail(reason: str, **kwargs) -> VertexDetectionResult:
+        corners_ml = None
+        corners_rgb = None
+
+        def fail(
+            reason: str,
+            **kwargs,
+        ) -> VertexDetectionResult:
+
             info.update(kwargs)
             info["ok"] = False
             info["reason"] = reason
@@ -950,21 +1265,33 @@ class VertexDetector:
                 K=K,
                 R0=R0,
                 t0=t0,
+                corners_ml=corners_ml,
+                corners_rgb=corners_rgb,
             )
+
+        if bgr is None or bgr.ndim != 3 or bgr.shape[2] != 3:
+            return fail("invalid_rgb_image")
 
         box = self.boxes.get(int(label))
 
         if box is None:
             return fail("no_size_for_label")
 
-        sign, c3d, face_cos = self._pick_visible_face(box, R0, t0)
+        sign, c3d, face_cos = self._pick_visible_face(
+            box,
+            R0,
+            t0,
+        )
 
         info["face_cos"] = float(face_cos)
 
         if face_cos < p.min_face_cos:
             return fail("face_grazing")
 
-        c3d_b = self._face_corners_obj(box, -sign)
+        c3d_b = self._face_corners_obj(
+            box,
+            -sign,
+        )
 
         cam_pts = c3d @ R0.T + t0
         cam_b = c3d_b @ R0.T + t0
@@ -972,8 +1299,15 @@ class VertexDetector:
         if (cam_pts[:, 2] <= 0).any() or (cam_b[:, 2] <= 0).any():
             return fail("behind_camera")
 
-        pred = self._project(cam_pts, K)
-        pred_b = self._project(cam_b, K)
+        pred = self._project(
+            cam_pts,
+            K,
+        )
+
+        pred_b = self._project(
+            cam_b,
+            K,
+        )
 
         info["corners_pred"] = pred.tolist()
 
@@ -982,21 +1316,49 @@ class VertexDetector:
         if not np.isfinite(pred).all() or not np.isfinite(pred_b).all():
             return fail("invalid_projected_corners")
 
-        allp = np.vstack([pred, pred_b])
+        allp = np.vstack(
+            [
+                pred,
+                pred_b,
+            ]
+        )
 
         pad = 6
 
-        x0 = max(0, int(np.floor(allp[:, 0].min())) - pad)
-        y0 = max(0, int(np.floor(allp[:, 1].min())) - pad)
-        x1 = min(w, int(np.ceil(allp[:, 0].max())) + pad)
-        y1 = min(h, int(np.ceil(allp[:, 1].max())) + pad)
+        x0 = max(
+            0,
+            int(np.floor(allp[:, 0].min())) - pad,
+        )
+
+        y0 = max(
+            0,
+            int(np.floor(allp[:, 1].min())) - pad,
+        )
+
+        x1 = min(
+            w,
+            int(np.ceil(allp[:, 0].max())) + pad,
+        )
+
+        y1 = min(
+            h,
+            int(np.ceil(allp[:, 1].max())) + pad,
+        )
 
         if x1 <= x0 or y1 <= y0 or (x1 - x0) < p.min_roi_px or (y1 - y0) < p.min_roi_px:
-            return fail("roi_too_small", roi=[x0, y0, x1, y1])
+            return fail(
+                "roi_too_small",
+                roi=[x0, y0, x1, y1],
+            )
 
-        # All four projected corners are used as visible initial points.
         offset_keypoints = np.concatenate(
-            [pred.astype(np.float32), np.ones((4, 1), dtype=np.float32)],
+            [
+                pred.astype(np.float32),
+                np.ones(
+                    (4, 1),
+                    dtype=np.float32,
+                ),
+            ],
             axis=1,
         )
 
@@ -1009,7 +1371,10 @@ class VertexDetector:
             roi_x0,
             roi_y0,
             roi_side,
-        ) = self._prepare_input(bgr, offset_keypoints)
+        ) = self._prepare_input(
+            bgr,
+            offset_keypoints,
+        )
 
         model_input = model_input.unsqueeze(0).to(self.device)
 
@@ -1020,15 +1385,26 @@ class VertexDetector:
         cond = None
 
         if self.cond_dim > 0:
+
             cond = (
-                torch.from_numpy(build_condition(box["size_mm"], self.size_scale_mm))
+                torch.from_numpy(
+                    build_condition(
+                        box["size_mm"],
+                        self.size_scale_mm,
+                    )
+                )
                 .float()
                 .unsqueeze(0)
                 .to(self.device)
             )
 
         with torch.inference_mode():
-            output = self.model(model_input, initial_keypoints, cond)
+
+            output = self.model(
+                model_input,
+                initial_keypoints,
+                cond,
+            )
 
         if (
             not isinstance(output, dict)
@@ -1038,44 +1414,49 @@ class VertexDetector:
             return fail("invalid_model_output")
 
         pred_roi = output["keypoints"][0].float().detach().cpu().numpy()
+
         predicted_delta_roi = output["delta"][0].float().detach().cpu().numpy()
 
         if pred_roi.shape != (4, 2) or not np.isfinite(pred_roi).all():
             return fail("invalid_predicted_keypoints")
 
-        # Normalized ROI coordinates -> image pixels.
-        pred_pixels = np.zeros((4, 2), dtype=np.float64)
+        if (
+            predicted_delta_roi.shape != (4, 2)
+            or not np.isfinite(predicted_delta_roi).all()
+        ):
+            return fail("invalid_predicted_delta")
+
+        pred_pixels = np.zeros(
+            (4, 2),
+            dtype=np.float32,
+        )
+
         pred_pixels[:, 0] = roi_x0 + pred_roi[:, 0] * roi_side
+
         pred_pixels[:, 1] = roi_y0 + pred_roi[:, 1] * roi_side
 
-        raw_shifts = np.linalg.norm(pred_pixels - pred, axis=1)
+        corners_ml = pred_pixels.astype(np.float64)
+
+        raw_shifts = np.linalg.norm(
+            corners_ml - pred,
+            axis=1,
+        )
 
         info["raw_corner_shift_mean_px"] = float(raw_shifts.mean())
 
-        # Optional guard: tiny corrections are within the network's noise
-        # floor, so keep the original projected corners instead.
         info["correction_skipped"] = False
 
         if float(p.min_correction_px) > 0.0 and float(raw_shifts.mean()) < float(
             p.min_correction_px
         ):
-            pred_pixels = pred.copy()
+            corners_ml = pred.copy()
+
             info["correction_skipped"] = True
 
-        # ---- classical RGB snapping + candidate selection ----
-        info["corners_ml"] = pred_pixels.tolist()
-        info["snap"] = None
-
-        if p.snap_enabled:
-            candidates: Dict[str, np.ndarray] = {"ml": pred_pixels}
-
-            if p.snap_multi:
-                candidates["race"] = pred.copy()
-
-            pred_pixels, snap_info = self._snap_select(bgr, candidates, K, c3d)
-            info["snap"] = snap_info
-
-        shifts = np.linalg.norm(pred_pixels - pred, axis=1)
+        shifts = np.linalg.norm(
+            corners_ml - pred,
+            axis=1,
+        )
 
         info["roi"] = {
             "x0": float(roi_x0),
@@ -1085,15 +1466,21 @@ class VertexDetector:
         }
 
         info["initial_keypoints_roi"] = initial_coords.tolist()
-        info["predicted_keypoints_roi"] = pred_roi.tolist()
-        info["predicted_delta_roi"] = predicted_delta_roi.tolist()
-        info["corner_shift_px"] = shifts.tolist()
-        info["corner_shift_mean_px"] = float(shifts.mean())
-        info["corner_shift_max_px"] = float(shifts.max())
-        info["corners_obs"] = pred_pixels.tolist()
 
-        if not np.isfinite(pred_pixels).all():
-            return fail("invalid_corners_obs")
+        info["predicted_keypoints_roi"] = pred_roi.tolist()
+
+        info["predicted_delta_roi"] = predicted_delta_roi.tolist()
+
+        info["corner_shift_px"] = shifts.tolist()
+
+        info["corner_shift_mean_px"] = float(shifts.mean())
+
+        info["corner_shift_max_px"] = float(shifts.max())
+
+        info["corners_ml"] = corners_ml.tolist()
+
+        if not np.isfinite(corners_ml).all():
+            return fail("invalid_corners_ml")
 
         if float(shifts.max()) > float(p.max_corner_shift_px):
             return fail(
@@ -1101,41 +1488,115 @@ class VertexDetector:
                 max_corner_shift_px=float(p.max_corner_shift_px),
             )
 
+        # Validate ML corners before RGB refinement.
+        ml_valid, ml_geom = self._quadrilateral_valid(
+            corners_ml,
+            p.min_edge_len_px,
+        )
+
+        info["ml_geometry"] = ml_geom
+
+        if not ml_valid:
+            return fail("ml_" + str(ml_geom["reason"]))
+
+        # RGB local refinement.
+        corners_obs = corners_ml.copy()
+
+        rgb_info = {
+            "enabled": bool(p.rgb_refine_enabled),
+            "accepted": False,
+            "reason": "not_attempted",
+        }
+
+        rgb_candidates = None
+
+        if p.rgb_refine_enabled:
+
+            rgb_candidates, rgb_info = self._refine_rgb_corners(
+                bgr,
+                corners_ml,
+            )
+
+            if rgb_info.get("accepted", False):
+
+                corners_rgb = rgb_candidates.copy()
+                corners_obs = corners_rgb.copy()
+
+            else:
+
+                corners_rgb = None
+                corners_obs = corners_ml.copy()
+
+        info["rgb_refine"] = rgb_info
+
+        info["rgb_refine_ok"] = bool(rgb_info.get("accepted", False))
+
+        info["rgb_refine_reason"] = str(rgb_info.get("reason", "unknown"))
+
+        info["rgb_refine_accepted"] = bool(rgb_info.get("accepted", False))
+
+        info["rgb_corner_shift_px"] = rgb_info.get("corner_shift_px")
+
+        info["rgb_corner_shift_mean_px"] = rgb_info.get("corner_shift_mean_px")
+
+        info["corners_rgb"] = corners_rgb.tolist() if corners_rgb is not None else None
+
+        info["corners_obs"] = corners_obs.tolist()
+
+        info["final_method"] = (
+            "rgb_local_corner"
+            if info["rgb_refine_accepted"]
+            else "keypoint_refinement_net"
+        )
+
+        # Validate final corners.
+        valid, geom = self._quadrilateral_valid(
+            corners_obs,
+            p.min_edge_len_px,
+        )
+
+        info["final_geometry"] = geom
+
+        if not valid:
+            return fail("final_" + str(geom["reason"]))
+
         edge_lengths = np.linalg.norm(
-            np.roll(pred_pixels, -1, axis=0) - pred_pixels, axis=1
+            np.roll(
+                corners_obs,
+                -1,
+                axis=0,
+            )
+            - corners_obs,
+            axis=1,
         )
 
         info["edge_lengths_px"] = edge_lengths.tolist()
 
-        if (edge_lengths < float(p.min_edge_len_px)).any():
-            return fail("edge_too_short")
-
-        contour = pred_pixels.astype(np.float32).reshape(-1, 1, 2)
-
-        if not cv2.isContourConvex(contour.astype(np.int32)):
-            return fail("non_convex_corners")
-
         area_pred = abs(cv2.contourArea(pred.astype(np.float32).reshape(-1, 1, 2)))
-        area_obs = abs(cv2.contourArea(contour))
+
+        area_obs = abs(
+            cv2.contourArea(corners_obs.astype(np.float32).reshape(-1, 1, 2))
+        )
 
         area_ratio = float(area_obs / max(area_pred, 1e-6))
 
         info["area_ratio"] = area_ratio
 
-        if not (p.area_ratio_min <= area_ratio <= p.area_ratio_max):
+        if not (float(p.area_ratio_min) <= area_ratio <= float(p.area_ratio_max)):
             return fail("area_ratio_invalid")
 
-        lines = self._build_lines(pred_pixels)
-        segments = self._build_segments(pred_pixels)
+        lines = self._build_lines(corners_obs)
+
+        segments = self._build_segments(corners_obs)
 
         valid_idx = [i for i, line in enumerate(lines) if line is not None]
 
         edge_pts = [segments[i].copy() for i in valid_idx]
+
         edge_segs = [segments[i].copy() for i in valid_idx]
 
         info["valid_edges"] = valid_idx
         info["n_edges"] = len(valid_idx)
-
         info["reason"] = "vertices_detected"
         info["ok"] = True
 
@@ -1144,7 +1605,7 @@ class VertexDetector:
             info=info,
             corners_pred=pred,
             corners_bottom=pred_b,
-            corners_obs=pred_pixels,
+            corners_obs=corners_obs,
             lines=lines,
             valid_idx=valid_idx,
             edge_pts=edge_pts,
@@ -1153,26 +1614,51 @@ class VertexDetector:
             K=K,
             R0=R0,
             t0=t0,
+            corners_ml=corners_ml,
+            corners_rgb=corners_rgb,
         )
 
+    # ========================================================
+    # Debug drawing
+    # ========================================================
+
     @staticmethod
-    def draw(debug: np.ndarray, res: VertexDetectionResult) -> None:
-        """Draw RACE projection (orange I), ML output (blue M) and the final
-        selected corners (yellow P, magenta outline)."""
+    def draw(
+        debug: np.ndarray,
+        res: VertexDetectionResult,
+    ) -> None:
+        """Draw projected, ML and accepted RGB-refined keypoints."""
 
         def ip(q):
-            return int(round(float(q[0]))), int(round(float(q[1])))
+            return (
+                int(round(float(q[0]))),
+                int(round(float(q[1]))),
+            )
 
+        # RACE-6D projected corners: orange.
         if res.corners_pred is not None:
+
             for i, q in enumerate(res.corners_pred):
+
                 if not np.isfinite(q).all():
                     continue
 
-                cv2.circle(debug, ip(q), 5, (0, 165, 255), 2, cv2.LINE_AA)
+                cv2.circle(
+                    debug,
+                    ip(q),
+                    5,
+                    (0, 165, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
                 cv2.putText(
                     debug,
                     f"I{i}",
-                    (int(q[0]) + 6, int(q[1]) - 6),
+                    (
+                        int(q[0]) + 6,
+                        int(q[1]) - 6,
+                    ),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (0, 165, 255),
@@ -1180,29 +1666,81 @@ class VertexDetector:
                     cv2.LINE_AA,
                 )
 
-        ml = res.info.get("corners_ml") if res.info else None
+        # ML corners: yellow.
+        if res.corners_ml is not None:
 
-        if ml is not None:
-            for i, q in enumerate(np.asarray(ml, dtype=np.float64)):
+            for i, q in enumerate(res.corners_ml):
+
                 if not np.isfinite(q).all():
                     continue
 
-                cv2.circle(debug, ip(q), 4, (255, 128, 0), 1, cv2.LINE_AA)
+                cv2.circle(
+                    debug,
+                    ip(q),
+                    5,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+
                 cv2.putText(
                     debug,
                     f"M{i}",
-                    (int(q[0]) + 6, int(q[1]) + 14),
+                    (
+                        int(q[0]) + 6,
+                        int(q[1]) + 12,
+                    ),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.45,
-                    (255, 128, 0),
+                    (0, 255, 255),
                     1,
                     cv2.LINE_AA,
                 )
 
+        # Accepted RGB corners: green.
+        if res.corners_rgb is not None:
+
+            for i, q in enumerate(res.corners_rgb):
+
+                if not np.isfinite(q).all():
+                    continue
+
+                cv2.circle(
+                    debug,
+                    ip(q),
+                    6,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                cv2.putText(
+                    debug,
+                    f"R{i}",
+                    (
+                        int(q[0]) + 6,
+                        int(q[1]) - 6,
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (0, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        # Final quadrilateral.
         if res.corners_obs is not None:
+
             corners = res.corners_obs
 
+            rgb_accepted = res.corners_rgb is not None
+
+            line_color = (0, 255, 0) if rgb_accepted else (255, 0, 255)
+
+            point_color = (0, 255, 0) if rgb_accepted else (0, 255, 255)
+
             for i in range(4):
+
                 j = (i + 1) % 4
 
                 if (
@@ -1212,35 +1750,38 @@ class VertexDetector:
                     continue
 
                 cv2.line(
-                    debug, ip(corners[i]), ip(corners[j]), (255, 0, 255), 2, cv2.LINE_AA
-                )
-
-            for i, q in enumerate(corners):
-                if not np.isfinite(q).all():
-                    continue
-
-                cv2.circle(debug, ip(q), 5, (0, 255, 255), -1, cv2.LINE_AA)
-                cv2.putText(
                     debug,
-                    f"P{i}",
-                    (int(q[0]) + 6, int(q[1]) - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 255),
-                    1,
+                    ip(corners[i]),
+                    ip(corners[j]),
+                    line_color,
+                    2,
                     cv2.LINE_AA,
                 )
 
-            snap = res.info.get("snap") if res.info else None
+            for i, q in enumerate(corners):
 
-            if snap and "chosen" in snap:
+                if not np.isfinite(q).all():
+                    continue
+
+                cv2.circle(
+                    debug,
+                    ip(q),
+                    4,
+                    point_color,
+                    -1,
+                    cv2.LINE_AA,
+                )
+
                 cv2.putText(
                     debug,
-                    f"chosen: {snap['chosen']}",
-                    (20, 60),
+                    f"P{i}",
+                    (
+                        int(q[0]) + 6,
+                        int(q[1]) - 6,
+                    ),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2,
+                    0.5,
+                    point_color,
+                    1,
                     cv2.LINE_AA,
                 )
