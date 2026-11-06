@@ -7,9 +7,13 @@ Pipeline:
   1. Project the RACE-6D pose onto the RGB image.
   2. Build a pose-guided ROI from the four predicted face corners.
   3. Prepare RGB + initial-keypoint heatmaps.
-  4. Predict refined keypoints using KeypointRefinementNet.
+  4. Predict refined keypoints using KeypointRefinementNet
+     (conditioned on the box size, if the checkpoint was trained with it).
   5. Return VertexDetectionResult for pose_refine.py.
 
+Model / preprocessing settings (cond_dim, size_scale_mm, max_delta,
+image_size, roi_padding, min_roi_size) are read from the checkpoint's saved
+config so inference always matches training.
 """
 
 from __future__ import annotations
@@ -30,17 +34,38 @@ from models.keypoint_refinement import KeypointRefinementNet
 logger = logging.getLogger(__name__)
 
 
+def build_condition(size_mm, scale_mm: float) -> np.ndarray:
+    """Object-size condition vector. Must be identical to train.py."""
+    sx, sy, sz = [max(float(v), 1e-6) for v in size_mm]
+
+    return np.array(
+        [
+            sx / scale_mm,
+            sy / scale_mm,
+            sz / scale_mm,
+            math.log(sx / sy),
+            math.log(sz / sx),
+            math.log(sz / sy),
+        ],
+        dtype=np.float32,
+    )
+
+
 @dataclass
 class RefineParams:
-    # Model
+    # Model (overridden by the checkpoint's saved config when available)
     checkpoint: str = "runs/keypoint_refinement/best.pth"
     device: str = "cuda"
-    max_delta: float = 0.1
+    max_delta: float = 0.3
 
-    # ROI
-    image_size: int = 224
-    roi_padding: float = 0.25
-    min_roi_size: int = 64
+    # ROI (overridden by the checkpoint's saved config when available)
+    image_size: int = 256
+    roi_padding: float = 1.0
+    min_roi_size: int = 32
+
+    # Skip the network correction when it is smaller than this (px).
+    # 0 disables the guard. Small offsets (< ~10px) tend to be made worse.
+    min_correction_px: float = 0.0
 
     # Sanity
     max_corner_shift_px: float = 40.0
@@ -97,6 +122,10 @@ class VertexDetector:
         self.boxes = boxes
         self.p = params
 
+        # Filled in by _load_model from the checkpoint
+        self.cond_dim: int = 0
+        self.size_scale_mm: float = 300.0
+
         self.device = torch.device(
             params.device
             if params.device == "cpu" or torch.cuda.is_available()
@@ -152,6 +181,7 @@ class VertexDetector:
             "image_size",
             "roi_padding",
             "min_roi_size",
+            "min_correction_px",
             "max_corner_shift_px",
             "min_face_cos",
             "min_edge_len_px",
@@ -186,6 +216,7 @@ class VertexDetector:
 
     def _load_model(self) -> torch.nn.Module:
         checkpoint_path = Path(self.p.checkpoint).expanduser()
+
         if not checkpoint_path.is_absolute():
             module_dir = Path(__file__).resolve().parent
 
@@ -202,13 +233,8 @@ class VertexDetector:
 
         if not checkpoint_path.is_file():
             raise FileNotFoundError(
-                f"Keypoint refinement checkpoint not found: " f"{checkpoint_path}"
+                f"Keypoint refinement checkpoint not found: {checkpoint_path}"
             )
-
-        model = KeypointRefinementNet(
-            pretrained=False,
-            max_delta=float(self.p.max_delta),
-        )
 
         checkpoint = torch.load(
             str(checkpoint_path),
@@ -222,6 +248,40 @@ class VertexDetector:
             else checkpoint
         )
 
+        ckpt_cfg = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+        ckpt_cfg = ckpt_cfg or {}
+        ckpt_model = ckpt_cfg.get("model", {}) or {}
+        ckpt_dataset = ckpt_cfg.get("dataset", {}) or {}
+
+        # cond_dim: prefer the saved config, otherwise infer from the weights
+        if "cond_dim" in ckpt_model:
+            self.cond_dim = int(ckpt_model["cond_dim"])
+        elif "cond_encoder.0.weight" in state_dict:
+            self.cond_dim = int(state_dict["cond_encoder.0.weight"].shape[1])
+        else:
+            self.cond_dim = 0
+
+        self.size_scale_mm = float(ckpt_model.get("size_scale_mm", 300.0))
+
+        # Preprocessing / model settings must match training
+        if "max_delta" in ckpt_model:
+            self.p.max_delta = float(ckpt_model["max_delta"])
+
+        if "image_size" in ckpt_dataset:
+            self.p.image_size = int(ckpt_dataset["image_size"])
+
+        if "roi_padding" in ckpt_dataset:
+            self.p.roi_padding = float(ckpt_dataset["roi_padding"])
+
+        if "min_roi_size" in ckpt_dataset:
+            self.p.min_roi_size = int(ckpt_dataset["min_roi_size"])
+
+        model = KeypointRefinementNet(
+            pretrained=False,
+            max_delta=float(self.p.max_delta),
+            cond_dim=self.cond_dim,
+        )
+
         model.load_state_dict(
             state_dict,
             strict=True,
@@ -230,14 +290,17 @@ class VertexDetector:
         model.to(self.device)
         model.eval()
 
+        logger.info("Loaded KeypointRefinementNet: %s", checkpoint_path)
+        logger.info("Device: %s", self.device)
         logger.info(
-            "Loaded KeypointRefinementNet: %s",
-            checkpoint_path,
-        )
-
-        logger.info(
-            "Device: %s",
-            self.device,
+            "Model settings: cond_dim=%d size_scale_mm=%.1f max_delta=%.3f "
+            "image_size=%d roi_padding=%.2f min_roi_size=%d",
+            self.cond_dim,
+            self.size_scale_mm,
+            self.p.max_delta,
+            self.p.image_size,
+            self.p.roi_padding,
+            self.p.min_roi_size,
         )
 
         return model
@@ -365,7 +428,6 @@ class VertexDetector:
         )
 
         x0 = int(math.floor(center_x - side * 0.5))
-
         y0 = int(math.floor(center_y - side * 0.5))
 
         pad = side + 2
@@ -425,25 +487,11 @@ class VertexDetector:
                 int(math.ceil(3.0 * sigma)),
             )
 
-            x0 = max(
-                0,
-                int(math.floor(px)) - radius,
-            )
+            x0 = max(0, int(math.floor(px)) - radius)
+            x1 = min(resolution, int(math.floor(px)) + radius + 1)
 
-            x1 = min(
-                resolution,
-                int(math.floor(px)) + radius + 1,
-            )
-
-            y0 = max(
-                0,
-                int(math.floor(py)) - radius,
-            )
-
-            y1 = min(
-                resolution,
-                int(math.floor(py)) + radius + 1,
-            )
+            y0 = max(0, int(math.floor(py)) - radius)
+            y1 = min(resolution, int(math.floor(py)) + radius + 1)
 
             yy, xx = np.mgrid[y0:y1, x0:x1]
 
@@ -490,11 +538,9 @@ class VertexDetector:
         scale = float(self.p.image_size) / roi_side
 
         offset[:, 0] = (offset[:, 0] * width - x0) * scale / self.p.image_size
-
         offset[:, 1] = (offset[:, 1] * height - y0) * scale / self.p.image_size
 
         crop = crop.astype(np.float32) / 255.0
-
         crop = (crop - self.IMAGENET_MEAN) / self.IMAGENET_STD
 
         input_heatmaps = self._make_gaussian_heatmaps(
@@ -612,7 +658,12 @@ class VertexDetector:
             "method": "keypoint_refinement_net",
             "model_checkpoint": str(p.checkpoint),
             "device": str(self.device),
+            "cond_dim": int(self.cond_dim),
         }
+
+        pred = None
+        pred_b = None
+        c3d = None
 
         def fail(
             reason: str,
@@ -637,10 +688,6 @@ class VertexDetector:
                 R0=R0,
                 t0=t0,
             )
-
-        pred = None
-        pred_b = None
-        c3d = None
 
         box = self.boxes.get(int(label))
 
@@ -695,39 +742,19 @@ class VertexDetector:
 
         pad = 6
 
-        x0 = max(
-            0,
-            int(np.floor(allp[:, 0].min())) - pad,
-        )
-
-        y0 = max(
-            0,
-            int(np.floor(allp[:, 1].min())) - pad,
-        )
-
-        x1 = min(
-            w,
-            int(np.ceil(allp[:, 0].max())) + pad,
-        )
-
-        y1 = min(
-            h,
-            int(np.ceil(allp[:, 1].max())) + pad,
-        )
+        x0 = max(0, int(np.floor(allp[:, 0].min())) - pad)
+        y0 = max(0, int(np.floor(allp[:, 1].min())) - pad)
+        x1 = min(w, int(np.ceil(allp[:, 0].max())) + pad)
+        y1 = min(h, int(np.ceil(allp[:, 1].max())) + pad)
 
         if x1 <= x0 or y1 <= y0 or (x1 - x0) < p.min_roi_px or (y1 - y0) < p.min_roi_px:
             return fail(
                 "roi_too_small",
-                roi=[
-                    x0,
-                    y0,
-                    x1,
-                    y1,
-                ],
+                roi=[x0, y0, x1, y1],
             )
 
         # All four projected corners are used as visible initial points.
-        # Visibility is kept at 1 to match the offline inference pipeline.
+        # Visibility is kept at 1 to match training (online offset, vis=1).
         offset_keypoints = np.concatenate(
             [
                 pred.astype(np.float32),
@@ -759,10 +786,21 @@ class VertexDetector:
             torch.from_numpy(initial_coords).float().unsqueeze(0).to(self.device)
         )
 
+        cond = None
+
+        if self.cond_dim > 0:
+            cond = (
+                torch.from_numpy(build_condition(box["size_mm"], self.size_scale_mm))
+                .float()
+                .unsqueeze(0)
+                .to(self.device)
+            )
+
         with torch.inference_mode():
             output = self.model(
                 model_input,
                 initial_keypoints,
+                cond,
             )
 
         if (
@@ -772,9 +810,8 @@ class VertexDetector:
         ):
             return fail("invalid_model_output")
 
-        pred_roi = output["keypoints"][0].detach().cpu().numpy()
-
-        predicted_delta_roi = output["delta"][0].detach().cpu().numpy()
+        pred_roi = output["keypoints"][0].float().detach().cpu().numpy()
+        predicted_delta_roi = output["delta"][0].float().detach().cpu().numpy()
 
         if pred_roi.shape != (4, 2) or not np.isfinite(pred_roi).all():
             return fail("invalid_predicted_keypoints")
@@ -786,10 +823,26 @@ class VertexDetector:
         )
 
         pred_pixels[:, 0] = roi_x0 + pred_roi[:, 0] * roi_side
-
         pred_pixels[:, 1] = roi_y0 + pred_roi[:, 1] * roi_side
 
         pred_pixels = pred_pixels.astype(np.float64)
+
+        raw_shifts = np.linalg.norm(
+            pred_pixels - pred,
+            axis=1,
+        )
+
+        info["raw_corner_shift_mean_px"] = float(raw_shifts.mean())
+
+        # Optional guard: tiny corrections are within the network's noise
+        # floor, so keep the original projected corners instead.
+        info["correction_skipped"] = False
+
+        if float(p.min_correction_px) > 0.0 and float(raw_shifts.mean()) < float(
+            p.min_correction_px
+        ):
+            pred_pixels = pred.copy()
+            info["correction_skipped"] = True
 
         shifts = np.linalg.norm(
             pred_pixels - pred,
@@ -804,17 +857,11 @@ class VertexDetector:
         }
 
         info["initial_keypoints_roi"] = initial_coords.tolist()
-
         info["predicted_keypoints_roi"] = pred_roi.tolist()
-
         info["predicted_delta_roi"] = predicted_delta_roi.tolist()
-
         info["corner_shift_px"] = shifts.tolist()
-
         info["corner_shift_mean_px"] = float(shifts.mean())
-
         info["corner_shift_max_px"] = float(shifts.max())
-
         info["corners_obs"] = pred_pixels.tolist()
 
         if not np.isfinite(pred_pixels).all():
@@ -870,23 +917,19 @@ class VertexDetector:
         if not (0.5 <= area_ratio <= 2.0):
             return fail("area_ratio_invalid")
 
-        # Build compatibility lines from the four predicted corners.
+        # Build compatibility lines from the four refined corners.
         lines = self._build_lines(pred_pixels)
-
         segments = self._build_segments(pred_pixels)
 
         valid_idx = [i for i, line in enumerate(lines) if line is not None]
 
         edge_pts = [segments[i].copy() for i in valid_idx]
-
         edge_segs = [segments[i].copy() for i in valid_idx]
 
         info["valid_edges"] = valid_idx
-
         info["n_edges"] = len(valid_idx)
 
         info["reason"] = "vertices_detected"
-
         info["ok"] = True
 
         return VertexDetectionResult(
@@ -935,10 +978,7 @@ class VertexDetector:
                 cv2.putText(
                     debug,
                     f"I{i}",
-                    (
-                        int(q[0]) + 6,
-                        int(q[1]) - 6,
-                    ),
+                    (int(q[0]) + 6, int(q[1]) - 6),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (0, 165, 255),
@@ -983,10 +1023,7 @@ class VertexDetector:
                 cv2.putText(
                     debug,
                     f"P{i}",
-                    (
-                        int(q[0]) + 6,
-                        int(q[1]) - 6,
-                    ),
+                    (int(q[0]) + 6, int(q[1]) - 6),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.5,
                     (0, 255, 255),

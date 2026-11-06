@@ -18,7 +18,7 @@ USB_CAMERA:
 # MODEL_CONFIG is relative to the APPLE_PICK project root.
 # ==========================================================
 RACE_6D:
-  MODEL_PATH: "model/race6d_1102.pth" # 1006
+  MODEL_PATH: "model/race6d_1006.pth" # 1006
   MODEL_CONFIG: "service/RACE_6D/config/race6d_r50vd_pose_rgbd.yml"
   SCORE_THRESHOLD: 0.5
   MAX_PER_CLASS: 1
@@ -95,7 +95,7 @@ RGB_REFINE:
       REF_FLIP_X: false
 
   PARAMS:
-    CHECKPOINT: ../model/pose_refine_1104.pth
+    CHECKPOINT: ../model/pose_refine_1105.pth
     DEVICE: cuda
 
     MAX_DELTA: 0.1
